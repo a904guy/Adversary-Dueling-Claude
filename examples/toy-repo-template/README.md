@@ -1,0 +1,3 @@
+# calc
+
+Tiny calculator library.

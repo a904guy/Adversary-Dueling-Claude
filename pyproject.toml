@@ -1,0 +1,27 @@
+[project]
+name = "adversary"
+version = "0.1.0"
+description = "Supervise a Claude Code worker with an adversarial Claude Code reviewer, side by side in tmux."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[project.scripts]
+adversary = "adversary.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["adversary"]
+
+[tool.setuptools.package-data]
+adversary = ["prompts/*.md"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
