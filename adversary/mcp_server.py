@@ -39,6 +39,19 @@ TOOLS = [
         },
     },
     {
+        "name": "message_worker",
+        "description": (
+            "Send a message to the worker right away, without waiting for it to end its turn. If it is "
+            "working, the message is folded into its current turn; if it is idle, it starts a new turn. "
+            "Use it for new instructions or work from the human, or corrections it needs now."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"message": {"type": "string", "description": "What to tell the worker, in plain language."}},
+            "required": ["message"],
+        },
+    },
+    {
         "name": "changed_files",
         "description": (
             "List files the worker added (A), modified (M) or deleted (D) since the run started. "

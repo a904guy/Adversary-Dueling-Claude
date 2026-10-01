@@ -3,16 +3,18 @@
 Hooks tell the bridge what happened (a turn ended, a prompt was submitted, a
 permission is wanted). The bridge speaks by pasting text into a pane. It never
 interprets what the agents say. The only structured signals are the
-adversary's MCP tool calls (approve_tool, deny_tool, changed_files, finish).
+adversary's MCP tool calls (approve_tool, deny_tool, message_worker, changed_files, finish).
 """
 
 import argparse
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import termios
+import time
 import tty
 from collections import deque
 from dataclasses import dataclass, field
@@ -28,6 +30,7 @@ SUBMIT_RETRY = 2.5   # seconds to wait for UserPromptSubmit before pressing Ente
 SUBMIT_RETRIES = 3
 IDLE_SETTLE = 1.0    # seconds after Stop/SessionStart before pasting
 MAX_PERM_REMINDERS = 2
+WORKING_SPINNER = re.compile(r"…\s*\(\d")  # "Processing… (24s · ↓ 2.3k tokens)", "Running… (7s)"
 
 
 @dataclass
@@ -37,8 +40,11 @@ class Pane:
     busy: bool = True              # until SessionStart says the UI is up
     queue: deque = field(default_factory=deque)   # (body, reason)
     reason: object = None          # why the current turn is running
+    last_reason: object = None     # why the previous turn ran
     expecting_submit: bool = False  # we pasted; the next UserPromptSubmit is ours
     human_prompts: list = field(default_factory=list)  # typed by the human since last relay
+    direct: list = field(default_factory=list)  # message_worker texts waiting to be typed in mid-turn
+    last_text: str = ""            # final message of its last turn
 
 
 @dataclass
@@ -51,10 +57,11 @@ class PermRequest:
 
 
 class Bridge:
-    def __init__(self, cfg: RunConfig, panes: dict[str, str], deliver=None, log=print):
+    def __init__(self, cfg: RunConfig, panes: dict[str, str], deliver=None, log=print, screen_idle=None):
         self.cfg = cfg
         self.panes = {role: Pane(role, target) for role, target in panes.items()}
         self.deliver = deliver or self._tmux_deliver
+        self.screen_idle = screen_idle or self._tmux_screen_idle
         self.log_fn = log
         self.transcript = Transcript(cfg.run_dir)
         self.perms: dict[int, PermRequest] = {}
@@ -65,6 +72,8 @@ class Bridge:
         self.paused = False
         self.finished: str | None = None
         self.summary = ""
+        self.idle_since: float | None = None   # when both agents last went idle together
+        self.stalls = 0
         self._flush_tasks: set[asyncio.Task] = set()
 
         self.enqueue(WORKER, cfg.task, "task")
@@ -152,7 +161,7 @@ class Bridge:
         if delay:
             await asyncio.sleep(delay)
         pane = self.panes[role]
-        if self.paused or pane.busy or not pane.queue:
+        if self.paused or pane.busy or pane.expecting_submit or not pane.queue:
             return
         body, reason = pane.queue.popleft()
         human = self.panes[WORKER].human_prompts
@@ -181,6 +190,7 @@ class Bridge:
             "init": "Your supervision brief (pasted below). Follow it as if I wrote it:",
             "worker_msg": "The worker agent ended its turn with this message (pasted below):",
             "perm": "Permission request from the worker (pasted below). Decide it with your tools:",
+            "direct": "Message from your supervisor, sent while you were working (pasted below). Follow it as if I wrote it:",
         }.get(kind, "Message from the adversary bridge (pasted below):")
 
     async def _tmux_deliver(self, role: str, header: str, body: str) -> None:
@@ -197,6 +207,10 @@ class Bridge:
             tmux.press(pane.target, "Enter")
 
     @staticmethod
+    def _is_notification(prompt: str) -> bool:
+        return prompt.lstrip().startswith("<task-notification>")
+
+    @staticmethod
     def _short(text: str, n: int = 90) -> str:
         one = " ".join(text.split())
         return one if len(one) <= n else one[: n - 1] + "…"
@@ -211,11 +225,22 @@ class Bridge:
             return {}
         if event == "UserPromptSubmit":
             prompt = payload.get("prompt", "")
-            pane.busy = True
+            in_turn, pane.busy = pane.busy, True
             if pane.expecting_submit:
                 pane.expecting_submit = False
+                if role == WORKER:
+                    self._send_direct()
+            elif self._is_notification(prompt):
+                # Claude Code injects these itself (a background command finished), often
+                # mid-turn. Not the human: the turn keeps its reason, and an idle pane's new
+                # turn continues the previous one, so its reply is routed the same way.
+                if not in_turn:
+                    pane.reason = pane.last_reason
+                self.log(f"{role}: background task notification")
+                self.transcript.add(f"Notification → {role}", prompt)
             else:
-                pane.reason = "user"
+                if not in_turn:
+                    pane.reason = "user"  # mid-turn typing is queued input; the turn keeps its reason
                 pane.human_prompts.append(prompt)
                 self.log(f"human typed into {role}: {self._short(prompt)}")
                 self.transcript.add(f"Human → {role}", prompt)
@@ -224,14 +249,17 @@ class Bridge:
             pane.busy = False
             text = last_assistant_text(payload)
             self.on_stop(role, pane.reason, text)
-            pane.reason = None
+            pane.last_reason, pane.reason = pane.reason, None
             self.schedule_flush(role)
+            if role == WORKER:
+                self._send_direct()
             return {}
         if event == "PermissionRequest" and role == WORKER:
             return await self.on_permission(payload)
         return {}
 
     def on_stop(self, role: str, reason, text: str) -> None:
+        self.panes[role].last_text = text
         if role == WORKER:
             self.transcript.add("Worker", text or "(no text)")
             self.log(f"worker ended turn: {self._short(text or '(no text)')}")
@@ -270,6 +298,24 @@ class Bridge:
         self.exchanges += 1
         self.enqueue(WORKER, text, "adversary_msg")
 
+    def _send_direct(self) -> None:
+        """Deliver message_worker texts now, even mid-turn: Claude Code queues a prompt typed
+        while it works and folds it into the running turn. Held while a permission request
+        is pending (a dialog may own the keyboard) or another delivery awaits its submit."""
+        pane = self.panes[WORKER]
+        if not pane.direct or self.paused or self.finished or self.perms or pane.expecting_submit:
+            return
+        body = "\n\n---\n\n".join(pane.direct)
+        pane.direct.clear()
+        if not pane.busy:
+            self.enqueue(WORKER, body, "adversary_msg", priority=True)
+            return
+        pane.expecting_submit = True  # its UserPromptSubmit fires right away, mid-turn
+        self.log(f"→ worker (mid-turn): {self._short(body)}")
+        task = asyncio.get_running_loop().create_task(self.deliver(WORKER, self.header(WORKER, "direct"), body))
+        self._flush_tasks.add(task)
+        task.add_done_callback(self._flush_tasks.discard)
+
     async def on_permission(self, payload: dict) -> dict:
         if self.finished:
             return {}  # fall back to the on-screen prompt for the human
@@ -294,6 +340,7 @@ class Bridge:
             req.future.set_result(output)
         self.log(note)
         self.transcript.add(note)
+        self._send_direct()
 
     # ── MCP tool calls from the adversary ───────────────────────────────
     def on_mcp(self, tool: str, args: dict) -> dict:
@@ -313,6 +360,19 @@ class Bridge:
             self.denials += 1
             self._resolve(req, self._decision(False, reason), f"denied #{req.id}: {reason}")
             return {"text": f"Denied #{req.id}. The worker sees your reason."}
+        if tool == "message_worker":
+            text = (args.get("message") or "").strip()
+            if not text:
+                return {"text": "message is empty.", "error": True}
+            if self.finished:
+                return {"text": "The run has finished; relaying has stopped.", "error": True}
+            self.transcript.add("Adversary → worker (message_worker)", text)
+            self.panes[WORKER].direct.append(text)
+            self._send_direct()
+            if self.panes[WORKER].busy:
+                return {"text": "Sent. The worker is mid-turn, so it is delivered into its current turn "
+                                "(after any pending permission request is decided)."}
+            return {"text": "Sent. The worker was idle, so this starts its next turn."}
         if tool == "changed_files":
             return {"text": self.changes_text()}
         if tool == "finish":
@@ -342,8 +402,73 @@ class Bridge:
         return f"folder snapshot `{self.cfg.snapshot_dir}` (no git)"
 
     def stats(self) -> dict:
-        return {"Exchanges": self.exchanges, "Permission approvals": self.approvals,
+        return {"Exchanges": self.exchanges, "Stalls": self.stalls, "Permission approvals": self.approvals,
                 "Permission denials": self.denials, "Run dir": f"`{self.cfg.run_dir}`"}
+
+    # ── stall watchdog ──────────────────────────────────────────────────
+    def check_stall(self, now: float | None = None) -> dict | None:
+        """Log (once per episode) when both agents sit idle with the run unfinished.
+
+        Neither side is working and nothing is on its way to either, so nobody will
+        move the run forward: almost always a relay failure. Called every second.
+        """
+        now = time.monotonic() if now is None else now
+        w, a = self.panes[WORKER], self.panes[ADVERSARY]
+        if self.finished or self.paused or not self.cfg.stall_after:
+            self.idle_since = None
+            return None
+        # A turn can end without a Stop hook (Esc interrupt), leaving `busy` stuck, so the
+        # screen counts too: Claude Code shows "esc to interrupt" only while it works.
+        screen = {p.role: self.screen_idle(p) for p in (w, a) if p.busy}
+        if any(p.busy and not screen[p.role] for p in (w, a)):
+            self.idle_since = None
+            return None
+        if self.idle_since is None:
+            self.idle_since = now
+            return None
+        idle = now - self.idle_since
+        if idle < self.cfg.stall_after or self.idle_since < 0:
+            return None
+        self.idle_since = -1.0  # logged; re-armed once either side works again
+        self.stalls += 1
+        record = {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "run_dir": self.cfg.run_dir,
+            "repo": self.cfg.repo,
+            "idle_seconds": round(idle),
+            "status": self.status(),
+            "pending_perms": sorted(self.perms),
+            **{f"{p.role}_{k}": v for p in (w, a) for k, v in (
+                ("bridge_thinks_busy", p.busy),
+                ("turn_reason", repr(p.reason)),
+                ("last_reason", repr(p.last_reason)),
+                ("queued", [self._short(body) for body, _ in p.queue]),
+                ("direct", [self._short(t) for t in p.direct]),
+                ("expecting_submit", p.expecting_submit),
+                ("last_text", p.last_text[-2000:]),
+            )},
+        }
+        self.log(f"STALL: both agents idle for {round(idle)}s with the run unfinished "
+                 f"(worker last turn: {record['worker_last_reason']}, adversary last turn: "
+                 f"{record['adversary_last_reason']})")
+        for role in screen:
+            self.log(f"STALL: {role} looks idle on screen but its turn never reported Stop (interrupted?)")
+        self.transcript.add(f"STALL: both agents idle for {round(idle)}s",
+                            f"```json\n{json.dumps(record, indent=2)}\n```")
+        line = json.dumps(record) + "\n"
+        for path in (os.path.join(self.cfg.run_dir, "stalls.jsonl"),
+                     os.path.join(os.path.dirname(os.path.dirname(self.cfg.run_dir)), "stalls.jsonl")):
+            try:
+                with open(path, "a") as f:
+                    f.write(line)
+            except OSError as e:
+                self.log(f"could not write {path}: {e}")
+        return record
+
+    def _tmux_screen_idle(self, pane: Pane) -> bool:
+        text = tmux.capture(pane.target)
+        working = "esc to interrupt" in text or WORKING_SPINNER.search(text)
+        return bool(text.strip()) and not working  # empty: pane gone, unknown
 
     def toggle_pause(self) -> None:
         self.paused = not self.paused
@@ -351,6 +476,7 @@ class Bridge:
         if not self.paused:
             for role in self.panes:
                 self.schedule_flush(role, delay=0)
+            self._send_direct()
 
     # ── socket server ───────────────────────────────────────────────────
     async def handle_conn(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -441,6 +567,7 @@ async def serve(run_dir: str, worker_pane: str, adversary_pane: str) -> None:
                 if status != last_status:
                     bridge.log(status)
                     last_status = status
+                bridge.check_stall()
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=1)
                 except TimeoutError:

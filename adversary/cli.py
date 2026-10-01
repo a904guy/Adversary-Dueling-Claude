@@ -70,6 +70,7 @@ def run(a: argparse.Namespace) -> None:
         base_sha=base_sha, snapshot_dir=snapshot_dir, skip_permissions=a.skip_permissions, worker_permission_mode=a.worker_permission_mode,
         max_exchanges=a.max_exchanges, worker_model=a.worker_model, adversary_model=a.adversary_model,
         verify_cmds=a.verify_cmd or [], session=f"adversary-{ts}", strict_approvals=a.strict_approvals,
+        stall_after=a.stall_after,
     )
     cfg.save()
     scripts = write_launch_files(cfg)
@@ -126,6 +127,8 @@ def main() -> None:
                    help="ignore user-level settings for the worker so no user allow rule bypasses the adversary")
     r.add_argument("--worktree", action="store_true", help="run in a fresh git worktree on branch adversary/<ts>")
     r.add_argument("--max-exchanges", type=int, default=30, help="cap on worker↔adversary round trips (default 30)")
+    r.add_argument("--stall-after", type=int, default=120, metavar="SECONDS",
+                   help="log a stall when both agents sit idle this long with the run unfinished (default 120, 0 = off)")
     r.add_argument("--worker-model", help="model for the worker")
     r.add_argument("--adversary-model", help="model for the adversary")
     r.add_argument("--verify-cmd", action="append", help="extra command prefix the adversary may run (repeatable)")

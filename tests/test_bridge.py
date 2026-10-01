@@ -31,13 +31,16 @@ def make(repo, tmp_path, **kw):
     sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
     cfg = RunConfig(task="Do the thing.\nAll of it.", repo=str(repo), run_dir=str(run), sock=str(tmp_path / "s"),
                     base_sha=sha, **kw)
-    sent = []
+    sent, screen_idle = [], set()   # targets of panes that look idle on screen
 
     async def deliver(role, header, body):
         assert header.strip()
         sent.append((role, body))
 
-    return Bridge(cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=deliver, log=lambda m: None), sent
+    b = Bridge(cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=deliver, log=lambda m: None,
+               screen_idle=lambda pane: pane.target in screen_idle)
+    b.test_screen_idle = screen_idle
+    return b, sent
 
 
 async def settle():
@@ -244,7 +247,7 @@ async def test_socket_roundtrip_hook_and_mcp(repo, tmp_path):
         out, _ = await proc.communicate("".join(json.dumps(m) + "\n" for m in msgs).encode())
         replies = [json.loads(l) for l in out.decode().splitlines()]
         assert [r["id"] for r in replies] == [1, 2, 3]
-        assert {t["name"] for t in replies[1]["result"]["tools"]} == {"approve_tool", "deny_tool", "changed_files", "finish"}
+        assert {t["name"] for t in replies[1]["result"]["tools"]} == {"approve_tool", "deny_tool", "message_worker", "changed_files", "finish"}
         assert "CANNOT_COMPLETE" in replies[2]["result"]["content"][0]["text"]
         assert b.finished == "CANNOT_COMPLETE"
 
@@ -280,3 +283,151 @@ async def test_queued_worker_messages_are_coalesced_with_human_note(repo, tmp_pa
     assert "first done" in to_adv and "added the line" in to_adv and "also add a line" in to_adv
     assert to_adv.index("first done") < to_adv.index("added the line")
     assert len([t for r, t in sent if r == ADVERSARY]) == 2  # brief + one coalesced message
+
+
+NOTE = "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>"
+
+
+async def test_mid_turn_notification_keeps_reply_relayed(repo, tmp_path):
+    """A background task finishing mid-turn must not turn the adversary's review into a 'user' turn."""
+    b, sent = make(repo, tmp_path)
+    await start(b)
+    await submit(b, WORKER, sent)
+    await submit(b, ADVERSARY, sent)
+    await stop(b, ADVERSARY, "Ready.")
+    await stop(b, WORKER, "Done.")
+    await submit(b, ADVERSARY, sent)
+    await b.on_hook(ADVERSARY, "UserPromptSubmit", {"prompt": NOTE})
+    await stop(b, ADVERSARY, "Fix items 1-7.")
+    assert sent[-1] == (WORKER, "Fix items 1-7.")
+    assert not b.panes[ADVERSARY].human_prompts
+
+
+async def test_idle_notification_continues_previous_turn(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await start(b)
+    await submit(b, WORKER, sent)
+    await submit(b, ADVERSARY, sent)
+    await stop(b, ADVERSARY, "Ready.")
+    await stop(b, WORKER, "Done.")
+    await submit(b, ADVERSARY, sent)
+    await stop(b, ADVERSARY, "Tests are running, hold on.")
+    await submit(b, WORKER, sent)
+    await stop(b, WORKER, "Ok.")
+    # adversary is now reviewing "Ok."; let it finish, then a notification wakes it while idle
+    await submit(b, ADVERSARY, sent)
+    await stop(b, ADVERSARY, "Still waiting.")
+    await b.on_hook(ADVERSARY, "UserPromptSubmit", {"prompt": NOTE})
+    await stop(b, ADVERSARY, "Tests failed: fix test_x.")
+    assert "Tests failed: fix test_x." in [t for r, t in sent if r == WORKER] or \
+        any(t == "Tests failed: fix test_x." for t, _ in b.panes[WORKER].queue)
+
+
+async def test_worker_notification_is_not_a_human_amendment(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await start(b)
+    await submit(b, WORKER, sent)
+    await b.on_hook(WORKER, "UserPromptSubmit", {"prompt": NOTE})
+    assert not b.panes[WORKER].human_prompts
+
+
+async def test_human_typing_mid_turn_keeps_reason(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await start(b)
+    await submit(b, WORKER, sent)
+    await submit(b, ADVERSARY, sent)
+    await stop(b, ADVERSARY, "Ready.")
+    await stop(b, WORKER, "Done.")
+    await submit(b, ADVERSARY, sent)
+    await b.on_hook(ADVERSARY, "UserPromptSubmit", {"prompt": "also check the docs"})
+    await stop(b, ADVERSARY, "Check the docs too.")
+    assert sent[-1] == (WORKER, "Check the docs too.")
+
+
+async def test_message_worker_mid_turn_and_idle(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await start(b)
+    await submit(b, WORKER, sent)          # worker is mid-turn on the task
+    r = b.on_mcp("message_worker", {"message": "Also add a --verbose flag."})
+    await settle()
+    assert not r.get("error") and sent[-1] == (WORKER, "Also add a --verbose flag.")
+    assert b.panes[WORKER].busy and b.panes[WORKER].reason == "task"
+    await submit(b, WORKER, sent)           # Claude Code queues it: UserPromptSubmit fires mid-turn
+    assert not b.panes[WORKER].human_prompts and b.panes[WORKER].reason == "task"
+    await stop(b, WORKER, "Done, flag added.")
+    assert b.panes[ADVERSARY].queue or sent[-1] == (ADVERSARY, "Done, flag added.")
+    # idle worker: becomes a normal delivery
+    await submit(b, ADVERSARY, sent)
+    b.on_mcp("message_worker", {"message": "One more thing."})
+    await settle()
+    assert sent[-1] == (WORKER, "One more thing.")
+
+
+async def test_message_worker_waits_for_pending_permission(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await start(b)
+    await submit(b, WORKER, sent)
+    perm = asyncio.create_task(b.on_permission({"tool_name": "Bash", "tool_input": {"command": "ls"}}))
+    await settle()
+    b.on_mcp("message_worker", {"message": "Use the fixtures dir."})
+    await settle()
+    assert (WORKER, "Use the fixtures dir.") not in sent
+    b.on_mcp("approve_tool", {"request_id": 1})
+    await settle()
+    assert (await perm)["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+    assert sent[-1] == (WORKER, "Use the fixtures dir.")
+
+
+async def test_stall_logged_once_when_both_idle(repo, tmp_path):
+    b, sent = make(repo, tmp_path, stall_after=60)
+    await start(b)
+    await submit(b, WORKER, sent)
+    await submit(b, ADVERSARY, sent)
+    assert b.check_stall(now=0) is None                 # both busy
+    await stop(b, ADVERSARY, "Ready.")
+    b.panes[WORKER].busy = False                        # e.g. a relay was lost: nobody is working
+    b.panes[WORKER].last_reason = "task"
+    assert b.check_stall(now=100) is None               # idle clock starts
+    assert b.check_stall(now=150) is None
+    rec = b.check_stall(now=161)
+    assert rec and rec["idle_seconds"] == 61 and rec["adversary_last_text"] == "Ready."
+    assert b.check_stall(now=500) is None               # once per episode
+    lines = (tmp_path / "run" / "stalls.jsonl").read_text().splitlines()
+    assert len(lines) == 1 and json.loads(lines[0])["worker_last_reason"] == "'task'"
+    assert "STALL" in (tmp_path / "run" / "transcript.md").read_text()
+    b.panes[WORKER].busy = True                         # work resumes: re-armed
+    assert b.check_stall(now=600) is None
+    b.panes[WORKER].busy = False
+    b.check_stall(now=700)
+    assert b.check_stall(now=761) and b.stalls == 2
+
+
+async def test_no_stall_when_paused_finished_or_disabled(repo, tmp_path):
+    b, sent = make(repo, tmp_path, stall_after=0)
+    await start(b)
+    b.panes[WORKER].busy = b.panes[ADVERSARY].busy = False
+    b.check_stall(now=0)
+    assert b.check_stall(now=10_000) is None            # disabled
+    b.cfg.stall_after = 60
+    b.toggle_pause()
+    b.check_stall(now=0)
+    assert b.check_stall(now=10_000) is None            # paused
+    b.toggle_pause()
+    b.finish("COMPLETE", "ok")
+    b.check_stall(now=0)
+    assert b.check_stall(now=10_000) is None            # finished
+
+
+async def test_stall_detected_when_turn_ends_without_stop(repo, tmp_path):
+    """Esc-interrupting a turn fires no Stop hook: the bridge still thinks the pane is busy."""
+    b, sent = make(repo, tmp_path, stall_after=60)
+    await start(b)
+    await submit(b, WORKER, sent)
+    await submit(b, ADVERSARY, sent)
+    await stop(b, ADVERSARY, "Ready.")
+    b.check_stall(now=0)
+    assert b.check_stall(now=100) is None               # worker busy on screen too
+    b.test_screen_idle.add("%1")                         # interrupted: idle prompt, no Stop
+    b.check_stall(now=200)
+    rec = b.check_stall(now=261)
+    assert rec and rec["worker_bridge_thinks_busy"] is True

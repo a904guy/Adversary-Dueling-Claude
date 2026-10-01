@@ -37,6 +37,7 @@ class RunConfig:
     session: str = ""
     strict_approvals: bool = False
     snapshot_dir: str | None = None   # set when the repo has no git
+    stall_after: int = 120   # seconds both agents may sit idle before it is logged as a stall (0: off)
 
     def adversary_bash(self) -> list[str]:
         return VERIFY_BASH + (["diff"] if self.snapshot_dir else []) + self.verify_cmds
@@ -102,7 +103,7 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
         worker += ["--model", cfg.worker_model]
 
     allowed = ["Read", "Grep", "Glob", "mcp__adversary__approve_tool", "mcp__adversary__deny_tool",
-               "mcp__adversary__finish", "mcp__adversary__changed_files"]
+               "mcp__adversary__finish", "mcp__adversary__changed_files", "mcp__adversary__message_worker"]
     allowed += [f"Bash({c}:*)" for c in cfg.adversary_bash()]
     adversary = [
         "claude",

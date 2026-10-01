@@ -50,6 +50,7 @@ That is all that's required. It works in the current directory. Every flag below
 | `--strict-approvals` | Ignore user-level settings for the worker, so no personal allow rule lets a tool call skip the adversary. |
 | `--worktree` | Work in a fresh `git worktree` on branch `adversary/<timestamp>` (git repos only). |
 | `--max-exchanges N` | Cap on worker/adversary round trips (default 30). Permission requests don't count. |
+| `--stall-after SECONDS` | Log a stall when both agents sit idle this long while the run is unfinished (default 120, `0` turns it off). |
 | `--worker-model`, `--adversary-model` | Pick the model for each side. |
 | `--verify-cmd "just test"` | Extra command prefix the adversary may run (repeatable). |
 | `--task-file FILE` | Read the task from a file. |
@@ -65,10 +66,13 @@ Keys in the bridge pane:
 
 While relaying is paused I can type into the worker pane. Anything typed there is passed to the adversary as an amendment to the task, and it takes precedence over the original.
 
+I can also type into the adversary pane at any time, for example to add features or change the task. Its reply to me isn't relayed, but it passes the work on with its `message_worker` tool, which reaches the worker straight away. If the worker is busy, the message is typed into its pane and Claude Code folds it into the running turn. Delivery waits only while a permission request is pending.
+
 Each run writes to `~/.local/state/adversary/runs/<timestamp>/`:
 
 - `transcript.md`: every relayed message, permission decision and human input
 - `report.md`: outcome, the adversary's summary, and the files changed since the run started
+- `stalls.jsonl`: one record per stall, written when both agents have been idle for `--stall-after` seconds with the run unfinished. Nothing moves the run forward at that point, so it is almost always a relay failure. Each record holds both sides' last turn, queued messages, pending permissions and last message. It is also shown in the bridge pane and the transcript, and appended to `~/.local/state/adversary/stalls.jsonl` across all runs.
 - `snapshot/`: the folder's original contents (folders without git only)
 - the generated settings, MCP config and launch scripts
 
@@ -92,7 +96,7 @@ In a git repo, `changed_files` reports `git status` and `git diff --stat` agains
 
   The hook command (`adversary/hook.py`) talks to the bridge over a Unix socket.
 - **The bridge speaks by typing into tmux.** Each message is a typed one-line header, then the body as a bracketed paste, then Enter. The header matters: Claude Code wraps long pastes in `<pasted_content>` and won't follow pasted instructions unless the typed part of the message asks it to.
-- **Messages are free-form text.** The bridge never parses what either side says. The only structured signals are the adversary's MCP tool calls: `approve_tool`, `deny_tool`, `changed_files` and `finish`. They are served by `adversary/mcp_server.py`, a dependency-free stdio server.
+- **Messages are free-form text.** The bridge never parses what either side says. The only structured signals are the adversary's MCP tool calls: `approve_tool`, `deny_tool`, `message_worker`, `changed_files` and `finish`. They are served by `adversary/mcp_server.py`, a dependency-free stdio server.
 - **The adversary cannot change the project.**
   - It runs with `--permission-mode dontAsk`.
   - Its allowlist is Read/Grep/Glob plus read and verify Bash prefixes (git diff/log/status, test runners and similar).
@@ -113,7 +117,7 @@ adversary/
   cli.py          adversary run: run directory, snapshot, tmux layout
   bridge.py       socket server, relay logic, permission routing, caps, status
   hook.py         hook command used by both sessions
-  mcp_server.py   approve_tool / deny_tool / changed_files / finish
+  mcp_server.py   approve_tool / deny_tool / message_worker / changed_files / finish
   config.py       run config, per-run settings, MCP config and launch scripts
   snapshot.py     folder snapshot and change detection without git
   transcript.py   transcript.md and report.md
