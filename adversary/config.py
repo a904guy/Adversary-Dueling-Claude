@@ -38,6 +38,8 @@ class RunConfig:
     strict_approvals: bool = False
     snapshot_dir: str | None = None   # set when the repo has no git
     stall_after: int = 120   # seconds both agents may sit idle before it is logged as a stall (0: off)
+    origin: str | None = None   # folder the run was started from (differs from repo with --worktree)
+    sessions: dict = field(default_factory=dict)   # role -> Claude Code session ID, for resuming
 
     def adversary_bash(self) -> list[str]:
         return VERIFY_BASH + (["diff"] if self.snapshot_dir else []) + self.verify_cmds
@@ -124,6 +126,8 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
 
     scripts = {}
     for role, argv in (("worker", worker), ("adversary", adversary)):
+        if cfg.sessions.get(role):
+            argv = argv + ["--resume", cfg.sessions[role]]
         script = run / f"{role}.sh"
         # Wait for the bridge socket so no early hook event is lost.
         script.write_text(

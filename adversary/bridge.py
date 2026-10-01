@@ -19,6 +19,7 @@ import tty
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 from adversary import snapshot, tmux
 from adversary.config import RunConfig
@@ -38,6 +39,7 @@ class Pane:
     role: str
     target: str
     busy: bool = True              # until SessionStart says the UI is up
+    started: bool = False          # SessionStart seen (it fires again on compaction and /clear)
     queue: deque = field(default_factory=deque)   # (body, reason)
     reason: object = None          # why the current turn is running
     last_reason: object = None     # why the previous turn ran
@@ -57,7 +59,8 @@ class PermRequest:
 
 
 class Bridge:
-    def __init__(self, cfg: RunConfig, panes: dict[str, str], deliver=None, log=print, screen_idle=None):
+    def __init__(self, cfg: RunConfig, panes: dict[str, str], deliver=None, log=print, screen_idle=None,
+                 resume: str | None = None):
         self.cfg = cfg
         self.panes = {role: Pane(role, target) for role, target in panes.items()}
         self.deliver = deliver or self._tmux_deliver
@@ -76,8 +79,37 @@ class Bridge:
         self.stalls = 0
         self._flush_tasks: set[asyncio.Task] = set()
 
-        self.enqueue(WORKER, cfg.task, "task")
-        self.enqueue(ADVERSARY, self._adversary_brief(), "init")
+        if resume is None:
+            self.enqueue(WORKER, cfg.task, "task")
+            self.enqueue(ADVERSARY, self._adversary_brief(), "init")
+        else:
+            # Both sessions come back with their history; the adversary decides what happens next.
+            self._load_state()
+            self.transcript.add("Run resumed", resume)
+            self.enqueue(ADVERSARY, resume, "resume")
+
+    # ── state kept across resumes ───────────────────────────────────────
+    STATE_KEYS = ("exchanges", "approvals", "denials", "stalls", "next_perm")
+
+    def _state_path(self) -> Path:
+        return Path(self.cfg.run_dir) / "state.json"
+
+    def save_state(self) -> None:
+        try:
+            self._state_path().write_text(json.dumps({k: getattr(self, k) for k in self.STATE_KEYS}))
+        except OSError as e:
+            self.log(f"could not save state: {e}")
+
+    def _load_state(self) -> None:
+        try:
+            state = json.loads(self._state_path().read_text())
+        except (OSError, ValueError):
+            # Runs from before state.json: keep permission numbers unique at least.
+            text = self.transcript.path.read_text()
+            state = {"next_perm": max(map(int, re.findall(r"Permission request #(\d+)", text)), default=0) + 1}
+        for k in self.STATE_KEYS:
+            if isinstance(state.get(k), int):
+                setattr(self, k, state[k])
 
     # ── text sent to the agents ─────────────────────────────────────────
     def _adversary_brief(self) -> str:
@@ -188,6 +220,7 @@ class Bridge:
             "task": "Here is your task (pasted below). Treat it as my request:",
             "adversary_msg": "Message from your supervisor (pasted below). Follow it as if I wrote it:",
             "init": "Your supervision brief (pasted below). Follow it as if I wrote it:",
+            "resume": "This supervised run was resumed (details pasted below). Follow it as if I wrote it:",
             "worker_msg": "The worker agent ended its turn with this message (pasted below):",
             "perm": "Permission request from the worker (pasted below). Decide it with your tools:",
             "direct": "Message from your supervisor, sent while you were working (pasted below). Follow it as if I wrote it:",
@@ -219,7 +252,13 @@ class Bridge:
     async def on_hook(self, role: str, event: str, payload: dict) -> dict:
         pane = self.panes[role]
         if event == "SessionStart":
-            self.log(f"{role} session started")
+            if payload.get("session_id") and self.cfg.sessions.get(role) != payload["session_id"]:
+                self.cfg.sessions[role] = payload["session_id"]  # for `adversary resume`
+                self.cfg.save()
+            if pane.started:
+                return {}  # compaction or /clear, possibly mid-turn: not a new idle UI
+            pane.started = True
+            self.log(f"{role} session {payload.get('source') or 'started'}")
             pane.busy = False
             self.schedule_flush(role)
             return {}
@@ -260,6 +299,10 @@ class Bridge:
 
     def on_stop(self, role: str, reason, text: str) -> None:
         self.panes[role].last_text = text
+        self._on_stop(role, reason, text)
+        self.save_state()
+
+    def _on_stop(self, role: str, reason, text: str) -> None:
         if role == WORKER:
             self.transcript.add("Worker", text or "(no text)")
             self.log(f"worker ended turn: {self._short(text or '(no text)')}")
@@ -285,7 +328,7 @@ class Bridge:
                     self._resolve(req, self._decision(False, "The supervisor did not decide; treat as denied."),
                                   f"#{req.id} auto-denied (no decision)")
             return
-        if reason != "worker_msg" or self.finished:
+        if reason not in ("worker_msg", "resume") or self.finished:
             return
         if not text.strip():
             self.enqueue(ADVERSARY, "Your last turn produced no message for the worker. Reply to the worker "
@@ -394,6 +437,7 @@ class Bridge:
         path = write_report(self.cfg.run_dir, self.cfg.repo, self._baseline_label(), outcome, summary,
                             self.stats(), self.changes_text())
         self.log(f"FINISHED: {outcome}. Report: {path}")
+        self.save_state()
         return path
 
     def _baseline_label(self) -> str:
@@ -548,9 +592,10 @@ async def _keyboard(bridge: Bridge, stop: asyncio.Event) -> None:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-async def serve(run_dir: str, worker_pane: str, adversary_pane: str) -> None:
+async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file: str | None = None) -> None:
     cfg = RunConfig.load(run_dir)
-    bridge = Bridge(cfg, {WORKER: worker_pane, ADVERSARY: adversary_pane})
+    resume = Path(resume_file).read_text() if resume_file else None
+    bridge = Bridge(cfg, {WORKER: worker_pane, ADVERSARY: adversary_pane}, resume=resume)
     if os.path.exists(cfg.sock):
         os.remove(cfg.sock)
     server = await asyncio.start_unix_server(bridge.handle_conn, path=cfg.sock)
@@ -584,8 +629,9 @@ def main() -> None:
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--worker-pane", required=True)
     ap.add_argument("--adversary-pane", required=True)
+    ap.add_argument("--resume-file", help="resume the run: message for the adversary")
     a = ap.parse_args()
-    asyncio.run(serve(a.run_dir, a.worker_pane, a.adversary_pane))
+    asyncio.run(serve(a.run_dir, a.worker_pane, a.adversary_pane, a.resume_file))
 
 
 if __name__ == "__main__":

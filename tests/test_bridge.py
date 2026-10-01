@@ -431,3 +431,36 @@ async def test_stall_detected_when_turn_ends_without_stop(repo, tmp_path):
     b.check_stall(now=200)
     rec = b.check_stall(now=261)
     assert rec and rec["worker_bridge_thinks_busy"] is True
+
+
+async def test_session_ids_recorded_and_compaction_keeps_busy(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await b.on_hook(WORKER, "SessionStart", {"session_id": "w-1", "source": "startup"})
+    await b.on_hook(ADVERSARY, "SessionStart", {"session_id": "a-1", "source": "startup"})
+    await settle()
+    assert RunConfig.load(b.cfg.run_dir).sessions == {"worker": "w-1", "adversary": "a-1"}
+    await submit(b, WORKER, sent)
+    await b.on_hook(WORKER, "SessionStart", {"session_id": "w-1", "source": "compact"})  # mid-turn
+    assert b.panes[WORKER].busy
+
+
+async def test_resume_asks_adversary_and_forwards_its_reply(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    b.exchanges, b.approvals, b.next_perm = 4, 9, 12
+    b.save_state()
+    b2 = Bridge(b.cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=b.deliver, log=lambda m: None,
+                screen_idle=lambda p: False, resume="Run resumed. Check and reply.")
+    await start(b2)
+    assert sent == [(ADVERSARY, "Run resumed. Check and reply.")]   # no task re-sent to the worker
+    assert (b2.exchanges, b2.approvals, b2.next_perm) == (4, 9, 12)
+    await submit(b2, ADVERSARY, sent)
+    await stop(b2, ADVERSARY, "Fix item 3.")
+    assert sent[-1] == (WORKER, "Fix item 3.") and b2.exchanges == 5
+
+
+async def test_resume_without_state_keeps_permission_numbers_unique(repo, tmp_path):
+    b, _ = make(repo, tmp_path)
+    b.transcript.add("Permission request #41: Bash", "x")
+    b2 = Bridge(b.cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=b.deliver, log=lambda m: None,
+                screen_idle=lambda p: False, resume="go")
+    assert b2.next_perm == 42

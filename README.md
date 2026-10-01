@@ -56,6 +56,28 @@ That is all that's required. It works in the current directory. Every flag below
 | `--task-file FILE` | Read the task from a file. |
 | `--no-attach` | Start the tmux session detached. |
 
+### Resuming
+
+```sh
+adversary resume
+```
+
+This picks up the last run in the current directory (or the folder it was started from, for `--worktree` runs). It works after a crash, a closed terminal, a stall, or a run that already finished.
+
+- **Both sessions come back:** each Claude Code session is reopened with `claude --resume`, with its full history.
+- **The adversary decides what's next:** it is told the run was resumed and given the worker's last message. It checks the current state, then sends the worker what to do next, or calls `finish`.
+- **New instructions are optional:** `adversary resume "Also add a --verbose flag"` passes them to the adversary as an amendment to the task.
+- **Counters carry over:** exchange, approval, denial and stall counts, and permission request numbers.
+
+| Flag | Effect |
+|---|---|
+| `--repo PATH` | Resume the last run in `PATH` instead of the current directory. |
+| `--run ID` | Resume a specific run, by timestamp (`20261001-143802`) or run directory. |
+| `--kill` | If the run is still open in its tmux session, close it first. Without this, I'm asked to confirm. |
+| `--no-attach` | Start the tmux session detached. |
+
+Runs record their session IDs as they start. For older runs, the sessions are found in Claude Code's session logs for the folder.
+
 Keys in the bridge pane:
 
 | Key | Action |
@@ -74,6 +96,7 @@ Each run writes to `~/.local/state/adversary/runs/<timestamp>/`:
 - `report.md`: outcome, the adversary's summary, and the files changed since the run started
 - `stalls.jsonl`: one record per stall, written when both agents have been idle for `--stall-after` seconds with the run unfinished. Nothing moves the run forward at that point, so it is almost always a relay failure. Each record holds both sides' last turn, queued messages, pending permissions and last message. It is also shown in the bridge pane and the transcript, and appended to `~/.local/state/adversary/stalls.jsonl` across all runs.
 - `snapshot/`: the folder's original contents (folders without git only)
+- `state.json`: counters carried over by `adversary resume`
 - the generated settings, MCP config and launch scripts
 
 ## Without git
@@ -119,6 +142,7 @@ adversary/
   hook.py         hook command used by both sessions
   mcp_server.py   approve_tool / deny_tool / message_worker / changed_files / finish
   config.py       run config, per-run settings, MCP config and launch scripts
+  sessions.py     finding the run and Claude Code sessions to resume
   snapshot.py     folder snapshot and change detection without git
   transcript.py   transcript.md and report.md
   tmux.py         paste, key and capture helpers
