@@ -53,3 +53,19 @@ def test_last_worker_message(tmp_path):
         "# t\n\n## [10:00:00] Worker\n\nfirst\n\n## [10:01:00] Adversary (worker_msg)\n\nfix\n\n"
         "## [10:02:00] Worker\n\nsecond\n\n## [10:03:00] approved #3\n")
     assert sessions.last_worker_message(str(tmp_path)) == "second"
+
+
+def test_resume_note_without_instructions_or_worker_message():
+    from adversary.cli import resume_note
+    note = resume_note(False, "No response requested.", None)
+    assert "<worker_message>" not in note and "ended without a message" in note
+    assert "no new instructions" in note and "call hold" in note and "NOTE: the human" not in note
+    assert "ended without a message" in resume_note(False, "\u200b", None)
+
+
+def test_resume_note_with_instructions_and_worker_message():
+    from adversary.cli import resume_note
+    note = resume_note(True, "Tests pass.", "Add a --json flag.")
+    assert "<worker_message>\nTests pass.\n</worker_message>" in note
+    assert "> Add a --json flag." in note and "human's new instructions" in note
+    assert "no new instructions" not in note and "open again" in note

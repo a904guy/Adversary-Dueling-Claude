@@ -1,0 +1,25 @@
+
+  Two Claude Code sessions are running side by side:
+
+    LEFT   WORKER      does the task. Watch it here.
+    RIGHT  ADVERSARY   your supervisor. It answers the worker's questions,
+                       decides its permission requests and checks the work.
+
+  Talk to the run through the RIGHT pane. It has the keyboard now.
+  Ask it for changes or new work there; it passes them to the worker.
+
+  The left pane is for watching, copying output or stopping the worker
+  with Esc. Messages typed there skip the supervisor.
+
+  Before typing in either pane, it's best to pause the relay first, so
+  a relayed message isn't typed into the middle of yours.
+
+  BOTTOM  BRIDGE (status pane). Click it or select it, then press:
+    p   pause / resume the relay
+    s   print the status line
+    q   stop the bridge and end the run
+  The status line shows exchanges against the cap, approvals, pending
+  permissions, whether each side is busy or idle, and "worker on hold".
+
+  This message is shown once per project.
+

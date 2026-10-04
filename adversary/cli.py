@@ -77,6 +77,9 @@ def run(a: argparse.Namespace) -> None:
     launch(cfg, no_attach=a.no_attach)
 
 
+BRIDGE_ROWS = 4  # the bridge pane only shows status and log lines
+
+
 def launch(cfg: RunConfig, no_attach: bool, resume_file: Path | None = None) -> None:
     scripts = write_launch_files(cfg)
     repo, run_dir = cfg.repo, Path(cfg.run_dir)
@@ -96,8 +99,10 @@ def launch(cfg: RunConfig, no_attach: bool, resume_file: Path | None = None) -> 
                   f"--run-dir {shlex.quote(str(run_dir))} --worker-pane {worker} --adversary-pane {adversary}"
                   + (f" --resume-file {shlex.quote(str(resume_file))}" if resume_file else "") + "; "
                   "echo; echo 'bridge exited, press Enter to close'; read _")
-    bridge = tmux.tmux("split-window", "-v", "-f", "-l", "12", "-P", "-F", "#{pane_id}", "-t", worker,
+    bridge = tmux.tmux("split-window", "-v", "-f", "-l", str(BRIDGE_ROWS), "-P", "-F", "#{pane_id}", "-t", worker,
                        "sh", "-c", bridge_cmd)
+    # Attaching from a terminal of another size rescales every pane; keep the bridge short.
+    tmux.tmux("set-hook", "-w", "-t", worker, "window-resized", f"resize-pane -t {bridge} -y {BRIDGE_ROWS}")
     # Label panes with a user option: Claude Code rewrites the pane title (OSC escapes), so
     # #{pane_title} would show its process title instead of the role.
     for pane, label in ((worker, "WORKER · does the task"),
@@ -107,7 +112,7 @@ def launch(cfg: RunConfig, no_attach: bool, resume_file: Path | None = None) -> 
     tmux.tmux("set-option", "-w", "-t", worker, "pane-border-status", "top")
     tmux.tmux("set-option", "-w", "-t", worker, "pane-border-format",
               "#{?pane_active,#[reverse],} #{@adversary_label} #[default]")
-    tmux.tmux("select-pane", "-t", worker)
+    tmux.tmux("select-pane", "-t", adversary)  # the bridge focuses it again once its session has loaded
 
     print(f"adversary: run dir {run_dir}")
     if inside:
@@ -160,25 +165,49 @@ def resume(a: argparse.Namespace) -> None:
     cfg.save()
 
     was_finished = (Path(cfg.run_dir) / "report.md").exists()
-    worker_said = sessions.last_worker_message(cfg.run_dir)
+    note = resume_note(was_finished, sessions.last_worker_message(cfg.run_dir), a.message)
+    resume_file = Path(cfg.run_dir) / "resume.md"
+    resume_file.write_text(note)
+    print(f"adversary: resuming run {cfg.run_dir}")
+    print(f"adversary: task: {short(cfg.task)}")
+    launch(cfg, no_attach=a.no_attach, resume_file=resume_file)
+
+
+# What Claude Code records as the final message of a turn that produced no reply.
+EMPTY_REPLIES = {"", "no response requested."}
+
+
+def resume_note(was_finished: bool, worker_said: str, message: str | None) -> str:
+    """The adversary's first message on resume. It differs with and without new instructions
+    from the human, and when the worker's last turn left no message."""
+    worker_said = (worker_said or "").strip()
+    visible = "".join(c for c in worker_said if c.isprintable() and not c.isspace() and c not in "\u200b\u200c\u200d\u2060\ufeff")
+    silent = not visible or worker_said.lower() in EMPTY_REPLIES
     note = [
         "This supervised run was interrupted and has just been resumed. Your session and the worker's "
         "were both restored with their history, but the worker is idle and has not been told anything yet. "
         "Messages can be lost when a run stops, so don't assume your last reply reached the worker.",
         "The run had previously been ended with `finish`; it is open again." if was_finished else "",
-        f"The worker's last message (from the run transcript):\n\n<worker_message>\n{worker_said}\n</worker_message>"
-        if worker_said else "",
-        "NOTE: the human added these instructions. They come from the person you stand in for, so they "
-        f"amend the original task and take precedence over it where the two conflict:\n\n> {a.message}"
-        if a.message else "",
-        "Check where things stand (changed_files, the tests), then reply with what the worker should do "
-        "next. Your reply is forwarded to it verbatim. If every requirement is verifiably done, call finish instead.",
+        "The worker's last turn ended without a message, so there is nothing from it to answer. Work out "
+        "where it got to from the repository and your own history." if silent else
+        f"The worker's last message (from the run transcript):\n\n<worker_message>\n{worker_said}\n</worker_message>",
     ]
-    resume_file = Path(cfg.run_dir) / "resume.md"
-    resume_file.write_text("\n\n".join(p for p in note if p))
-    print(f"adversary: resuming run {cfg.run_dir}")
-    print(f"adversary: task: {short(cfg.task)}")
-    launch(cfg, no_attach=a.no_attach, resume_file=resume_file)
+    if message:
+        note += [
+            "NOTE: the human added these instructions. They come from the person you stand in for, so they "
+            f"amend the original task and take precedence over it where the two conflict:\n\n> {message}",
+            "Check where things stand (changed_files, the tests), then reply with what the worker should do "
+            "next, starting with the human's new instructions. Your reply is forwarded to it verbatim.",
+        ]
+    else:
+        note += [
+            "The human gave no new instructions: carry on with the task as it stood when the run stopped, "
+            "including any changes the human asked for earlier in your history.",
+            "Check where things stand (changed_files, the tests). If work remains, reply with what the worker "
+            "should do next; your reply is forwarded to it verbatim. If every requirement is verifiably done, "
+            "call finish. If the worker has nothing to do until the human decides something, call hold.",
+        ]
+    return "\n\n".join(p for p in note if p)
 
 
 def bridge_alive(sock: str) -> bool:

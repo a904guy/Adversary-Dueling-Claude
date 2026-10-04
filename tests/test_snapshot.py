@@ -50,7 +50,7 @@ async def test_bridge_without_git_uses_snapshot(tmp_path):
     async def deliver(role, header, body):
         sent.append((role, body))
 
-    b = Bridge(cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=deliver, log=lambda m: None)
+    b = Bridge(cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=deliver, log=lambda m: None, focus=lambda p: None)
     await b.on_hook(ADVERSARY, "SessionStart", {})
     for _ in range(5):
         await asyncio.sleep(0)

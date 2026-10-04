@@ -3,7 +3,7 @@
 Hooks tell the bridge what happened (a turn ended, a prompt was submitted, a
 permission is wanted). The bridge speaks by pasting text into a pane. It never
 interprets what the agents say. The only structured signals are the
-adversary's MCP tool calls (approve_tool, deny_tool, message_worker, changed_files, finish).
+adversary's MCP tool calls (approve_tool, deny_tool, message_worker, hold, changed_files, finish).
 """
 
 import argparse
@@ -11,11 +11,13 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import termios
 import time
 import tty
+import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -31,6 +33,9 @@ SUBMIT_RETRY = 2.5   # seconds to wait for UserPromptSubmit before pressing Ente
 SUBMIT_RETRIES = 3
 IDLE_SETTLE = 1.0    # seconds after Stop/SessionStart before pasting
 MAX_PERM_REMINDERS = 2
+HELP_DIR = Path(__file__).resolve().parent / "help"
+# One-time help popups: (key, title, pane it relates to). Each is shown once per project.
+POPUPS = {"intro": ("how this works", ADVERSARY), "worker_tip": ("the worker pane", WORKER)}
 WORKING_SPINNER = re.compile(r"…\s*\(\d")  # "Processing… (24s · ↓ 2.3k tokens)", "Running… (7s)"
 
 
@@ -43,7 +48,8 @@ class Pane:
     queue: deque = field(default_factory=deque)   # (body, reason)
     reason: object = None          # why the current turn is running
     last_reason: object = None     # why the previous turn ran
-    expecting_submit: bool = False  # we pasted; the next UserPromptSubmit is ours
+    expecting_submit: bool = False  # we pasted; the next UserPromptSubmit should be ours
+    pending: tuple | None = None   # (header, body, reason) of that paste, until its submit is seen
     human_prompts: list = field(default_factory=list)  # typed by the human since last relay
     direct: list = field(default_factory=list)  # message_worker texts waiting to be typed in mid-turn
     last_text: str = ""            # final message of its last turn
@@ -60,11 +66,18 @@ class PermRequest:
 
 class Bridge:
     def __init__(self, cfg: RunConfig, panes: dict[str, str], deliver=None, log=print, screen_idle=None,
-                 resume: str | None = None):
+                 resume: str | None = None, focus=None, focused=None, popup=None):
         self.cfg = cfg
         self.panes = {role: Pane(role, target) for role, target in panes.items()}
         self.deliver = deliver or self._tmux_deliver
         self.screen_idle = screen_idle or self._tmux_screen_idle
+        self.focus = focus or self._tmux_focus
+        self.focused = focused or self._tmux_focused
+        self.popup = popup or self._tmux_popup
+        self._popup_task: asyncio.Task | None = None
+        # Per-project record (which help popups were shown), kept with the runs, keyed by folder.
+        project = re.sub(r"[^\w.-]+", "-", cfg.origin or cfg.repo).strip("-")
+        self.project_file = Path(cfg.run_dir).parent.parent / "projects" / f"{project}.json"
         self.log_fn = log
         self.transcript = Transcript(cfg.run_dir)
         self.perms: dict[int, PermRequest] = {}
@@ -74,6 +87,7 @@ class Bridge:
         self.denials = 0
         self.paused = False
         self.finished: str | None = None
+        self.held: str | None = None           # adversary's hold reason: worker parked, nothing to relay
         self.summary = ""
         self.idle_since: float | None = None   # when both agents last went idle together
         self.stalls = 0
@@ -163,7 +177,7 @@ class Bridge:
         state = self.finished or ("PAUSED" if self.paused else "running")
         return (f"[{state}] exchange {self.exchanges}/{self.cfg.max_exchanges} · approvals {self.approvals} · "
                 f"denials {self.denials} · pending perms {len(self.perms)} · worker {'busy' if w.busy else 'idle'} · "
-                f"adversary {'busy' if a.busy else 'idle'}")
+                f"adversary {'busy' if a.busy else 'idle'}" + (" · worker on hold" if self.held else ""))
 
     # ── delivery ────────────────────────────────────────────────────────
     def enqueue(self, role: str, text: str, reason, priority: bool = False) -> None:
@@ -203,9 +217,12 @@ class Bridge:
                     "you stand in for, so they amend the original task and take precedence over it where the two "
                     f"conflict. Review against the task as amended:\n\n{said}\n\n---\n\n{body}")
             human.clear()
-        pane.busy, pane.reason, pane.expecting_submit = True, reason, True
+        if role == ADVERSARY and reason == "worker_msg":
+            self.release_hold("the worker sent a message")
+        header = self.header(role, reason)
+        pane.busy, pane.reason, pane.expecting_submit, pane.pending = True, reason, True, (header, body, reason)
         self.log(f"→ {role}: {self._short(body)}")
-        await self.deliver(role, self.header(role, reason), body)
+        await self.deliver(role, header, body)
 
     @staticmethod
     def header(role: str, reason) -> str:
@@ -244,6 +261,25 @@ class Bridge:
         return prompt.lstrip().startswith("<task-notification>")
 
     @staticmethod
+    def _is_delivery(pending: tuple, prompt: str) -> bool:
+        """Whether a submitted prompt is the bridge's paste rather than something a person typed.
+
+        Claude Code shows the typed header, then the paste either verbatim, wrapped in
+        <pasted_content>, or as a "[Pasted text #1 +40 lines]" placeholder.
+        """
+        header, body, _ = pending
+        p = prompt.lstrip()
+        if p.startswith(header.split(" (")[0]) or p.startswith("[Pasted text"):
+            return True
+        start = body.strip()[:80]
+        return bool(start) and start in prompt
+
+    @staticmethod
+    def _blank(text: str) -> bool:
+        """No visible text: whitespace only, or invisible characters such as a zero-width space."""
+        return all(c.isspace() or unicodedata.category(c) in ("Cf", "Cc", "Zs", "Zl", "Zp") for c in text)
+
+    @staticmethod
     def _short(text: str, n: int = 90) -> str:
         one = " ".join(text.split())
         return one if len(one) <= n else one[: n - 1] + "…"
@@ -259,14 +295,18 @@ class Bridge:
                 return {}  # compaction or /clear, possibly mid-turn: not a new idle UI
             pane.started = True
             self.log(f"{role} session {payload.get('source') or 'started'}")
+            if role == ADVERSARY:
+                self.focus(pane)  # the human talks to the supervisor, so it gets the keyboard
             pane.busy = False
             self.schedule_flush(role)
             return {}
         if event == "UserPromptSubmit":
             prompt = payload.get("prompt", "")
             in_turn, pane.busy = pane.busy, True
-            if pane.expecting_submit:
-                pane.expecting_submit = False
+            if role == WORKER:
+                self.release_hold("the worker started a turn")
+            if pane.expecting_submit and self._is_delivery(pane.pending, prompt):
+                pane.expecting_submit, pane.pending = False, None
                 if role == WORKER:
                     self._send_direct()
             elif self._is_notification(prompt):
@@ -278,6 +318,9 @@ class Bridge:
                 self.log(f"{role}: background task notification")
                 self.transcript.add(f"Notification → {role}", prompt)
             else:
+                if pane.expecting_submit:
+                    # A person submitted before our paste went in: their prompt, not ours.
+                    in_turn = self._requeue_pending(pane)
                 if not in_turn:
                     pane.reason = "user"  # mid-turn typing is queued input; the turn keeps its reason
                 pane.human_prompts.append(prompt)
@@ -311,7 +354,9 @@ class Bridge:
                 self._resolve(req, {}, f"request #{req.id} expired (worker turn ended)")
             if self.finished:
                 return
-            self.enqueue(ADVERSARY, text or "(the worker ended its turn without a message)", "worker_msg")
+            if self._blank(text):
+                text = "(the worker ended its turn without a message)"
+            self.enqueue(ADVERSARY, text, "worker_msg")
             return
 
         # adversary
@@ -328,11 +373,12 @@ class Bridge:
                     self._resolve(req, self._decision(False, "The supervisor did not decide; treat as denied."),
                                   f"#{req.id} auto-denied (no decision)")
             return
-        if reason not in ("worker_msg", "resume") or self.finished:
-            return
-        if not text.strip():
+        if reason not in ("worker_msg", "resume") or self.finished or self.held:
+            return  # on hold: the worker stays idle and this reply goes nowhere
+        if self._blank(text):
             self.enqueue(ADVERSARY, "Your last turn produced no message for the worker. Reply to the worker "
-                         "(your reply is forwarded verbatim), or call finish.", "worker_msg")
+                         "(your reply is forwarded verbatim), call hold to leave it idle, or call finish.",
+                         "worker_msg")
             return
         if self.exchanges >= self.cfg.max_exchanges:
             self.finish("INCOMPLETE", f"Hit the exchange cap ({self.cfg.max_exchanges}) before the adversary "
@@ -353,11 +399,32 @@ class Bridge:
         if not pane.busy:
             self.enqueue(WORKER, body, "adversary_msg", priority=True)
             return
-        pane.expecting_submit = True  # its UserPromptSubmit fires right away, mid-turn
+        header = self.header(WORKER, "direct")
+        pane.expecting_submit, pane.pending = True, (header, body, "direct")  # its submit fires right away
         self.log(f"→ worker (mid-turn): {self._short(body)}")
-        task = asyncio.get_running_loop().create_task(self.deliver(WORKER, self.header(WORKER, "direct"), body))
+        task = asyncio.get_running_loop().create_task(self.deliver(WORKER, header, body))
         self._flush_tasks.add(task)
         task.add_done_callback(self._flush_tasks.discard)
+
+    def _requeue_pending(self, pane: Pane) -> bool:
+        """Put back a paste that a person's prompt beat to the submit. Returns whether the
+        pane was already mid-turn before that paste."""
+        _, body, reason = pane.pending or (None, None, None)
+        pane.expecting_submit, pane.pending = False, None
+        if reason is None:
+            return pane.reason is not None
+        self.log(f"{pane.role}: a typed prompt was submitted before the bridge's message; resending it after this turn")
+        if reason == "direct":
+            pane.direct.insert(0, body)
+            return True
+        pane.queue.appendleft((body, reason))
+        return False
+
+    def release_hold(self, why: str) -> None:
+        if self.held:
+            self.held = None
+            self.log(f"hold released: {why}")
+            self.transcript.add(f"Hold released: {why}")
 
     async def on_permission(self, payload: dict) -> dict:
         if self.finished:
@@ -410,12 +477,26 @@ class Bridge:
             if self.finished:
                 return {"text": "The run has finished; relaying has stopped.", "error": True}
             self.transcript.add("Adversary → worker (message_worker)", text)
+            self.release_hold("the adversary messaged the worker")
             self.panes[WORKER].direct.append(text)
             self._send_direct()
             if self.panes[WORKER].busy:
                 return {"text": "Sent. The worker is mid-turn, so it is delivered into its current turn "
                                 "(after any pending permission request is decided)."}
             return {"text": "Sent. The worker was idle, so this starts its next turn."}
+        if tool == "hold":
+            if self.finished:
+                return {"text": "The run has finished; relaying has stopped.", "error": True}
+            w = self.panes[WORKER]
+            if w.busy or w.queue or w.direct:
+                return {"text": "The worker is busy or has a message on its way, so its next turn-end will reach "
+                                "you anyway. Call hold once it is idle.", "error": True}
+            reason = (args.get("reason") or "").strip() or "no reason given"
+            self.held = reason
+            self.log(f"worker on hold: {reason}")
+            self.transcript.add("Worker on hold", reason)
+            return {"text": "The worker is on hold. Your reply this turn is not forwarded, and nothing is sent "
+                            "to it until you call message_worker (or the human types to it). End your turn."}
         if tool == "changed_files":
             return {"text": self.changes_text()}
         if tool == "finish":
@@ -458,7 +539,7 @@ class Bridge:
         """
         now = time.monotonic() if now is None else now
         w, a = self.panes[WORKER], self.panes[ADVERSARY]
-        if self.finished or self.paused or not self.cfg.stall_after:
+        if self.finished or self.paused or self.held or not self.cfg.stall_after:
             self.idle_since = None
             return None
         # A turn can end without a Stop hook (Esc interrupt), leaving `busy` stuck, so the
@@ -508,6 +589,83 @@ class Bridge:
             except OSError as e:
                 self.log(f"could not write {path}: {e}")
         return record
+
+    def _tmux_focus(self, pane: Pane) -> None:
+        try:
+            tmux.tmux("select-window", "-t", pane.target)
+            tmux.tmux("select-pane", "-t", pane.target)
+        except subprocess.CalledProcessError as e:
+            self.log(f"could not focus the {pane.role} pane: {e.stderr.strip() if e.stderr else e}")
+
+    # ── one-time help popups ────────────────────────────────────────────
+    def project_data(self) -> dict:
+        try:
+            return json.loads(self.project_file.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def _mark_shown(self, key: str) -> None:
+        data = self.project_data()
+        data.setdefault("shown", {})[key] = datetime.now().isoformat(timespec="seconds")
+        try:
+            self.project_file.parent.mkdir(parents=True, exist_ok=True)
+            self.project_file.write_text(json.dumps(data, indent=2))
+        except OSError as e:
+            self.log(f"could not save {self.project_file}: {e}")
+
+    def check_popups(self) -> None:
+        """Called every second. Once per project: explain the layout once the adversary has
+        loaded, and point the human to the adversary pane the first time they select the worker."""
+        if (self._popup_task and not self._popup_task.done()) or not self.panes[ADVERSARY].started:
+            return
+        shown = self.project_data().get("shown", {})
+        if "intro" not in shown:
+            key = "intro"
+        elif "worker_tip" not in shown and self.focused(self.panes[WORKER]):
+            key = "worker_tip"
+        else:
+            return
+        self._popup_task = asyncio.get_running_loop().create_task(self._show_popup(key))
+
+    async def _show_popup(self, key: str) -> None:
+        title, role = POPUPS[key]
+        if await self.popup(self.panes[role], title, (HELP_DIR / f"{key}.txt").read_text()):
+            self._mark_shown(key)
+
+    def _tmux_focused(self, pane: Pane) -> bool:
+        """The pane is the active one in the active window, and someone is attached."""
+        try:
+            out = tmux.tmux("display", "-p", "-t", pane.target, "#{pane_active}#{window_active}#{session_attached}")
+        except subprocess.CalledProcessError:
+            return False
+        return out[:2] == "11" and out[2:] not in ("", "0")
+
+    async def _tmux_popup(self, pane: Pane, title: str, text: str) -> bool:
+        """Show `text` in a popup on a client viewing the pane's session; True once it was shown
+        and closed. False (try again later) when nobody is attached."""
+        try:
+            session = tmux.tmux("display", "-p", "-t", pane.target, "#{session_name}")
+            clients = tmux.tmux("list-clients", "-t", session, "-F",
+                                "#{client_name} #{client_width} #{client_height}").splitlines()
+        except subprocess.CalledProcessError:
+            return False
+        if not clients:
+            return False
+        client, width, height = clients[0].rsplit(" ", 2)
+        lines = text.splitlines()
+        path = Path(self.cfg.run_dir) / f"popup-{title.replace(' ', '-')}.txt"
+        path.write_text(text)
+        cmd = f"bash -c {shlex.quote(f'cat {shlex.quote(str(path))}; read -rsn1 -p "  Press any key to close "')}"
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "display-popup", "-c", client, "-t", pane.target, "-E", "-b", "rounded",
+            "-T", f" adversary · {title} ", "-w", str(min(max(map(len, lines)) + 4, int(width))),
+            "-h", str(min(len(lines) + 4, int(height))), cmd,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        _, err = await proc.communicate()
+        if proc.returncode:
+            self.log(f"could not show the {title} popup: {err.decode().strip()}")
+            return False
+        return True
 
     def _tmux_screen_idle(self, pane: Pane) -> bool:
         text = tmux.capture(pane.target)
@@ -613,6 +771,7 @@ async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file
                     bridge.log(status)
                     last_status = status
                 bridge.check_stall()
+                bridge.check_popups()
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=1)
                 except TimeoutError:

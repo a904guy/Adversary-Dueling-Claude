@@ -31,15 +31,24 @@ def make(repo, tmp_path, **kw):
     sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
     cfg = RunConfig(task="Do the thing.\nAll of it.", repo=str(repo), run_dir=str(run), sock=str(tmp_path / "s"),
                     base_sha=sha, **kw)
-    sent, screen_idle = [], set()   # targets of panes that look idle on screen
+    sent, screen_idle, focused = [], set(), []   # targets of panes that look idle on screen
+    popups, has_focus = [], set()                 # popups shown; roles whose pane has focus
+
+    async def popup(pane, title, text):
+        popups.append((pane.role, title, text))
+        return True
 
     async def deliver(role, header, body):
         assert header.strip()
         sent.append((role, body))
 
     b = Bridge(cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=deliver, log=lambda m: None,
-               screen_idle=lambda pane: pane.target in screen_idle)
+               screen_idle=lambda pane: pane.target in screen_idle, focus=lambda pane: focused.append(pane.role),
+               focused=lambda pane: pane.role in has_focus, popup=popup)
+    b.project_file = tmp_path / "projects" / "repo.json"
+    b.test_popups, b.test_has_focus = popups, has_focus
     b.test_screen_idle = screen_idle
+    b.test_focused = focused
     return b, sent
 
 
@@ -247,7 +256,7 @@ async def test_socket_roundtrip_hook_and_mcp(repo, tmp_path):
         out, _ = await proc.communicate("".join(json.dumps(m) + "\n" for m in msgs).encode())
         replies = [json.loads(l) for l in out.decode().splitlines()]
         assert [r["id"] for r in replies] == [1, 2, 3]
-        assert {t["name"] for t in replies[1]["result"]["tools"]} == {"approve_tool", "deny_tool", "message_worker", "changed_files", "finish"}
+        assert {t["name"] for t in replies[1]["result"]["tools"]} == {"approve_tool", "deny_tool", "message_worker", "hold", "changed_files", "finish"}
         assert "CANNOT_COMPLETE" in replies[2]["result"]["content"][0]["text"]
         assert b.finished == "CANNOT_COMPLETE"
 
@@ -448,7 +457,7 @@ async def test_resume_asks_adversary_and_forwards_its_reply(repo, tmp_path):
     b, sent = make(repo, tmp_path)
     b.exchanges, b.approvals, b.next_perm = 4, 9, 12
     b.save_state()
-    b2 = Bridge(b.cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=b.deliver, log=lambda m: None,
+    b2 = Bridge(b.cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=b.deliver, log=lambda m: None, focus=lambda p: None,
                 screen_idle=lambda p: False, resume="Run resumed. Check and reply.")
     await start(b2)
     assert sent == [(ADVERSARY, "Run resumed. Check and reply.")]   # no task re-sent to the worker
@@ -461,6 +470,145 @@ async def test_resume_asks_adversary_and_forwards_its_reply(repo, tmp_path):
 async def test_resume_without_state_keeps_permission_numbers_unique(repo, tmp_path):
     b, _ = make(repo, tmp_path)
     b.transcript.add("Permission request #41: Bash", "x")
-    b2 = Bridge(b.cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=b.deliver, log=lambda m: None,
+    b2 = Bridge(b.cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=b.deliver, log=lambda m: None, focus=lambda p: None,
                 screen_idle=lambda p: False, resume="go")
     assert b2.next_perm == 42
+
+
+async def ready(b, sent):
+    await start(b)
+    await submit(b, WORKER, sent)
+    await submit(b, ADVERSARY, sent)
+    await stop(b, ADVERSARY, "Ready.")
+
+
+async def test_hold_ends_the_ping_pong(repo, tmp_path):
+    b, sent = make(repo, tmp_path, stall_after=60)
+    await ready(b, sent)
+    await stop(b, WORKER, "Holding. Nothing is running.")
+    await submit(b, ADVERSARY, sent)
+    r = b.on_mcp("hold", {"reason": "waiting for the human to approve the e2e run"})
+    assert not r.get("error") and b.held
+    await stop(b, ADVERSARY, "Keep holding.")
+    assert not any(r == WORKER and t == "Keep holding." for r, t in sent)
+    assert b.exchanges == 0 and not b.panes[ADVERSARY].queue
+    b.check_stall(now=0)
+    assert b.check_stall(now=10_000) is None              # held is not a stall
+    assert "worker on hold" in b.status()
+    b.on_mcp("message_worker", {"message": "Run the e2e suite once."})
+    await settle()
+    assert b.held is None and sent[-1] == (WORKER, "Run the e2e suite once.")
+
+
+async def test_hold_released_by_human_typing_to_worker(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "Done for now.")
+    await submit(b, ADVERSARY, sent)
+    b.on_mcp("hold", {"reason": "waiting"})
+    await stop(b, ADVERSARY, "ok")
+    await b.on_hook(WORKER, "UserPromptSubmit", {"prompt": "also add a README"})
+    assert b.held is None
+    await stop(b, WORKER, "README added.")
+    assert sent[-1][0] == ADVERSARY and sent[-1][1].endswith("README added.")
+
+
+async def test_hold_refused_while_worker_busy(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)                                   # worker still on its task
+    assert b.on_mcp("hold", {"reason": "x"}).get("error") and b.held is None
+
+
+async def test_invisible_replies_count_as_empty(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "\u200b\n")
+    assert sent[-1] == (ADVERSARY, "(the worker ended its turn without a message)")
+    await submit(b, ADVERSARY, sent)
+    await stop(b, ADVERSARY, " \u200b ")
+    assert sent[-1][0] == ADVERSARY and "call hold" in sent[-1][1]
+    assert b.exchanges == 0
+
+
+async def test_typed_prompt_beating_a_delivery_is_the_humans_turn(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "Finished step 1.")             # pasted into the adversary pane, not yet submitted
+    assert b.panes[ADVERSARY].expecting_submit
+    await b.on_hook(ADVERSARY, "UserPromptSubmit", {"prompt": "why is npm using 10GB?"})
+    a = b.panes[ADVERSARY]
+    assert a.reason == "user" and not a.expecting_submit
+    assert "Human → adversary" in (tmp_path / "run" / "transcript.md").read_text()
+    await stop(b, ADVERSARY, "It's reserved address space, not real memory.")
+    assert not any(r == WORKER and "reserved address space" in t for r, t in sent)
+    assert sent[-1] == (ADVERSARY, "Finished step 1.")    # the worker's message is delivered again
+    await submit(b, ADVERSARY, sent)
+    assert a.reason == "worker_msg"
+
+
+async def test_typed_prompt_beating_a_mid_turn_message_requeues_it(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await start(b)
+    await submit(b, WORKER, sent)                          # worker mid-turn on the task
+    b.on_mcp("message_worker", {"message": "Use the fixtures dir."})
+    await settle()
+    await b.on_hook(WORKER, "UserPromptSubmit", {"prompt": "human: hurry up"})
+    w = b.panes[WORKER]
+    assert w.reason == "task" and w.direct == ["Use the fixtures dir."]
+    b._send_direct()
+    await settle()
+    assert sent[-1] == (WORKER, "Use the fixtures dir.")
+
+
+async def test_adversary_pane_focused_once_loaded(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await b.on_hook(WORKER, "SessionStart", {})
+    assert b.test_focused == []
+    await b.on_hook(ADVERSARY, "SessionStart", {})
+    await b.on_hook(ADVERSARY, "SessionStart", {"source": "compact"})   # compaction: no focus change
+    assert b.test_focused == [ADVERSARY]
+
+
+async def test_help_popups_once_per_project(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    b.check_popups()
+    await settle()
+    assert b.test_popups == []                             # adversary not loaded yet
+    await start(b)
+    b.check_popups()
+    await settle()
+    assert [(r, t) for r, t, _ in b.test_popups] == [(ADVERSARY, "how this works")]
+    assert "RIGHT" in b.test_popups[0][2]
+    b.check_popups()
+    await settle()
+    assert len(b.test_popups) == 1                         # intro shown once; worker not focused
+    b.test_has_focus.add(WORKER)
+    b.check_popups()
+    await settle()
+    assert b.test_popups[-1][:2] == (WORKER, "the worker pane")
+    b.check_popups()
+    await settle()
+    assert len(b.test_popups) == 2
+    assert set(json.loads(b.project_file.read_text())["shown"]) == {"intro", "worker_tip"}
+    b2, _ = make(repo, tmp_path)                           # a later run in the same project
+    b2.project_file = b.project_file
+    b2.test_has_focus.add(WORKER)
+    await start(b2)
+    b2.check_popups()
+    await settle()
+    assert b2.test_popups == []
+
+
+async def test_popup_retried_until_shown(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    calls = []
+
+    async def no_client(pane, title, text):
+        calls.append(title)
+        return False                                       # nobody attached yet
+    b.popup = no_client
+    await start(b)
+    for _ in range(2):
+        b.check_popups()
+        await settle()
+    assert calls == ["how this works", "how this works"] and not b.project_file.exists()

@@ -11,9 +11,10 @@ Both sides are the regular `claude` CLI, so usage comes out of the logged-in Cla
 ```
 ┌─ WORKER · does the task ───┬─ ADVERSARY · reviews ──────┐
 │ real `claude` session      │ real `claude` session      │
-│ (watch it, or type into it)│ (read-only + MCP tools)    │
+│ (watch it; type here only  │ (read-only + MCP tools)    │
+│  with the relay paused)    │ ◀ type here: it has focus  │
 ├────────────────────────────┴────────────────────────────┤
-│ BRIDGE · exchange 3/30 · approvals 7 · worker idle      │
+│ BRIDGE · [running] exchange 3/30 · approvals 7 · …      │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -65,8 +66,8 @@ adversary resume
 This picks up the last run in the current directory (or the folder it was started from, for `--worktree` runs). It works after a crash, a closed terminal, a stall, or a run that already finished.
 
 - **Both sessions come back:** each Claude Code session is reopened with `claude --resume`, with its full history.
-- **The adversary decides what's next:** it is told the run was resumed and given the worker's last message. It checks the current state, then sends the worker what to do next, or calls `finish`.
-- **New instructions are optional:** `adversary resume "Also add a --verbose flag"` passes them to the adversary as an amendment to the task.
+- **The adversary decides what's next:** it is told the run was resumed and given the worker's last message (or told the worker's last turn left none). It checks the current state, then sends the worker what to do next, calls `hold`, or calls `finish`.
+- **New instructions are optional:** `adversary resume "Also add a --verbose flag"` passes them to the adversary as an amendment to the task, and the worker starts on them first. Without them, the adversary is told to carry on with the task as it stood, including changes asked for earlier.
 - **Counters carry over:** exchange, approval, denial and stall counts, and permission request numbers.
 
 | Flag | Effect |
@@ -86,9 +87,15 @@ Keys in the bridge pane:
 | `s` | Print status |
 | `q` | Stop the bridge |
 
-While relaying is paused I can type into the worker pane. Anything typed there is passed to the adversary as an amendment to the task, and it takes precedence over the original.
+The first run in a project opens a short "how this works" popup over the panes, and the first time I select the worker pane, a tip points me back to the adversary pane. Each is shown once per project; which ones I've seen is kept in `~/.local/state/adversary/projects/<folder>.json` (delete it to see them again). A key closes them.
 
-I can also type into the adversary pane at any time, for example to add features or change the task. Its reply to me isn't relayed, but it passes the work on with its `message_worker` tool, which reaches the worker straight away. If the worker is busy, the message is typed into its pane and Claude Code folds it into the running turn. Delivery waits only while a permission request is pending.
+**I talk to the run through the adversary pane on the right.** It has the keyboard when a run starts or resumes: the bridge selects its window and pane once its session has loaded. I can type into it at any time, for example to add features or change the task. Its reply to me isn't relayed, but it passes the work on with its `message_worker` tool, which reaches the worker straight away. If the worker is busy, the message is typed into its pane and Claude Code folds it into the running turn. Delivery waits only while a permission request is pending.
+
+The worker pane on the left is for watching, copying output, or stopping the worker with Esc. If I type a message there, I press `p` first so a relayed message isn't typed into the middle of mine. Anything typed there is passed to the adversary as an amendment to the task, and it takes precedence over the original.
+
+The bridge pane along the bottom is kept 4 rows high. It shows the status line (`[running]`/`[PAUSED]`, exchanges against the cap, approvals and denials, pending permissions, whether each side is busy or idle, and "worker on hold") and a log of each relay. The keys above work when it has focus.
+
+When the worker has nothing to do until I decide something, the adversary calls `hold`. Its reply that turn isn't forwarded and the worker stays idle, rather than the two trading "keep holding" / "holding" messages. The hold ends when the adversary calls `message_worker` or I type to the worker, and a held run isn't logged as a stall.
 
 Each run writes to `~/.local/state/adversary/runs/<timestamp>/`:
 
@@ -119,7 +126,7 @@ In a git repo, `changed_files` reports `git status` and `git diff --stat` agains
 
   The hook command (`adversary/hook.py`) talks to the bridge over a Unix socket.
 - **The bridge speaks by typing into tmux.** Each message is a typed one-line header, then the body as a bracketed paste, then Enter. The header matters: Claude Code wraps long pastes in `<pasted_content>` and won't follow pasted instructions unless the typed part of the message asks it to.
-- **Messages are free-form text.** The bridge never parses what either side says. The only structured signals are the adversary's MCP tool calls: `approve_tool`, `deny_tool`, `message_worker`, `changed_files` and `finish`. They are served by `adversary/mcp_server.py`, a dependency-free stdio server.
+- **Messages are free-form text.** The bridge never parses what either side says. The only structured signals are the adversary's MCP tool calls: `approve_tool`, `deny_tool`, `message_worker`, `hold`, `changed_files` and `finish`. They are served by `adversary/mcp_server.py`, a dependency-free stdio server.
 - **The adversary cannot change the project.**
   - It runs with `--permission-mode dontAsk`.
   - Its allowlist is Read/Grep/Glob plus read and verify Bash prefixes (git diff/log/status, test runners and similar).
@@ -131,7 +138,7 @@ In a git repo, `changed_files` reports `git status` and `git diff --stat` agains
 
 - **Pre-approved commands skip the adversary.** In default mode, a command already allowed by user settings (for example a `Bash(curl:*)` rule in `~/.claude/settings*.json`) runs without reaching the adversary. `--strict-approvals` prevents this.
 - **Answering on screen:** if a worker permission prompt is answered on screen, the adversary's pending request expires when the worker's turn ends.
-- **Typing over a delivery:** if the bridge delivers a message while someone is typing in that pane, the two get mixed together. Press `p` to pause before typing.
+- **Typing over a delivery:** if the bridge delivers a message while someone is typing in that pane, the two get mixed together. Press `p` to pause before typing. If a typed prompt is submitted before the bridge's message goes in, the bridge recognises it as typed (it lacks the bridge's header), treats the turn as the person's, and resends its own message afterwards.
 
 ## Layout
 
@@ -140,7 +147,8 @@ adversary/
   cli.py          adversary run: run directory, snapshot, tmux layout
   bridge.py       socket server, relay logic, permission routing, caps, status
   hook.py         hook command used by both sessions
-  mcp_server.py   approve_tool / deny_tool / message_worker / changed_files / finish
+  mcp_server.py   approve_tool / deny_tool / message_worker / hold / changed_files / finish
+  help/           text of the one-time popups (intro, worker-pane tip)
   config.py       run config, per-run settings, MCP config and launch scripts
   sessions.py     finding the run and Claude Code sessions to resume
   snapshot.py     folder snapshot and change detection without git

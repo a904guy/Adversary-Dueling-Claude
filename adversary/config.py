@@ -105,7 +105,8 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
         worker += ["--model", cfg.worker_model]
 
     allowed = ["Read", "Grep", "Glob", "mcp__adversary__approve_tool", "mcp__adversary__deny_tool",
-               "mcp__adversary__finish", "mcp__adversary__changed_files", "mcp__adversary__message_worker"]
+               "mcp__adversary__finish", "mcp__adversary__changed_files", "mcp__adversary__message_worker",
+               "mcp__adversary__hold"]
     allowed += [f"Bash({c}:*)" for c in cfg.adversary_bash()]
     adversary = [
         "claude",

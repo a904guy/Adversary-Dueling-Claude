@@ -52,6 +52,20 @@ TOOLS = [
         },
     },
     {
+        "name": "hold",
+        "description": (
+            "Leave the idle worker waiting, with nothing sent to it, when it has no work until the human "
+            "decides something. Your reply this turn is not forwarded. The hold ends when you call "
+            "message_worker or the human types to the worker. Use it instead of telling the worker to wait, "
+            "since every reply of yours would start another turn."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"reason": {"type": "string", "description": "What the worker is waiting for, for the run log."}},
+            "required": ["reason"],
+        },
+    },
+    {
         "name": "changed_files",
         "description": (
             "List files the worker added (A), modified (M) or deleted (D) since the run started. "
