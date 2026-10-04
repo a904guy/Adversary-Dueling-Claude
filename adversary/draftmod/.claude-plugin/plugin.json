@@ -1,0 +1,5 @@
+{
+  "name": "adversary-draft",
+  "version": "0.1.0",
+  "description": "Tells the adversary bridge whether the prompt box holds an unsent draft, so it never pastes into one."
+}

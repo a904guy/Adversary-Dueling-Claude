@@ -6,8 +6,8 @@
   To give instructions, use the ADVERSARY pane on the right. It passes
   them to the worker and keeps checking the work against them.
 
-  If you do type a message here, press p in the bridge pane first to
-  pause the relay, so a relayed message isn't typed into yours.
+  If you do type a message here, the bridge waits until you send or
+  clear it before typing anything into this pane.
 
   This tip is shown once per project.
 

@@ -12,6 +12,7 @@ from adversary.config import RunConfig
 @pytest.fixture(autouse=True)
 def fast(monkeypatch):
     monkeypatch.setattr(bridge_mod, "IDLE_SETTLE", 0)
+    monkeypatch.setattr(bridge_mod, "DRAFT_RECHECK", 0)
 
 
 @pytest.fixture
@@ -32,7 +33,8 @@ def make(repo, tmp_path, **kw):
     cfg = RunConfig(task="Do the thing.\nAll of it.", repo=str(repo), run_dir=str(run), sock=str(tmp_path / "s"),
                     base_sha=sha, **kw)
     sent, screen_idle, focused = [], set(), []   # targets of panes that look idle on screen
-    popups, has_focus = [], set()                 # popups shown; roles whose pane has focus
+    popups, has_focus, drafts = [], set(), set()  # popups shown; roles whose pane has focus / a draft
+    modes = {}                                     # role -> "shell mode" / "copy mode"
 
     async def popup(pane, title, text):
         popups.append((pane.role, title, text))
@@ -44,7 +46,9 @@ def make(repo, tmp_path, **kw):
 
     b = Bridge(cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=deliver, log=lambda m: None,
                screen_idle=lambda pane: pane.target in screen_idle, focus=lambda pane: focused.append(pane.role),
-               focused=lambda pane: pane.role in has_focus, popup=popup)
+               focused=lambda pane: pane.role in has_focus, popup=popup, has_draft=lambda pane: pane.role in drafts,
+               pane_mode=lambda pane: modes.get(pane.role))
+    b.test_drafts, b.test_modes = drafts, modes
     b.project_file = tmp_path / "projects" / "repo.json"
     b.test_popups, b.test_has_focus = popups, has_focus
     b.test_screen_idle = screen_idle
@@ -196,7 +200,16 @@ async def test_exchange_cap(repo, tmp_path):
         if i == 0:
             await submit(b, WORKER, sent)
     assert (WORKER, "a0") in sent and (WORKER, "a1") not in sent
-    assert b.finished == "INCOMPLETE"
+    assert not b.finished and b.held and b.total_exchanges == 1  # a pause, never the end
+    assert "not forwarded" in sent[-1][1] and sent[-1][0] == ADVERSARY
+    await submit(b, ADVERSARY, sent)
+    await stop(b, ADVERSARY, "Understood.")                       # reply to the note goes nowhere
+    assert (WORKER, "Understood.") not in sent
+    await b.on_hook(ADVERSARY, "UserPromptSubmit", {"prompt": "keep going on item 2"})
+    assert b.exchanges == 0                                       # the human spoke
+    b.on_mcp("message_worker", {"message": "Carry on with item 2."})
+    await settle()
+    assert sent[-1] == (WORKER, "Carry on with item 2.") and not b.held
 
 
 async def test_human_typing_is_detected_and_reply_still_relayed(repo, tmp_path):
@@ -455,22 +468,22 @@ async def test_session_ids_recorded_and_compaction_keeps_busy(repo, tmp_path):
 
 async def test_resume_asks_adversary_and_forwards_its_reply(repo, tmp_path):
     b, sent = make(repo, tmp_path)
-    b.exchanges, b.approvals, b.next_perm = 4, 9, 12
+    b.total_exchanges, b.approvals, b.next_perm = 4, 9, 12
     b.save_state()
-    b2 = Bridge(b.cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=b.deliver, log=lambda m: None, focus=lambda p: None,
+    b2 = Bridge(b.cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=b.deliver, log=lambda m: None, focus=lambda p: None, pane_mode=lambda p: None,
                 screen_idle=lambda p: False, resume="Run resumed. Check and reply.")
     await start(b2)
     assert sent == [(ADVERSARY, "Run resumed. Check and reply.")]   # no task re-sent to the worker
-    assert (b2.exchanges, b2.approvals, b2.next_perm) == (4, 9, 12)
+    assert (b2.exchanges, b2.total_exchanges, b2.approvals, b2.next_perm) == (0, 4, 9, 12)  # count restarts
     await submit(b2, ADVERSARY, sent)
     await stop(b2, ADVERSARY, "Fix item 3.")
-    assert sent[-1] == (WORKER, "Fix item 3.") and b2.exchanges == 5
+    assert sent[-1] == (WORKER, "Fix item 3.") and (b2.exchanges, b2.total_exchanges) == (1, 5)
 
 
 async def test_resume_without_state_keeps_permission_numbers_unique(repo, tmp_path):
     b, _ = make(repo, tmp_path)
     b.transcript.add("Permission request #41: Bash", "x")
-    b2 = Bridge(b.cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=b.deliver, log=lambda m: None, focus=lambda p: None,
+    b2 = Bridge(b.cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=b.deliver, log=lambda m: None, focus=lambda p: None, pane_mode=lambda p: None,
                 screen_idle=lambda p: False, resume="go")
     assert b2.next_perm == 42
 
@@ -612,3 +625,142 @@ async def test_popup_retried_until_shown(repo, tmp_path):
         b.check_popups()
         await settle()
     assert calls == ["how this works", "how this works"] and not b.project_file.exists()
+
+
+async def test_delivery_waits_for_the_persons_draft(repo, tmp_path):
+    b, sent = make(repo, tmp_path, stall_after=60)
+    await ready(b, sent)
+    b.test_drafts.add(ADVERSARY)                           # someone is typing in the adversary pane
+    await stop(b, WORKER, "Step 1 done.")
+    for _ in range(3):
+        await asyncio.sleep(0.01)                          # rechecks keep finding the draft
+    assert not any(r == ADVERSARY and t == "Step 1 done." for r, t in sent)
+    assert b.panes[ADVERSARY].waiting_on == "a draft" and "waiting on you in the adversary pane (a draft)" in b.status()
+    b.panes[WORKER].busy = b.panes[ADVERSARY].busy = False
+    b.check_stall(now=0)
+    assert b.check_stall(now=10_000) is None               # someone typing is not a stall
+    b.test_drafts.clear()                                  # sent or cleared
+    await asyncio.sleep(0.01)
+    await settle()
+    assert sent[-1] == (ADVERSARY, "Step 1 done.") and not b.panes[ADVERSARY].waiting_on
+
+
+async def test_mid_turn_message_waits_for_draft_in_worker_pane(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await start(b)
+    await submit(b, WORKER, sent)                          # worker mid-turn
+    b.test_drafts.add(WORKER)
+    b.on_mcp("message_worker", {"message": "Use the fixtures dir."})
+    await asyncio.sleep(0.01)
+    assert (WORKER, "Use the fixtures dir.") not in sent
+    b.test_drafts.clear()
+    await asyncio.sleep(0.01)
+    await settle()
+    assert sent[-1] == (WORKER, "Use the fixtures dir.")
+
+
+def test_draft_file_is_read_from_the_run_dir(repo, tmp_path):
+    b, _ = make(repo, tmp_path)
+    pane = b.panes[WORKER]
+    assert b._draft_file_says(pane) is False               # no report: no draft
+    (tmp_path / "run" / "draft-worker.json").write_text('{"draft": true, "at": 1}')
+    assert b._draft_file_says(pane) is True
+    (tmp_path / "run" / "draft-worker.json").write_text("not json")
+    assert b._draft_file_says(pane) is False
+
+
+def test_launch_scripts_load_the_draft_mod(repo, tmp_path):
+    from adversary.config import write_launch_files
+    b, _ = make(repo, tmp_path)
+    (tmp_path / "run" / "draft-adversary.json").write_text('{"draft": true}')
+    scripts = write_launch_files(b.cfg)
+    for role, script in scripts.items():
+        text = script.read_text()
+        assert "--plugin-dir" in text and "draftmod" in text
+        assert f"ADVERSARY_DRAFT_FILE={tmp_path / 'run' / f'draft-{role}.json'}" in text
+    assert not (tmp_path / "run" / "draft-adversary.json").exists()   # stale report removed
+
+
+async def test_shell_command_turn_is_not_routed_as_the_delivery(repo, tmp_path):
+    """The 14:17 / 14:19 incident: the bridge's paste ran as a `!` shell command (no
+    UserPromptSubmit), and the adversary's reply to the person was relayed to the worker."""
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "URLs fixed and staged.")
+    assert sent[-1] == (ADVERSARY, "URLs fixed and staged.") and b.panes[ADVERSARY].expecting_submit
+    # no UserPromptSubmit: the box was in shell mode and ran it; the model replies to the person
+    await stop(b, ADVERSARY, "The worker's report got pasted into your shell.")
+    assert not any(r == WORKER and "pasted into your shell" in t for r, t in sent)
+    assert b.exchanges == 0 and b.panes[ADVERSARY].last_reason is None
+    assert sent[-1] == (ADVERSARY, "URLs fixed and staged.")       # delivered again, as a prompt this time
+    await submit(b, ADVERSARY, sent)
+    assert b.panes[ADVERSARY].reason == "worker_msg"
+    await stop(b, ADVERSARY, "Good. Wait for the human to push.")
+    assert sent[-1] == (WORKER, "Good. Wait for the human to push.")
+
+
+async def test_waits_while_pane_is_in_shell_or_copy_mode(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    b.test_modes[ADVERSARY] = "shell mode"
+    await stop(b, WORKER, "done")
+    await asyncio.sleep(0.01)
+    assert not any(r == ADVERSARY and t == "done" for r, t in sent)
+    assert "(shell mode)" in b.status()
+    b.test_modes[ADVERSARY] = "copy mode"
+    await asyncio.sleep(0.01)
+    assert "(copy mode)" in b.status()
+    del b.test_modes[ADVERSARY]
+    await asyncio.sleep(0.01)
+    await settle()
+    assert sent[-1] == (ADVERSARY, "done")
+
+
+async def test_failed_delivery_is_retried_not_stuck(repo, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge_mod, "DELIVERY_RETRY", 0)
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    real, fails = b.deliver, [1]
+
+    async def flaky(role, header, body):
+        if fails:
+            fails.pop()
+            raise subprocess.CalledProcessError(1, ["tmux", "send-keys"], stderr="can't find pane")
+        await real(role, header, body)
+    b.deliver = flaky
+    await stop(b, WORKER, "done")
+    a = b.panes[ADVERSARY]
+    await asyncio.sleep(0.01)
+    await settle()
+    assert sent[-1] == (ADVERSARY, "done") and a.expecting_submit and a.reason is None
+    await submit(b, ADVERSARY, sent)
+    assert a.reason == "worker_msg"
+
+
+async def test_old_state_at_the_cap_resumes_with_room(repo, tmp_path):
+    """RootPilot's state.json: {"exchanges": 30, ...} from before the count restarted on resume."""
+    b, sent = make(repo, tmp_path)
+    (tmp_path / "run" / "state.json").write_text('{"exchanges": 30, "approvals": 1008, "denials": 27, "stalls": 0, "next_perm": 1316}')
+    b2 = Bridge(b.cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=b.deliver, log=lambda m: None, focus=lambda p: None,
+                pane_mode=lambda p: None, screen_idle=lambda p: False, resume="Resumed.")
+    assert (b2.exchanges, b2.total_exchanges, b2.approvals) == (0, 30, 1008)
+    await start(b2)
+    await submit(b2, ADVERSARY, sent)
+    await stop(b2, ADVERSARY, "Next: the kill-switch image.")
+    assert sent[-1] == (WORKER, "Next: the kill-switch image.") and not b2.finished
+
+
+async def test_quit_terminates_then_kills_stragglers():
+    polite = subprocess.Popen(["sleep", "30"])
+    stubborn = subprocess.Popen(["sh", "-c", "trap '' TERM; exec sleep 30"])
+    logged = []
+    try:
+        await asyncio.sleep(0.2)  # let sh install the trap before the SIGTERM
+        await bridge_mod.stop_processes([polite.pid, stubborn.pid], grace=1, log=logged.append)
+        await asyncio.sleep(0.2)
+        assert not bridge_mod._alive(polite.pid) and not bridge_mod._alive(stubborn.pid)
+        # Only the one ignoring SIGTERM needed SIGKILL.
+        assert logged == [f"pid {stubborn.pid} didn't exit within 1s; killing it"]
+    finally:
+        for p in (polite, stubborn):
+            p.kill()

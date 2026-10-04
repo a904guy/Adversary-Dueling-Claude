@@ -11,13 +11,13 @@
   The left pane is for watching, copying output or stopping the worker
   with Esc. Messages typed there skip the supervisor.
 
-  Before typing in either pane, it's best to pause the relay first, so
-  a relayed message isn't typed into the middle of yours.
+  Type whenever you like: while you have a message drafted in a pane,
+  the bridge waits and delivers once you send or clear it.
 
   BOTTOM  BRIDGE (status pane). Click it or select it, then press:
     p   pause / resume the relay
     s   print the status line
-    q   stop the bridge and end the run
+    q   end the run: closes both Claudes and this tmux window
   The status line shows exchanges against the cap, approvals, pending
   permissions, whether each side is busy or idle, and "worker on hold".
 

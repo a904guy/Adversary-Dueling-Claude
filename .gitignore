@@ -3,3 +3,5 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 int/
+adversary/draftmod/.claude-plugin/types/
+adversary/draftmod/tsconfig.json

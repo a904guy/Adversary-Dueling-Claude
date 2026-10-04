@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import termios
@@ -24,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 from adversary import snapshot, tmux
-from adversary.config import RunConfig
+from adversary.config import RunConfig, draft_path
 from adversary.transcript import Transcript, last_assistant_text, write_report
 
 WORKER, ADVERSARY = "worker", "adversary"
@@ -32,6 +33,9 @@ PASTE_SETTLE = 0.4   # seconds between paste and Enter (plus a little per KB)
 SUBMIT_RETRY = 2.5   # seconds to wait for UserPromptSubmit before pressing Enter again
 SUBMIT_RETRIES = 3
 IDLE_SETTLE = 1.0    # seconds after Stop/SessionStart before pasting
+DRAFT_RECHECK = 1.0  # seconds between checks while a person has a draft in the pane
+DELIVERY_RETRY = 5.0  # seconds before retrying a delivery tmux refused
+QUIT_GRACE = 10.0    # seconds the agents get to exit on SIGTERM before SIGKILL
 MAX_PERM_REMINDERS = 2
 HELP_DIR = Path(__file__).resolve().parent / "help"
 # One-time help popups: (key, title, pane it relates to). Each is shown once per project.
@@ -53,6 +57,8 @@ class Pane:
     human_prompts: list = field(default_factory=list)  # typed by the human since last relay
     direct: list = field(default_factory=list)  # message_worker texts waiting to be typed in mid-turn
     last_text: str = ""            # final message of its last turn
+    waiting_on: str | None = None  # why a delivery waits for the person: "a draft", "shell mode", "copy mode"
+    wait_retry: bool = False       # a recheck is scheduled
 
 
 @dataclass
@@ -66,7 +72,8 @@ class PermRequest:
 
 class Bridge:
     def __init__(self, cfg: RunConfig, panes: dict[str, str], deliver=None, log=print, screen_idle=None,
-                 resume: str | None = None, focus=None, focused=None, popup=None):
+                 resume: str | None = None, focus=None, focused=None, popup=None, has_draft=None,
+                 pane_mode=None):
         self.cfg = cfg
         self.panes = {role: Pane(role, target) for role, target in panes.items()}
         self.deliver = deliver or self._tmux_deliver
@@ -74,6 +81,8 @@ class Bridge:
         self.focus = focus or self._tmux_focus
         self.focused = focused or self._tmux_focused
         self.popup = popup or self._tmux_popup
+        self.has_draft = has_draft or self._draft_file_says
+        self.pane_mode = pane_mode or self._tmux_pane_mode
         self._popup_task: asyncio.Task | None = None
         # Per-project record (which help popups were shown), kept with the runs, keyed by folder.
         project = re.sub(r"[^\w.-]+", "-", cfg.origin or cfg.repo).strip("-")
@@ -82,7 +91,8 @@ class Bridge:
         self.transcript = Transcript(cfg.run_dir)
         self.perms: dict[int, PermRequest] = {}
         self.next_perm = 1
-        self.exchanges = 0
+        self.exchanges = 0         # forwarded adversary replies since the human last spoke (or resume)
+        self.total_exchanges = 0   # over the run's whole life, for the report
         self.approvals = 0
         self.denials = 0
         self.paused = False
@@ -103,7 +113,7 @@ class Bridge:
             self.enqueue(ADVERSARY, resume, "resume")
 
     # ── state kept across resumes ───────────────────────────────────────
-    STATE_KEYS = ("exchanges", "approvals", "denials", "stalls", "next_perm")
+    STATE_KEYS = ("total_exchanges", "approvals", "denials", "stalls", "next_perm")
 
     def _state_path(self) -> Path:
         return Path(self.cfg.run_dir) / "state.json"
@@ -121,9 +131,11 @@ class Bridge:
             # Runs from before state.json: keep permission numbers unique at least.
             text = self.transcript.path.read_text()
             state = {"next_perm": max(map(int, re.findall(r"Permission request #(\d+)", text)), default=0) + 1}
+        state.setdefault("total_exchanges", state.get("exchanges"))  # state.json before the split
         for k in self.STATE_KEYS:
             if isinstance(state.get(k), int):
                 setattr(self, k, state[k])
+        # `exchanges` starts again at 0: resuming is the human picking the run back up.
 
     # ── text sent to the agents ─────────────────────────────────────────
     def _adversary_brief(self) -> str:
@@ -175,9 +187,10 @@ class Bridge:
     def status(self) -> str:
         w, a = self.panes[WORKER], self.panes[ADVERSARY]
         state = self.finished or ("PAUSED" if self.paused else "running")
-        return (f"[{state}] exchange {self.exchanges}/{self.cfg.max_exchanges} · approvals {self.approvals} · "
+        return (f"[{state}] exchanges since you {self.exchanges}/{self.cfg.max_exchanges} · approvals {self.approvals} · "
                 f"denials {self.denials} · pending perms {len(self.perms)} · worker {'busy' if w.busy else 'idle'} · "
-                f"adversary {'busy' if a.busy else 'idle'}" + (" · worker on hold" if self.held else ""))
+                f"adversary {'busy' if a.busy else 'idle'}" + (" · worker on hold" if self.held else "")
+                + "".join(f" · waiting on you in the {p.role} pane ({p.waiting_on})" for p in (w, a) if p.waiting_on))
 
     # ── delivery ────────────────────────────────────────────────────────
     def enqueue(self, role: str, text: str, reason, priority: bool = False) -> None:
@@ -207,7 +220,7 @@ class Bridge:
         if delay:
             await asyncio.sleep(delay)
         pane = self.panes[role]
-        if self.paused or pane.busy or pane.expecting_submit or not pane.queue:
+        if self.paused or pane.busy or pane.expecting_submit or not pane.queue or self._waiting_on_person(pane):
             return
         body, reason = pane.queue.popleft()
         human = self.panes[WORKER].human_prompts
@@ -220,9 +233,14 @@ class Bridge:
         if role == ADVERSARY and reason == "worker_msg":
             self.release_hold("the worker sent a message")
         header = self.header(role, reason)
-        pane.busy, pane.reason, pane.expecting_submit, pane.pending = True, reason, True, (header, body, reason)
+        # The turn takes `reason` only once its UserPromptSubmit shows this text went in as a
+        # prompt: a paste that ran as a shell command, or never went in, routes nothing.
+        pane.busy, pane.expecting_submit, pane.pending = True, True, (header, body, reason)
         self.log(f"→ {role}: {self._short(body)}")
-        await self.deliver(role, header, body)
+        try:
+            await self.deliver(role, header, body)
+        except Exception as e:
+            self._delivery_failed(pane, e)
 
     @staticmethod
     def header(role: str, reason) -> str:
@@ -252,6 +270,16 @@ class Bridge:
         for _ in range(SUBMIT_RETRIES):
             await asyncio.sleep(SUBMIT_RETRY)
             if not pane.expecting_submit:
+                return
+            # Enter again only while the box still starts with our message: never submit
+            # something a person typed, or a shell command.
+            report = self._draft_report(pane)
+            if report is not None and not str(report.get("head", "")).startswith(header[:40]):
+                self.log(f"{role}: no submit seen, and the prompt box no longer holds the bridge's message; "
+                         "not pressing Enter")
+                return
+            if self.pane_mode(pane):
+                self.log(f"{role}: no submit seen, and the pane is in {self.pane_mode(pane)}; not pressing Enter")
                 return
             self.log(f"{role}: no submit seen yet, pressing Enter again")
             tmux.press(pane.target, "Enter")
@@ -306,6 +334,8 @@ class Bridge:
             if role == WORKER:
                 self.release_hold("the worker started a turn")
             if pane.expecting_submit and self._is_delivery(pane.pending, prompt):
+                if pane.pending[2] != "direct":
+                    pane.reason = pane.pending[2]  # a mid-turn message keeps the running turn's reason
                 pane.expecting_submit, pane.pending = False, None
                 if role == WORKER:
                     self._send_direct()
@@ -323,11 +353,17 @@ class Bridge:
                     in_turn = self._requeue_pending(pane)
                 if not in_turn:
                     pane.reason = "user"  # mid-turn typing is queued input; the turn keeps its reason
+                self._human_spoke()
                 pane.human_prompts.append(prompt)
                 self.log(f"human typed into {role}: {self._short(prompt)}")
                 self.transcript.add(f"Human → {role}", prompt)
             return {}
         if event == "Stop":
+            if pane.expecting_submit and pane.pending and pane.pending[2] != "direct":
+                # A turn ran without our message going in as a prompt: a shell command (`!`)
+                # or something else the person started. Their turn; ours is sent again.
+                self.log(f"{role}: the bridge's message wasn't submitted as a prompt; resending it after this turn")
+                self._requeue_pending(pane, quiet=True)
             pane.busy = False
             text = last_assistant_text(payload)
             self.on_stop(role, pane.reason, text)
@@ -381,11 +417,29 @@ class Bridge:
                          "worker_msg")
             return
         if self.exchanges >= self.cfg.max_exchanges:
-            self.finish("INCOMPLETE", f"Hit the exchange cap ({self.cfg.max_exchanges}) before the adversary "
-                        f"called finish. Last adversary message:\n\n{text}")
+            self._cap_reached(text)
             return
         self.exchanges += 1
+        self.total_exchanges += 1
         self.enqueue(WORKER, text, "adversary_msg")
+
+    def _cap_reached(self, text: str) -> None:
+        """The two have gone back and forth max_exchanges times without the human: a loop
+        guard. The worker is put on hold, not the run ended; the human picks it back up."""
+        cap = self.cfg.max_exchanges
+        self.held = f"{cap} exchanges since the human last spoke"
+        self.log(f"exchange cap: {cap} round trips without you; worker on hold, the adversary's reply not forwarded")
+        self.transcript.add(f"Exchange cap ({cap}): worker on hold", f"Not forwarded to the worker:\n\n{text}")
+        self.enqueue(ADVERSARY, f"Your last reply was not forwarded: you and the worker have gone back and forth {cap} "
+                     "times without the human, so the worker is on hold in case the two of you are looping. Nothing "
+                     "is lost. The count starts again when the human types to either of you; to carry on before "
+                     "that, send the worker what it needs with message_worker. Your reply to this note isn't "
+                     "forwarded.", "cap_note")
+
+    def _human_spoke(self) -> None:
+        if self.exchanges:
+            self.log(f"exchange count reset (was {self.exchanges}): you spoke")
+        self.exchanges = 0
 
     def _send_direct(self) -> None:
         """Deliver message_worker texts now, even mid-turn: Claude Code queues a prompt typed
@@ -394,6 +448,8 @@ class Bridge:
         pane = self.panes[WORKER]
         if not pane.direct or self.paused or self.finished or self.perms or pane.expecting_submit:
             return
+        if pane.busy and self._waiting_on_person(pane):
+            return  # (an idle worker's message goes through the queue, which checks too)
         body = "\n\n---\n\n".join(pane.direct)
         pane.direct.clear()
         if not pane.busy:
@@ -402,18 +458,95 @@ class Bridge:
         header = self.header(WORKER, "direct")
         pane.expecting_submit, pane.pending = True, (header, body, "direct")  # its submit fires right away
         self.log(f"→ worker (mid-turn): {self._short(body)}")
-        task = asyncio.get_running_loop().create_task(self.deliver(WORKER, header, body))
+        task = asyncio.get_running_loop().create_task(self._deliver_direct(pane, header, body))
         self._flush_tasks.add(task)
         task.add_done_callback(self._flush_tasks.discard)
 
-    def _requeue_pending(self, pane: Pane) -> bool:
-        """Put back a paste that a person's prompt beat to the submit. Returns whether the
-        pane was already mid-turn before that paste."""
+    async def _deliver_direct(self, pane: Pane, header: str, body: str) -> None:
+        try:
+            await self.deliver(pane.role, header, body)
+        except Exception as e:
+            self._delivery_failed(pane, e)
+
+    def _delivery_failed(self, pane: Pane, e: Exception) -> None:
+        """tmux refused the keys (the pane briefly unreachable, say): undo the delivery's
+        state and send it again shortly, rather than leave the pane marked busy forever."""
+        detail = getattr(e, "stderr", None) or e
+        self.log(f"{pane.role}: delivery failed ({str(detail).strip()}); retrying in {DELIVERY_RETRY:.0f}s")
+        direct = pane.pending is not None and pane.pending[2] == "direct"
+        self._requeue_pending(pane, quiet=True)
+        if not direct:
+            pane.busy = False
+        loop = asyncio.get_running_loop()
+        loop.call_later(DELIVERY_RETRY, self.schedule_flush, pane.role, 0)
+        if pane.role == WORKER:
+            loop.call_later(DELIVERY_RETRY, self._send_direct)
+
+    # ── waiting for the person ──────────────────────────────────────────
+    def _draft_report(self, pane: Pane) -> dict | None:
+        """What the draft mod in that session last reported, or None with no report (the
+        mod isn't loaded, or an older Claude Code without mods)."""
+        try:
+            report = json.loads(draft_path(self.cfg, pane.role).read_text())
+        except (OSError, ValueError):
+            return None
+        return report if isinstance(report, dict) else None
+
+    def _draft_file_says(self, pane: Pane) -> bool:
+        return (self._draft_report(pane) or {}).get("draft") is True
+
+    def _tmux_pane_mode(self, pane: Pane) -> str | None:
+        """A pane state that would swallow or misread typed text: copy mode (keys drive the
+        scrollback), or Claude Code's shell mode (`!`: Enter runs the box as a command).
+        Shell mode is read off the screen, as the prompt line's `!` glyph in place of `❯`;
+        mods don't report it."""
+        try:
+            if tmux.tmux("display", "-p", "-t", pane.target, "#{pane_in_mode}") == "1":
+                return "copy mode"
+        except subprocess.CalledProcessError:
+            return None
+        for line in reversed(tmux.capture(pane.target).splitlines()):
+            if line.startswith("❯"):
+                return None
+            if line.startswith(("!\u00a0", "! ")):
+                return "shell mode"
+        return None
+
+    def _waiting_on_person(self, pane: Pane) -> bool:
+        """True while typing into the pane would land in something of the person's: a message
+        half written, shell mode or copy mode. Nothing is typed until that's done.
+        Rechecked every DRAFT_RECHECK seconds."""
+        why = "a draft" if self.has_draft(pane) else self.pane_mode(pane)
+        if why is None:
+            if pane.waiting_on:
+                self.log(f"{pane.role}: no longer waiting ({pane.waiting_on} done); delivering")
+                pane.waiting_on = None
+            return False
+        if pane.waiting_on != why:
+            pane.waiting_on = why
+            self.log({"a draft": f"{pane.role}: you have a message drafted there; waiting until it's sent or cleared",
+                      "shell mode": f"{pane.role}: the prompt is in shell mode (!); waiting until it's back to normal",
+                      "copy mode": f"{pane.role}: the pane is in copy mode; waiting until you leave it"}[why])
+        if not pane.wait_retry:
+            pane.wait_retry = True
+            asyncio.get_running_loop().call_later(DRAFT_RECHECK, self._recheck_wait, pane.role)
+        return True
+
+    def _recheck_wait(self, role: str) -> None:
+        self.panes[role].wait_retry = False
+        self.schedule_flush(role, delay=0)
+        if role == WORKER:
+            self._send_direct()
+
+    def _requeue_pending(self, pane: Pane, quiet: bool = False) -> bool:
+        """Put back a paste that didn't go in as a prompt. Returns whether the pane was
+        already mid-turn before that paste."""
         _, body, reason = pane.pending or (None, None, None)
         pane.expecting_submit, pane.pending = False, None
         if reason is None:
             return pane.reason is not None
-        self.log(f"{pane.role}: a typed prompt was submitted before the bridge's message; resending it after this turn")
+        if not quiet:
+            self.log(f"{pane.role}: a typed prompt was submitted before the bridge's message; resending it after this turn")
         if reason == "direct":
             pane.direct.insert(0, body)
             return True
@@ -527,7 +660,7 @@ class Bridge:
         return f"folder snapshot `{self.cfg.snapshot_dir}` (no git)"
 
     def stats(self) -> dict:
-        return {"Exchanges": self.exchanges, "Stalls": self.stalls, "Permission approvals": self.approvals,
+        return {"Exchanges": self.total_exchanges, "Stalls": self.stalls, "Permission approvals": self.approvals,
                 "Permission denials": self.denials, "Run dir": f"`{self.cfg.run_dir}`"}
 
     # ── stall watchdog ──────────────────────────────────────────────────
@@ -545,7 +678,7 @@ class Bridge:
         # A turn can end without a Stop hook (Esc interrupt), leaving `busy` stuck, so the
         # screen counts too: Claude Code shows "esc to interrupt" only while it works.
         screen = {p.role: self.screen_idle(p) for p in (w, a) if p.busy}
-        if any(p.busy and not screen[p.role] for p in (w, a)):
+        if any(p.busy and not screen[p.role] for p in (w, a)) or w.waiting_on or a.waiting_on:
             self.idle_since = None
             return None
         if self.idle_since is None:
@@ -708,8 +841,8 @@ async def _startup_watch(bridge: Bridge) -> None:
         await asyncio.sleep(1)
         waiting = False
         for role, pane in bridge.panes.items():
-            if not pane.busy or pane.reason is not None:
-                continue  # session started
+            if pane.started:
+                continue
             waiting = True
             screen = tmux.capture(pane.target)
             for marker, label in (("Yes, I trust this folder", "trust"), ("Yes, I accept", "skip-permissions")):
@@ -750,6 +883,62 @@ async def _keyboard(bridge: Bridge, stop: asyncio.Event) -> None:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
+def _window_of(pane: str) -> str | None:
+    try:
+        return tmux.tmux("display-message", "-p", "-t", pane, "#{window_id}") or None
+    except subprocess.CalledProcessError:
+        return None
+
+
+def _pane_pid(pane: str) -> int | None:
+    try:
+        return int(tmux.tmux("display-message", "-p", "-t", pane, "#{pane_pid}"))
+    except (subprocess.CalledProcessError, ValueError):
+        return None
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    # A child of ours that exited but wasn't reaped yet counts as gone.
+    try:
+        return os.waitpid(pid, os.WNOHANG) == (0, 0)
+    except ChildProcessError:
+        return True
+
+
+async def stop_processes(pids: list[int], grace: float = QUIT_GRACE, log=print) -> None:
+    """SIGTERM each pid, wait up to `grace` seconds for them to exit, SIGKILL any left."""
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + grace
+    while any(_alive(p) for p in pids) and time.monotonic() < deadline:
+        await asyncio.sleep(0.2)
+    for pid in pids:
+        if _alive(pid):
+            log(f"pid {pid} didn't exit within {grace:.0f}s; killing it")
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+async def close_agents(bridge: Bridge, panes: list[str]) -> None:
+    """Shut down the Claude Code sessions in `panes` (each pane execs into claude)."""
+    pids = [pid for pid in map(_pane_pid, panes) if pid]
+    if not pids:
+        return
+    bridge.log("closing the worker and adversary sessions…")
+    await stop_processes(pids, log=bridge.log)
+
+
 async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file: str | None = None) -> None:
     cfg = RunConfig.load(run_dir)
     resume = Path(resume_file).read_text() if resume_file else None
@@ -758,7 +947,7 @@ async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file
         os.remove(cfg.sock)
     server = await asyncio.start_unix_server(bridge.handle_conn, path=cfg.sock)
     bridge.log(f"bridge up · run dir {run_dir}")
-    bridge.log("keys: p pause/resume relay · s status · q quit bridge")
+    bridge.log("keys: p pause/resume relay · s status · q end the run and close everything")
     stop = asyncio.Event()
     watch = asyncio.create_task(_startup_watch(bridge))
     last_status = ""
@@ -781,6 +970,11 @@ async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file
         watch.cancel()
         if os.path.exists(cfg.sock):
             os.remove(cfg.sock)
+    # The loop only ends on q: close both Claude Code sessions, then the run's tmux window.
+    window = _window_of(worker_pane)
+    await close_agents(bridge, [worker_pane, adversary_pane])
+    if window:
+        subprocess.run(["tmux", "kill-window", "-t", window], capture_output=True)
 
 
 def main() -> None:

@@ -30,7 +30,7 @@ class RunConfig:
     base_sha: str | None
     skip_permissions: bool = False
     worker_permission_mode: str | None = None
-    max_exchanges: int = 30
+    max_exchanges: int = 30   # round trips without the human before the worker is held
     worker_model: str | None = None
     adversary_model: str | None = None
     verify_cmds: list[str] = field(default_factory=list)
@@ -72,6 +72,11 @@ def _hooks(cfg: RunConfig, role: str, events: list[str]) -> dict:
             entry["matcher"] = "*"
         hooks[event] = [entry]
     return {"hooks": hooks}
+
+
+def draft_path(cfg: RunConfig, role: str) -> Path:
+    """Where the draft mod in `role`'s session reports whether its prompt box holds a draft."""
+    return Path(cfg.run_dir) / f"draft-{role}.json"
 
 
 def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
@@ -125,10 +130,15 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
     if cfg.adversary_model:
         adversary += ["--model", cfg.adversary_model]
 
+    # The draft mod reports whether the prompt box holds an unsent message (bridge waits if so).
+    draftmod = str(Path(__file__).resolve().parent / "draftmod")
     scripts = {}
     for role, argv in (("worker", worker), ("adversary", adversary)):
+        argv = argv + ["--plugin-dir", draftmod]
         if cfg.sessions.get(role):
             argv = argv + ["--resume", cfg.sessions[role]]
+        draft_file = draft_path(cfg, role)
+        draft_file.unlink(missing_ok=True)  # a previous launch's report is stale
         script = run / f"{role}.sh"
         # Wait for the bridge socket so no early hook event is lost.
         script.write_text(
@@ -136,6 +146,7 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
             f"while [ ! -S {shlex.quote(cfg.sock)} ]; do sleep 0.2; done\n"
             f"cd {shlex.quote(cfg.repo)}\n"
             f"export PYTHONPATH={shlex.quote(pkg_root)}${{PYTHONPATH:+:$PYTHONPATH}}\n"
+            f"export ADVERSARY_DRAFT_FILE={shlex.quote(str(draft_file))}\n"
             f"exec {shlex.join(argv)}\n"
         )
         script.chmod(0o755)

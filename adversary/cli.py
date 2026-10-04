@@ -241,7 +241,8 @@ def main() -> None:
     r.add_argument("--strict-approvals", action="store_true",
                    help="ignore user-level settings for the worker so no user allow rule bypasses the adversary")
     r.add_argument("--worktree", action="store_true", help="run in a fresh git worktree on branch adversary/<ts>")
-    r.add_argument("--max-exchanges", type=int, default=30, help="cap on worker↔adversary round trips (default 30)")
+    r.add_argument("--max-exchanges", type=int, default=30, help="round trips between the agents without you before the worker is put on hold (default 30); "
+                        "the count restarts whenever you type to either side, and on resume")
     r.add_argument("--stall-after", type=int, default=120, metavar="SECONDS",
                    help="log a stall when both agents sit idle this long with the run unfinished (default 120, 0 = off)")
     r.add_argument("--worker-model", help="model for the worker")
