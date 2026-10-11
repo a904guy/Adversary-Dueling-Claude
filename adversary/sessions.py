@@ -8,11 +8,24 @@ from pathlib import Path
 from adversary.config import RunConfig
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
-# The typed header that opens each agent's first prompt (see Bridge.header).
+# The typed headers that can open each agent's first prompt (see Bridge.header). The worker's
+# first prompt is the supervisor's plan on current runs, or the task itself on runs made before
+# the plan-first change; either prefix identifies a worker session.
 FIRST_PROMPT = {
-    "worker": "Here is your task (pasted below).",
-    "adversary": "Your supervision brief (pasted below).",
+    "worker": ("Your supervisor's plan for this task (pasted below).", "Here is your task (pasted below)."),
+    "adversary": ("Your supervision brief (pasted below).",),
 }
+# Headers whose first prompt does NOT quote the task: the plan the adversary writes is in its own
+# words, so the folder-scan fallback can't use the task text to recognise that worker session.
+HEADERS_WITHOUT_TASK = {"Your supervisor's plan for this task (pasted below)."}
+
+
+def session_log(cfg: RunConfig, role: str) -> Path | None:
+    """Claude Code's JSONL log for a role's recorded session, if one is recorded."""
+    sid = cfg.sessions.get(role)
+    if not sid:
+        return None
+    return CLAUDE_PROJECTS / re.sub(r"[^A-Za-z0-9]", "-", cfg.repo) / f"{sid}.jsonl"
 
 
 def run_started(run_dir: str) -> datetime:
@@ -43,30 +56,44 @@ def _first_prompt(path: Path) -> tuple[datetime, str] | None:
 def find_sessions(cfg: RunConfig) -> dict[str, str]:
     """Session IDs of a run's worker and adversary.
 
-    Runs record them as their sessions start (cfg.sessions). Older runs didn't, so
-    this falls back to Claude Code's session logs for the folder: each agent's
-    first prompt starts with a known header and contains the task, and was sent
-    within a few minutes of the run starting.
+    Runs record them as their sessions start (cfg.sessions). A recorded id is trusted only
+    if its log still holds a real conversation: a failed resume can leave a stub session
+    (metadata lines only), and the bridge may have recorded that stub, so resuming it would
+    open an empty session and the pane would die. A stub or missing id is dropped and found
+    again from Claude Code's session logs for the folder — each agent's first prompt starts
+    with a known header and contains the task, within a few minutes of the run starting. For
+    older runs that recorded nothing, this is the only source.
     """
-    found = dict(cfg.sessions)
+    folder = CLAUDE_PROJECTS / re.sub(r"[^A-Za-z0-9]", "-", cfg.repo)
+    found = {role: sid for role, sid in cfg.sessions.items()
+             if sid and _first_prompt(folder / f"{sid}.jsonl") is not None}
     if all(role in found for role in FIRST_PROMPT):
         return found
-    folder = CLAUDE_PROJECTS / re.sub(r"[^A-Za-z0-9]", "-", cfg.repo)
     start = run_started(cfg.run_dir)
     window = (start - timedelta(seconds=30), start + timedelta(minutes=10))
     task_hint = cfg.task.strip()[:200]
-    best: dict[str, tuple[datetime, str]] = {}
+    best: dict[str, tuple[float, str]] = {}   # role -> (mtime, stem); the most recently written wins
     for path in folder.glob("*.jsonl"):
-        if datetime.fromtimestamp(path.stat().st_mtime, timezone.utc) < window[0]:
+        mtime = path.stat().st_mtime
+        if datetime.fromtimestamp(mtime, timezone.utc) < window[0]:
             continue
         first = _first_prompt(path)
-        if not first or not (window[0] <= first[0] <= window[1]) or task_hint not in first[1]:
+        if not first or not (window[0] <= first[0] <= window[1]):
             continue
-        for role, header in FIRST_PROMPT.items():
-            if role not in found and first[1].startswith(header):
-                if role not in best or first[0] < best[role][0]:
-                    best[role] = (first[0], path.stem)
-    found.update({role: sid for role, (_, sid) in best.items()})
+        for role, headers in FIRST_PROMPT.items():
+            if role in found:
+                continue
+            for h in headers:
+                if not first[1].startswith(h):
+                    continue
+                # Every first prompt quotes the task except the adversary's plan, which is in its
+                # own words; for that one the time window and newest-mtime have to carry the match.
+                if h not in HEADERS_WITHOUT_TASK and task_hint not in first[1]:
+                    break
+                if role not in best or mtime > best[role][0]:
+                    best[role] = (mtime, path.stem)
+                break
+    found.update({role: stem for role, (_, stem) in best.items()})
     return found
 
 

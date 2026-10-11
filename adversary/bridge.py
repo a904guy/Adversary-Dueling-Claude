@@ -3,7 +3,8 @@
 Hooks tell the bridge what happened (a turn ended, a prompt was submitted, a
 permission is wanted). The bridge speaks by pasting text into a pane. It never
 interprets what the agents say. The only structured signals are the
-adversary's MCP tool calls (approve_tool, deny_tool, message_worker, hold, changed_files, finish).
+adversary's MCP tool calls (approve_tool, deny_tool, message_worker, hold, read_worker,
+changed_files, finish).
 """
 
 import argparse
@@ -24,9 +25,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from adversary import snapshot, tmux
+from adversary import sessions, snapshot, tmux
 from adversary.config import RunConfig, draft_path
-from adversary.transcript import Transcript, last_assistant_text, write_report
+from adversary.transcript import (Transcript, last_assistant_text, recent_activity, turn_had_tool_use,
+                                   write_report)
 
 WORKER, ADVERSARY = "worker", "adversary"
 PASTE_SETTLE = 0.4   # seconds between paste and Enter (plus a little per KB)
@@ -37,6 +39,7 @@ DRAFT_RECHECK = 1.0  # seconds between checks while a person has a draft in the 
 DELIVERY_RETRY = 5.0  # seconds before retrying a delivery tmux refused
 QUIT_GRACE = 10.0    # seconds the agents get to exit on SIGTERM before SIGKILL
 MAX_PERM_REMINDERS = 2
+QUIET_HOLD_AT = 2    # consecutive no-op worker turns (after an adversary reply) before an auto-hold
 HELP_DIR = Path(__file__).resolve().parent / "help"
 # One-time help popups: (key, title, pane it relates to). Each is shown once per project.
 POPUPS = {"intro": ("how this works", ADVERSARY), "worker_tip": ("the worker pane", WORKER)}
@@ -57,6 +60,7 @@ class Pane:
     human_prompts: list = field(default_factory=list)  # typed by the human since last relay
     direct: list = field(default_factory=list)  # message_worker texts waiting to be typed in mid-turn
     last_text: str = ""            # final message of its last turn
+    transcript_path: str | None = None  # this session's JSONL, from live hook payloads
     waiting_on: str | None = None  # why a delivery waits for the person: "a draft", "shell mode", "copy mode"
     wait_retry: bool = False       # a recheck is scheduled
 
@@ -93,6 +97,7 @@ class Bridge:
         self.next_perm = 1
         self.exchanges = 0         # forwarded adversary replies since the human last spoke (or resume)
         self.total_exchanges = 0   # over the run's whole life, for the report
+        self.quiet_rounds = 0      # worker turns in a row that did nothing after an adversary reply
         self.approvals = 0
         self.denials = 0
         self.paused = False
@@ -101,10 +106,13 @@ class Bridge:
         self.summary = ""
         self.idle_since: float | None = None   # when both agents last went idle together
         self.stalls = 0
+        self.plan_sent = False                  # the worker has been given its first instructions
         self._flush_tasks: set[asyncio.Task] = set()
 
         if resume is None:
-            self.enqueue(WORKER, cfg.task, "task")
+            # The worker is NOT given the task directly: the adversary gets it, studies the
+            # repo, and ends its first turn with a plan, which is forwarded to the worker as its
+            # instructions. One planner, so the two don't start from competing plans.
             self.enqueue(ADVERSARY, self._adversary_brief(), "init")
         else:
             # Both sessions come back with their history; the adversary decides what happens next.
@@ -140,17 +148,39 @@ class Bridge:
     # ── text sent to the agents ─────────────────────────────────────────
     def _adversary_brief(self) -> str:
         return (
-            "The worker has just been given this task (verbatim):\n\n"
+            "You are supervising a worker on this task. The worker has NOT been told the task — you "
+            "have. Nobody else plans this run: you do, so the worker builds exactly what the task "
+            "needs and the two of you don't start from competing plans.\n\n"
             f"<task>\n{self.cfg.task}\n</task>\n\n"
             f"Repository: {self.cfg.repo}\n{self._baseline_text()}\n"
             f"Worker permissions: {'all tool calls pre-approved (skip-permissions)' if self.cfg.skip_permissions else 'routed to you for approval'}\n\n"
             "Your Bash access is limited to these command prefixes, each run as ONE simple command "
             "(no `&&`, `;`, pipes, redirects, loops or `cd`; you are already in the repo): "
             f"{', '.join(self.cfg.adversary_bash())}. Anything else is denied, which does not mean Bash is "
-            "unavailable. Use Read/Grep/Glob to inspect files. You MUST run the project's tests yourself "
-            "before calling finish.\n\n"
-            "Study the repository now so you are ready to review. Your reply to this message is NOT "
-            "forwarded; end your turn with a short 'Ready.' once prepared."
+            "unavailable. Use Read/Grep/Glob to inspect files, and WebFetch/WebSearch to research "
+            "anything the task points you at that isn't in the repo — a referenced GitHub repo's source "
+            "and docs, an API, a spec. You MUST run the project's tests yourself before calling finish.\n\n"
+            "Study the repository now — and whatever else the task points you at — then END YOUR TURN with "
+            "the worker's instructions: the goal in your own words and a concrete plan for how to accomplish "
+            "it. That reply is forwarded to the worker verbatim as its first instructions and starts it "
+            "working, so write it to the worker, not to me, and don't use message_worker for it.\n\n"
+            "The plan must be YOUR analysis and decisions. If the task tells you to research, investigate, "
+            "design or 'build a plan' first, that work is yours — do it before you hand off. Do NOT just "
+            "restate the task and tell the worker to go figure out the plan: a plan that says 'research X "
+            "and write the plan' is not a plan. The worker executes your plan and writes any documents you "
+            "can't (you have no Write tool), but the thinking — which pieces, which approach, what is and "
+            "isn't possible and why — is yours and belongs in the hand-off (or you verify the worker's "
+            "version against the source yourself; 'worker, figure it out' is not supervising).\n\n"
+            "Take as many tool calls as the planning needs — the worker stays idle until you hand off, so "
+            "there is no rush to end the turn. Research references yourself on the web (a GitHub repo the "
+            "task names, documentation, an API): WebFetch a file or page, WebSearch to find it. Only when "
+            "something genuinely isn't reachable that way (a private repo, or a tree so large you need it "
+            "on disk) make your FIRST hand-off 'fetch it to <a path I can read> and stop', read it when the "
+            "worker returns, then send the real plan with message_worker. You still verify the result "
+            "against the task yourself before calling finish.\n\n"
+            "If the task is too ambiguous to plan without my input, call hold and end your turn with your "
+            "question to me instead: nothing reaches the worker until you message_worker, so no half-formed "
+            "plan leaks."
         )
 
     def _baseline_text(self) -> str:
@@ -253,6 +283,7 @@ class Bridge:
         kind = reason[0] if isinstance(reason, tuple) else reason
         return {
             "task": "Here is your task (pasted below). Treat it as my request:",
+            "plan": "Your supervisor's plan for this task (pasted below). Follow it as if I wrote it:",
             "adversary_msg": "Message from your supervisor (pasted below). Follow it as if I wrote it:",
             "init": "Your supervision brief (pasted below). Follow it as if I wrote it:",
             "resume": "This supervised run was resumed (details pasted below). Follow it as if I wrote it:",
@@ -286,7 +317,15 @@ class Bridge:
 
     @staticmethod
     def _is_notification(prompt: str) -> bool:
-        return prompt.lstrip().startswith("<task-notification>")
+        """A prompt Claude Code injected itself, not something the person typed: a background
+        task finishing, or a message from a subagent the worker launched. Subagents report back
+        as 'Another Claude session sent a message:' with a <teammate-message> block, not as a
+        <task-notification>; both must count, or a subagent's progress update is mistaken for
+        human input and resets the loop guard."""
+        p = prompt.lstrip()
+        return (p.startswith("<task-notification>")
+                or p.startswith("Another Claude session sent a message:")
+                or "<teammate-message" in p[:200])
 
     @staticmethod
     def _is_delivery(pending: tuple, prompt: str) -> bool:
@@ -313,12 +352,29 @@ class Bridge:
         return one if len(one) <= n else one[: n - 1] + "…"
 
     # ── hook events ─────────────────────────────────────────────────────
+    def _record_session(self, role: str, payload: dict) -> None:
+        """Remember `role`'s Claude Code session id, for `adversary resume`."""
+        sid = payload.get("session_id")
+        if sid and self.cfg.sessions.get(role) != sid:
+            self.cfg.sessions[role] = sid
+            self.cfg.save()
+
     async def on_hook(self, role: str, event: str, payload: dict) -> dict:
         pane = self.panes[role]
+        # Keep the session's live JSONL path for read_worker. Only a real session fires
+        # UserPromptSubmit/Stop/PermissionRequest; SessionStart can come from a stub (a failed
+        # resume), so it only fills a path we don't have yet — same caution as _record_session.
+        tp = payload.get("transcript_path")
+        if tp and (event != "SessionStart" or not pane.transcript_path):
+            pane.transcript_path = tp
         if event == "SessionStart":
-            if payload.get("session_id") and self.cfg.sessions.get(role) != payload["session_id"]:
-                self.cfg.sessions[role] = payload["session_id"]  # for `adversary resume`
-                self.cfg.save()
+            # Record the id only if we have none yet. On resume we already know the id we
+            # launched with, and Claude Code can fire SessionStart for a throwaway stub session
+            # (a failed resume writes only metadata) before the real one runs; overwriting the
+            # known id with that stub makes the next resume open an empty session and the pane
+            # dies. The id that actually runs a turn is captured at Stop instead.
+            if not self.cfg.sessions.get(role):
+                self._record_session(role, payload)
             if pane.started:
                 return {}  # compaction or /clear, possibly mid-turn: not a new idle UI
             pane.started = True
@@ -353,6 +409,11 @@ class Bridge:
                     in_turn = self._requeue_pending(pane)
                 if not in_turn:
                     pane.reason = "user"  # mid-turn typing is queued input; the turn keeps its reason
+                if self.finished and role == WORKER:
+                    # The human restarted the worker by hand on a finished run; let its reply
+                    # flow back to the adversary. (Typing to the adversary waits for its
+                    # message_worker call, so a parting "thanks" doesn't reopen the run.)
+                    self.reopen("the human typed new work into the worker")
                 self._human_spoke()
                 pane.human_prompts.append(prompt)
                 self.log(f"human typed into {role}: {self._short(prompt)}")
@@ -364,9 +425,15 @@ class Bridge:
                 # or something else the person started. Their turn; ours is sent again.
                 self.log(f"{role}: the bridge's message wasn't submitted as a prompt; resending it after this turn")
                 self._requeue_pending(pane, quiet=True)
+            # The session that just ran a turn is the live one; a stub never gets here. This keeps
+            # the recorded id pointing at the real session even when a resume forks to a new id.
+            self._record_session(role, payload)
             pane.busy = False
             text = last_assistant_text(payload)
-            self.on_stop(role, pane.reason, text)
+            # Only the worker's no-op turns drive the quiet-loop hold, and only when the adversary
+            # started the turn; read the transcript for a tool call just in that case.
+            had_tool = turn_had_tool_use(payload) if role == WORKER and pane.reason == "adversary_msg" else True
+            self.on_stop(role, pane.reason, text, had_tool)
             pane.last_reason, pane.reason = pane.reason, None
             self.schedule_flush(role)
             if role == WORKER:
@@ -376,12 +443,12 @@ class Bridge:
             return await self.on_permission(payload)
         return {}
 
-    def on_stop(self, role: str, reason, text: str) -> None:
+    def on_stop(self, role: str, reason, text: str, had_tool_use: bool = True) -> None:
         self.panes[role].last_text = text
-        self._on_stop(role, reason, text)
+        self._on_stop(role, reason, text, had_tool_use)
         self.save_state()
 
-    def _on_stop(self, role: str, reason, text: str) -> None:
+    def _on_stop(self, role: str, reason, text: str, had_tool_use: bool = True) -> None:
         if role == WORKER:
             self.transcript.add("Worker", text or "(no text)")
             self.log(f"worker ended turn: {self._short(text or '(no text)')}")
@@ -392,6 +459,17 @@ class Bridge:
                 return
             if self._blank(text):
                 text = "(the worker ended its turn without a message)"
+            # A turn the adversary's own reply started, in which the worker did nothing (no tool
+            # call), means the worker had nothing to do with that reply. Repeated, the two are only
+            # echoing while the worker waits on a background subagent. Park it rather than relay
+            # another no-op that the adversary will just answer, restarting the loop.
+            if reason == "adversary_msg" and not had_tool_use:
+                self.quiet_rounds += 1
+                if self.quiet_rounds >= QUIET_HOLD_AT and not self.held:
+                    self._quiet_hold()
+                    return
+            else:
+                self.quiet_rounds = 0
             self.enqueue(ADVERSARY, text, "worker_msg")
             return
 
@@ -409,12 +487,27 @@ class Bridge:
                     self._resolve(req, self._decision(False, "The supervisor did not decide; treat as denied."),
                                   f"#{req.id} auto-denied (no decision)")
             return
-        if reason not in ("worker_msg", "resume") or self.finished or self.held:
+        if reason not in ("worker_msg", "resume", "init") or self.finished or self.held:
             return  # on hold: the worker stays idle and this reply goes nowhere
         if self._blank(text):
-            self.enqueue(ADVERSARY, "Your last turn produced no message for the worker. Reply to the worker "
-                         "(your reply is forwarded verbatim), call hold to leave it idle, or call finish.",
-                         "worker_msg")
+            if reason != "init":
+                self.enqueue(ADVERSARY, "Your last turn produced no message for the worker. Reply to the worker "
+                             "(your reply is forwarded verbatim), call hold to leave it idle, or call finish.",
+                             "worker_msg")
+            elif not self.plan_sent:
+                # Init with no plan and nothing sent to the worker yet: ask for one. (If the plan
+                # already went out via message_worker, a blank end-of-turn is fine — stay quiet.)
+                self.enqueue(ADVERSARY, "Your turn produced no plan for the worker. Study the repo if you "
+                             "need to, then end your turn with the goal and a concrete plan — that reply is "
+                             "forwarded to the worker and starts it.", "init")
+            return
+        if reason == "init":
+            # The plan is the human's own task reaching the worker for the first time, not a
+            # round-trip the loop guard should count. Forward it once, unless message_worker
+            # already delivered the first instructions during this turn.
+            if not self.plan_sent:
+                self.plan_sent = True
+                self.enqueue(WORKER, text, "plan")
             return
         if self.exchanges >= self.cfg.max_exchanges:
             self._cap_reached(text)
@@ -436,10 +529,29 @@ class Bridge:
                      "that, send the worker what it needs with message_worker. Your reply to this note isn't "
                      "forwarded.", "cap_note")
 
+    def _quiet_hold(self) -> None:
+        """The worker has ended turn after turn doing nothing in reply to the adversary: it is
+        waiting on something that will bring it back on its own (a background subagent or task),
+        and the two are only echoing. Park the worker and tell the adversary to stop replying."""
+        self.held = "worker idle, waiting on a background subagent or task"
+        self.quiet_rounds = 0
+        self.log("quiet-loop hold: the worker did nothing after the adversary's replies; worker on hold")
+        self.transcript.add("Quiet-loop hold: worker on hold",
+                            "The worker ended consecutive turns with no action after the adversary's replies.")
+        self.enqueue(ADVERSARY,
+                     "The worker has ended several turns in a row without doing anything after your replies. It "
+                     "has nothing for you right now — it is waiting on a background subagent or task, which will "
+                     "bring it back to you on its own when it finishes. The worker is now on hold, so stop "
+                     "replying: don't send it anything and don't check in, or you'll just restart the loop. End "
+                     "your turn. It will return to you when there is real work; if the human gives you something "
+                     "new in the meantime, use message_worker then. Your reply to this note isn't forwarded.",
+                     "quiet_note")
+
     def _human_spoke(self) -> None:
         if self.exchanges:
             self.log(f"exchange count reset (was {self.exchanges}): you spoke")
         self.exchanges = 0
+        self.quiet_rounds = 0
 
     def _send_direct(self) -> None:
         """Deliver message_worker texts now, even mid-turn: Claude Code queues a prompt typed
@@ -567,6 +679,7 @@ class Bridge:
                           loop.create_future())
         self.next_perm += 1
         self.perms[req.id] = req
+        self.quiet_rounds = 0  # a permission request means the worker is doing real work
         self.log(f"permission #{req.id}: {req.tool} {self._short(json.dumps(req.input), 70)}")
         self.transcript.add(f"Permission request #{req.id}: {req.tool}", f"```json\n{json.dumps(req.input, indent=2)}\n```")
         self.enqueue(ADVERSARY, self._perm_text(req), ("perm", req.id), priority=True)
@@ -598,25 +711,34 @@ class Bridge:
             if tool == "approve_tool":
                 self.approvals += 1
                 self._resolve(req, self._decision(True), f"approved #{req.id} {args.get('note', '')}".strip())
-                return {"text": f"Approved #{req.id}. The worker's tool call will run."}
+                return {"text": f"Approved #{req.id}. The worker's tool call will run. This was a "
+                                "permission decision, not a message to the worker: nothing you say now reaches "
+                                "it, so just end your turn — no reply, and do NOT call hold (the worker is "
+                                "mid-turn). Its next request or turn-end will come to you."}
             reason = args.get("reason") or "Denied by supervisor."
             self.denials += 1
             self._resolve(req, self._decision(False, reason), f"denied #{req.id}: {reason}")
-            return {"text": f"Denied #{req.id}. The worker sees your reason."}
+            return {"text": f"Denied #{req.id}. The worker sees your reason. This was a permission decision: "
+                            "nothing else you say now reaches the worker, so just end your turn — do NOT call "
+                            "hold. Its next request or turn-end will come to you."}
         if tool == "message_worker":
             text = (args.get("message") or "").strip()
             if not text:
                 return {"text": "message is empty.", "error": True}
-            if self.finished:
-                return {"text": "The run has finished; relaying has stopped.", "error": True}
+            reopened = bool(self.finished)
+            if reopened:
+                self.reopen("the adversary sent the worker new work with message_worker")
             self.transcript.add("Adversary → worker (message_worker)", text)
+            self.plan_sent = True  # the worker has its instructions; don't also auto-forward an init reply
+            self.quiet_rounds = 0  # the adversary gave the worker real work; start the loop count fresh
             self.release_hold("the adversary messaged the worker")
             self.panes[WORKER].direct.append(text)
             self._send_direct()
+            note = "The finished run is live again. " if reopened else ""
             if self.panes[WORKER].busy:
-                return {"text": "Sent. The worker is mid-turn, so it is delivered into its current turn "
+                return {"text": note + "Sent. The worker is mid-turn, so it is delivered into its current turn "
                                 "(after any pending permission request is decided)."}
-            return {"text": "Sent. The worker was idle, so this starts its next turn."}
+            return {"text": note + "Sent. The worker was idle, so this starts its next turn."}
         if tool == "hold":
             if self.finished:
                 return {"text": "The run has finished; relaying has stopped.", "error": True}
@@ -630,14 +752,55 @@ class Bridge:
             self.transcript.add("Worker on hold", reason)
             return {"text": "The worker is on hold. Your reply this turn is not forwarded, and nothing is sent "
                             "to it until you call message_worker (or the human types to it). End your turn."}
+        if tool == "read_worker":
+            return self._read_worker(args)
         if tool == "changed_files":
             return {"text": self.changes_text()}
         if tool == "finish":
             outcome = "COMPLETE" if args.get("outcome") == "complete" else "CANNOT_COMPLETE"
             path = self.finish(outcome, args.get("summary", ""))
             return {"text": f"Run finished ({outcome}). Relaying has stopped; report written to {path}. "
-                            "You do not need to message the worker again."}
+                            "If the human later gives you new work, call message_worker: that picks the "
+                            "run back up and starts the worker again."}
         return {"text": f"Unknown tool {tool}", "error": True}
+
+    def _worker_log(self) -> Path | None:
+        """The worker session's JSONL: its live hook path, else the recorded-id fallback."""
+        tp = self.panes[WORKER].transcript_path
+        if tp and Path(tp).exists():
+            return Path(tp)
+        path = sessions.session_log(self.cfg, WORKER)
+        return path if path and path.exists() else None
+
+    def _read_worker(self, args: dict) -> dict:
+        """Show the adversary the worker's last N responses and tool calls (read-only)."""
+        try:
+            count = int(args.get("count", 10))
+        except (TypeError, ValueError):
+            count = 10
+        count = max(1, min(count, 50))
+        path = self._worker_log()
+        if not path:
+            return {"text": "The worker's session log isn't available yet (it may not have started a turn). "
+                            "Its turn-end messages still reach you as usual.", "error": True}
+        body = recent_activity(path, count)
+        if not body:
+            return {"text": "The worker's session log has no responses or tool calls yet.", "error": True}
+        self.log(f"adversary read the worker's last {count}")
+        return {"text": f"Worker's last {count} responses and tool calls (oldest first):\n\n{body}"}
+
+    def reopen(self, why: str) -> None:
+        """Bring a finished run back to life so the worker can be started on new work.
+
+        finish() is not final: the human can return with a new task. Clears the finished
+        flag (the report stays on disk as the record of that round) so message_worker and
+        the relay work again."""
+        if not self.finished:
+            return
+        self.log(f"run reopened ({why}); was {self.finished}")
+        self.transcript.add("Run reopened", why)
+        self.finished, self.summary = None, ""
+        self.idle_since = None
 
     def finish(self, outcome: str, summary: str):
         if self.finished:

@@ -43,7 +43,9 @@ TOOLS = [
         "description": (
             "Send a message to the worker right away, without waiting for it to end its turn. If it is "
             "working, the message is folded into its current turn; if it is idle, it starts a new turn. "
-            "Use it for new instructions or work from the human, or corrections it needs now."
+            "Use it for new instructions or work from the human, or corrections it needs now. If you have "
+            "already called finish and the human comes back with new work, call this: it picks the run "
+            "back up and starts the worker again."
         ),
         "inputSchema": {
             "type": "object",
@@ -54,15 +56,35 @@ TOOLS = [
     {
         "name": "hold",
         "description": (
-            "Leave the idle worker waiting, with nothing sent to it, when it has no work until the human "
-            "decides something. Your reply this turn is not forwarded. The hold ends when you call "
-            "message_worker or the human types to the worker. Use it instead of telling the worker to wait, "
-            "since every reply of yours would start another turn."
+            "Leave the idle worker waiting, with nothing sent to it, when it has no work for you right now. "
+            "Use it when the worker is waiting on a background subagent or task (its turn just says it is "
+            "'awaiting' something), or when the human tells you to leave the worker alone: a reply of yours "
+            "would only wake the worker to say it is still waiting. Your reply this turn is not forwarded. "
+            "The hold ends on its own when the worker's next real turn arrives (a subagent finishing brings "
+            "it back), or when you call message_worker, or the human types to the worker."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {"reason": {"type": "string", "description": "What the worker is waiting for, for the run log."}},
             "required": ["reason"],
+        },
+    },
+    {
+        "name": "read_worker",
+        "description": (
+            "Read the worker's own recent activity: its last N responses and tool calls, with each "
+            "tool call's result, oldest first. Only the worker's turn-end messages reach you on their "
+            "own, and its file reads and searches (Read/Grep/Glob) never surface as permission requests, "
+            "so this is how you see what it actually did. Use it to check a 'done' or 'I verified X' "
+            "claim before accepting it, or when a worker message is vague. It shows the worker's own "
+            "calls; work it handed to a background subagent shows only as that call and its result, not "
+            "the subagent's own steps. Read-only: nothing is sent to the worker."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "count": {"type": "integer", "description": "How many recent items to show (1–50, default 10)."},
+            },
         },
     },
     {

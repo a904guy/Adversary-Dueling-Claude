@@ -2,6 +2,7 @@
 
 I run one Claude Code session (the **worker**) on a task and a second Claude Code session (the **adversary**) as its supervisor, side by side in tmux. The adversary:
 
+- is given the task first, studies the repo, and hands the worker a plan — the worker is never given the task directly, so the two don't start from competing plans,
 - answers the worker's "shall I proceed?" questions,
 - approves or denies the worker's permission prompts,
 - reviews the work against the original task when the worker says it is done. It reads the code and runs the tests itself, and sends back anything missing or broken until the task is actually finished.
@@ -66,7 +67,7 @@ adversary resume
 This picks up the last run in the current directory (or the folder it was started from, for `--worktree` runs). It works after a crash, a closed terminal, a stall, or a run that already finished.
 
 - **Both sessions come back:** each Claude Code session is reopened with `claude --resume`, with its full history.
-- **The adversary decides what's next:** it is told the run was resumed and given the worker's last message (or told the worker's last turn left none). It checks the current state, then sends the worker what to do next, calls `hold`, or calls `finish`.
+- **The adversary decides what's next:** it is told the run was resumed and given the worker's last message (or told the worker's last turn left none). It checks the current state, then sends the worker what to do next, calls `hold`, or calls `finish`. This is the same hand-off as at the start of a run: the worker stays idle until the adversary's reply reaches it.
 - **New instructions are optional:** `adversary resume "Also add a --verbose flag"` passes them to the adversary as an amendment to the task, and the worker starts on them first. Without them, the adversary is told to carry on with the task as it stood, including changes asked for earlier.
 - **Counters carry over:** exchange, approval, denial and stall counts, and permission request numbers.
 
@@ -95,7 +96,11 @@ The worker pane on the left is for watching, copying output, or stopping the wor
 
 The bridge pane along the bottom is kept 4 rows high. It shows the status line (`[running]`/`[PAUSED]`, exchanges since I last spoke against the cap, approvals and denials, pending permissions, whether each side is busy or idle, "worker on hold", and "waiting for your draft") and a log of each relay. The keys above work when it has focus.
 
-When the worker has nothing to do until I decide something, the adversary calls `hold`. Its reply that turn isn't forwarded and the worker stays idle, rather than the two trading "keep holding" / "holding" messages. The hold ends when the adversary calls `message_worker` or I type to the worker, and a held run isn't logged as a stall.
+When the worker has nothing to do — because I need to decide something, or because it is waiting on a background subagent or task it launched — the adversary calls `hold`. Its reply that turn isn't forwarded and the worker stays idle, rather than the two trading "still waiting" / "leaving it be" messages while nothing happens. The hold ends when the worker's next real turn arrives (a subagent finishing brings it back on its own), when the adversary calls `message_worker`, or when I type to the worker, and a held run isn't logged as a stall.
+
+If the adversary doesn't hold and instead keeps replying to a worker that does nothing back (the classic subagent-wait loop), the bridge steps in: after a couple of worker turns in a row that take no action after an adversary reply, it puts the worker on hold itself and tells the adversary to stop replying. Messages a subagent sends back to the worker ("Another Claude session sent a message…") are treated as background notifications, not as me typing, so they don't reset the loop guard.
+
+**`finish` isn't final.** When the adversary marks a run complete and I come back later with a new task or a follow-up, I just tell the adversary in its pane; its `message_worker` call picks the finished run back up and starts the worker again (the report already on disk stays as the record of that round). I can also restart the worker by typing straight into its pane. This is lighter than `adversary resume`, which is for picking a run up in a fresh tmux session after the window is gone.
 
 Each run writes to `~/.local/state/adversary/runs/<timestamp>/`:
 
@@ -126,10 +131,11 @@ In a git repo, `changed_files` reports `git status` and `git diff --stat` agains
 
   The hook command (`adversary/hook.py`) talks to the bridge over a Unix socket.
 - **The bridge speaks by typing into tmux.** Each message is a typed one-line header, then the body as a bracketed paste, then Enter. The header matters: Claude Code wraps long pastes in `<pasted_content>` and won't follow pasted instructions unless the typed part of the message asks it to.
-- **Messages are free-form text.** The bridge never parses what either side says. The only structured signals are the adversary's MCP tool calls: `approve_tool`, `deny_tool`, `message_worker`, `hold`, `changed_files` and `finish`. They are served by `adversary/mcp_server.py`, a dependency-free stdio server.
-- **The adversary cannot change the project.**
+- **Messages are free-form text.** The bridge never parses what either side says. The only structured signals are the adversary's MCP tool calls: `approve_tool`, `deny_tool`, `message_worker`, `hold`, `read_worker`, `changed_files` and `finish`. They are served by `adversary/mcp_server.py`, a dependency-free stdio server.
+- **The adversary can look over the worker's shoulder.** Only the worker's turn-end messages are relayed, and its Read/Grep/Glob calls never raise a permission prompt, so `read_worker` lets the adversary read the worker's own last N responses and tool calls (with each result) straight from its session log — to check a "done" claim against what the worker actually ran. It is read-only and sends nothing to the worker.
+- **The adversary cannot change the project, but it can research.**
   - It runs with `--permission-mode dontAsk`.
-  - Its allowlist is Read/Grep/Glob plus read and verify Bash prefixes (git diff/log/status, test runners and similar).
+  - Its allowlist is Read/Grep/Glob, WebFetch/WebSearch, and read and verify Bash prefixes (git diff/log/status, test runners and similar). Web access lets it study a reference the task names — a GitHub repo, docs, an API — and plan from it itself, so it isn't blind to anything outside the local repo.
   - Edit, Write and NotebookEdit are disallowed.
   - `--setting-sources project` keeps personal allow rules from widening its tools.
 - **Startup dialogs are accepted automatically.** The bridge accepts the folder-trust dialog (and the skip-permissions confirmation, if shown) for the working folder.
@@ -147,7 +153,7 @@ adversary/
   cli.py          adversary run: run directory, snapshot, tmux layout
   bridge.py       socket server, relay logic, permission routing, caps, status
   hook.py         hook command used by both sessions
-  mcp_server.py   approve_tool / deny_tool / message_worker / hold / changed_files / finish
+  mcp_server.py   approve_tool / deny_tool / message_worker / hold / read_worker / changed_files / finish
   help/           text of the one-time popups (intro, worker-pane tip)
   draftmod/       Claude Code mod reporting whether a prompt box holds an unsent draft
   config.py       run config, per-run settings, MCP config and launch scripts

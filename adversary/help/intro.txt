@@ -2,7 +2,8 @@
   Two Claude Code sessions are running side by side:
 
     LEFT   WORKER      does the task. Watch it here.
-    RIGHT  ADVERSARY   your supervisor. It answers the worker's questions,
+    RIGHT  ADVERSARY   your supervisor. It is given the task first, plans it
+                       and instructs the worker, then answers its questions,
                        decides its permission requests and checks the work.
 
   Talk to the run through the RIGHT pane. It has the keyboard now.

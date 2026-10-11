@@ -109,7 +109,11 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
     if cfg.worker_model:
         worker += ["--model", cfg.worker_model]
 
-    allowed = ["Read", "Grep", "Glob", "mcp__adversary__approve_tool", "mcp__adversary__deny_tool",
+    # Read-only inspection plus web research (WebFetch/WebSearch) so the supervisor can study
+    # references the task points at — a GitHub repo, docs, an API — and plan from them itself,
+    # rather than being blind to anything outside the local repo. Still no way to change the project.
+    allowed = ["Read", "Grep", "Glob", "WebFetch", "WebSearch",
+               "mcp__adversary__approve_tool", "mcp__adversary__deny_tool",
                "mcp__adversary__finish", "mcp__adversary__changed_files", "mcp__adversary__message_worker",
                "mcp__adversary__hold"]
     allowed += [f"Bash({c}:*)" for c in cfg.adversary_bash()]

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -78,21 +79,81 @@ async def stop(b, role, text):
     await settle()
 
 
-async def test_startup_delivers_task_and_brief(repo, tmp_path):
+def transcript_file(tmp_path, name, *, tool_use):
+    """A minimal session JSONL for one turn, so turn_had_tool_use can read it."""
+    p = tmp_path / f"t-{name}.jsonl"
+    content = ([{"type": "tool_use", "name": "Bash", "input": {}}] if tool_use else []) + [{"type": "text", "text": "x"}]
+    p.write_text("\n".join([
+        json.dumps({"type": "user", "message": {"role": "user", "content": "the adversary's reply"}}),
+        json.dumps({"type": "assistant", "message": {"role": "assistant", "content": content}}),
+    ]) + "\n")
+    return str(p)
+
+
+async def stop_tx(b, role, text, path):
+    """Stop with a transcript_path, so the bridge can see whether the turn made a tool call."""
+    await b.on_hook(role, "Stop", {"last_assistant_message": text, "transcript_path": path})
+    await settle()
+
+
+async def test_startup_gives_the_task_to_the_adversary_not_the_worker(repo, tmp_path):
     b, sent = make(repo, tmp_path)
     await start(b)
-    assert (WORKER, "Do the thing.\nAll of it.") in sent
+    assert not any(r == WORKER for r, t in sent)  # the worker is not given the task directly
     brief = [t for r, t in sent if r == ADVERSARY][0]
     assert "Do the thing.\nAll of it." in brief and b.cfg.base_sha in brief
+    # The adversary ends its init turn with the plan, which is forwarded to the worker.
+    await submit(b, ADVERSARY, sent)
+    await stop(b, ADVERSARY, "Here's the plan: step 1, step 2.")
+    assert sent[-1] == (WORKER, "Here's the plan: step 1, step 2.") and b.plan_sent
+    assert b.exchanges == 0  # the first hand-off is the task reaching the worker, not a loop round-trip
+
+
+async def test_startup_plan_sent_via_message_worker_is_not_resent(repo, tmp_path):
+    """If the adversary sends the plan with message_worker during its init turn and then ends the
+    turn with no text, the bridge must not also forward (or nag for) a plan — the worker gets one."""
+    b, sent = make(repo, tmp_path)
+    await start(b)
+    await submit(b, ADVERSARY, sent)
+    b.on_mcp("message_worker", {"message": "Plan: do step 1 then step 2."})
+    await settle()
+    assert sent[-1] == (WORKER, "Plan: do step 1 then step 2.") and b.plan_sent
+    n = len(sent)
+    await stop(b, ADVERSARY, "")                  # blank end-of-turn after the tool call
+    await settle()
+    assert len(sent) == n                         # nothing resent, and no "produced no plan" nag
+    assert not b.panes[ADVERSARY].queue
+
+
+async def test_adversary_can_hold_at_init_when_the_task_is_ambiguous(repo, tmp_path):
+    """An ambiguous task: the adversary holds and asks the human at init instead of guessing a
+    plan. Its question must not leak to the worker, which stays idle until message_worker."""
+    b, sent = make(repo, tmp_path)
+    await start(b)
+    await submit(b, ADVERSARY, sent)              # adversary picks up the brief
+    r = b.on_mcp("hold", {"reason": "task doesn't say which database"})
+    assert not r.get("error") and b.held
+    await stop(b, ADVERSARY, "Should this use Postgres or SQLite?")
+    assert not any(role == WORKER for role, t in sent)   # the question did not reach the worker
+    assert not b.plan_sent
+    b.on_mcp("message_worker", {"message": "Use SQLite. Plan: step 1, step 2."})
+    await settle()
+    assert b.held is None and b.plan_sent and sent[-1] == (WORKER, "Use SQLite. Plan: step 1, step 2.")
+
+
+async def test_first_plan_turn_is_exempt_from_the_quiet_loop(repo, tmp_path):
+    """The worker's first turn (reason 'plan') often ends with a text-only ack and no tool call;
+    that must not count toward the subagent-wait auto-hold."""
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)                          # worker busy on its first (plan) turn
+    await stop_tx(b, WORKER, "Understood, starting now.", transcript_file(tmp_path, "p", tool_use=False))
+    assert b.quiet_rounds == 0 and not b.held
+    assert sent[-1][0] == ADVERSARY and sent[-1][1].endswith("Understood, starting now.")
 
 
 async def test_relay_is_verbatim_both_ways(repo, tmp_path):
     b, sent = make(repo, tmp_path)
-    await start(b)
-    await submit(b, WORKER, sent)
-    await submit(b, ADVERSARY, sent)
-    await stop(b, ADVERSARY, "Ready.")            # init turn: not forwarded
-    assert not any(r == WORKER and t == "Ready." for r, t in sent)
+    await ready(b, sent)
     await stop(b, WORKER, "Shall I proceed?\n\n- yes\n- no")
     assert sent[-1] == (ADVERSARY, "Shall I proceed?\n\n- yes\n- no")
     await submit(b, ADVERSARY, sent)
@@ -103,27 +164,29 @@ async def test_relay_is_verbatim_both_ways(repo, tmp_path):
 
 async def test_queues_until_idle(repo, tmp_path):
     b, sent = make(repo, tmp_path)
-    await start(b)
-    await submit(b, WORKER, sent)
-    await submit(b, ADVERSARY, sent)
-    await stop(b, WORKER, "done")                 # adversary still busy with init
-    assert not any(r == ADVERSARY and t == "done" for r, t in sent)
-    await stop(b, ADVERSARY, "Ready.")
-    assert sent[-1] == (ADVERSARY, "done")
+    await ready(b, sent)                          # worker busy on its first turn, adversary idle
+    await stop(b, WORKER, "A")                    # forwarded to the idle adversary
+    await submit(b, ADVERSARY, sent)              # adversary now busy on A
+    await b.on_hook(WORKER, "UserPromptSubmit", {"prompt": "go"})  # worker runs again
+    await stop(b, WORKER, "done")                 # ends while the adversary is still busy
+    assert not any(r == ADVERSARY and "done" in t for r, t in sent)   # queued, not delivered yet
+    await stop(b, ADVERSARY, "ack A")             # adversary goes idle; the queued message follows
+    assert sent[-1][0] == ADVERSARY and "done" in sent[-1][1]
 
 
 async def test_permission_approve_and_deny(repo, tmp_path):
     b, sent = make(repo, tmp_path)
-    await start(b)
-    await submit(b, WORKER, sent)
-    await submit(b, ADVERSARY, sent)
-    await stop(b, ADVERSARY, "Ready.")
+    await ready(b, sent)
 
     pending = asyncio.create_task(b.on_hook(WORKER, "PermissionRequest",
                                             {"tool_name": "Bash", "tool_input": {"command": "pytest"}}))
     await settle()
     assert sent[-1][0] == ADVERSARY and "permission #1" in sent[-1][1] and "pytest" in sent[-1][1]
-    assert b.on_mcp("approve_tool", {"request_id": 1})["text"].startswith("Approved")
+    approved = b.on_mcp("approve_tool", {"request_id": 1})["text"]
+    assert approved.startswith("Approved")
+    # The decision response tells the adversary to end the turn and not narrate/hold,
+    # so it doesn't loop saying "Holding." after every approval.
+    assert "end your turn" in approved and "hold" in approved.lower()
     out = await pending
     assert out["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
 
@@ -143,10 +206,7 @@ async def test_permission_approve_and_deny(repo, tmp_path):
 
 async def test_permission_reminder_then_autodeny(repo, tmp_path):
     b, sent = make(repo, tmp_path)
-    await start(b)
-    await submit(b, WORKER, sent)
-    await submit(b, ADVERSARY, sent)
-    await stop(b, ADVERSARY, "Ready.")
+    await ready(b, sent)
     pending = asyncio.create_task(b.on_hook(WORKER, "PermissionRequest", {"tool_name": "Edit", "tool_input": {}}))
     await settle()
     for _ in range(bridge_mod.MAX_PERM_REMINDERS):
@@ -171,10 +231,7 @@ async def test_worker_stop_expires_pending_permission(repo, tmp_path):
 
 async def test_finish_stops_relay_and_writes_report(repo, tmp_path):
     b, sent = make(repo, tmp_path)
-    await start(b)
-    await submit(b, WORKER, sent)
-    await submit(b, ADVERSARY, sent)
-    await stop(b, ADVERSARY, "Ready.")
+    await ready(b, sent)
     await stop(b, WORKER, "All done!")
     await submit(b, ADVERSARY, sent)
     b.on_mcp("finish", {"outcome": "complete", "summary": "verified: tests pass"})
@@ -187,12 +244,55 @@ async def test_finish_stops_relay_and_writes_report(repo, tmp_path):
     assert len(sent) == n
 
 
+async def test_message_worker_reopens_a_finished_run(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "All done!")
+    await submit(b, ADVERSARY, sent)
+    b.on_mcp("finish", {"outcome": "complete", "summary": "done"})
+    await stop(b, ADVERSARY, "All verified.")
+    assert b.finished
+    # Human returns with a new task; the adversary starts the worker again.
+    r = b.on_mcp("message_worker", {"message": "New task: add a changelog."})
+    await settle()
+    assert not b.finished
+    assert "live again" in r["text"]
+    assert sent[-1] == (WORKER, "New task: add a changelog.")
+    # The worker's reply now flows back to the adversary again.
+    await submit(b, WORKER, sent)
+    await stop(b, WORKER, "Changelog added.")
+    assert any(r == ADVERSARY and "Changelog added." in t for r, t in sent)
+
+
+async def test_human_typing_into_worker_reopens_a_finished_run(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "All done!")
+    await submit(b, ADVERSARY, sent)
+    b.on_mcp("finish", {"outcome": "complete", "summary": "done"})
+    await stop(b, ADVERSARY, "All verified.")
+    assert b.finished
+    # The human restarts the worker by hand in its own pane.
+    await b.on_hook(WORKER, "UserPromptSubmit", {"prompt": "actually, also fix the typo"})
+    await stop(b, WORKER, "Fixed the typo.")
+    assert not b.finished
+    assert any(r == ADVERSARY and "Fixed the typo." in t for r, t in sent)
+
+
+async def test_human_thanking_adversary_does_not_reopen(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await start(b)
+    b.finish("COMPLETE", "done")
+    n = len(sent)
+    await b.on_hook(ADVERSARY, "UserPromptSubmit", {"prompt": "thanks, that's all"})
+    await stop(b, ADVERSARY, "You're welcome.")
+    assert b.finished  # a parting word to the adversary leaves the run finished
+    assert not any(r == WORKER for r, t in sent[n:])
+
+
 async def test_exchange_cap(repo, tmp_path):
     b, sent = make(repo, tmp_path, max_exchanges=1)
-    await start(b)
-    await submit(b, WORKER, sent)
-    await submit(b, ADVERSARY, sent)
-    await stop(b, ADVERSARY, "Ready.")
+    await ready(b, sent)
     for i in range(2):
         await stop(b, WORKER, f"w{i}")
         await submit(b, ADVERSARY, sent)
@@ -214,10 +314,7 @@ async def test_exchange_cap(repo, tmp_path):
 
 async def test_human_typing_is_detected_and_reply_still_relayed(repo, tmp_path):
     b, sent = make(repo, tmp_path)
-    await start(b)
-    await submit(b, WORKER, sent)
-    await submit(b, ADVERSARY, sent)
-    await stop(b, ADVERSARY, "Ready.")
+    await ready(b, sent)
     await stop(b, WORKER, "first")
     await b.on_hook(WORKER, "UserPromptSubmit", {"prompt": "human: also add docs"})
     assert b.panes[WORKER].reason == "user"
@@ -237,7 +334,7 @@ async def test_pause_holds_delivery(repo, tmp_path):
     assert sent == []
     b.toggle_pause()
     await settle()
-    assert len(sent) == 2
+    assert len(sent) == 1  # only the adversary's brief is queued at start (the worker gets no task)
 
 
 async def test_socket_roundtrip_hook_and_mcp(repo, tmp_path):
@@ -269,7 +366,7 @@ async def test_socket_roundtrip_hook_and_mcp(repo, tmp_path):
         out, _ = await proc.communicate("".join(json.dumps(m) + "\n" for m in msgs).encode())
         replies = [json.loads(l) for l in out.decode().splitlines()]
         assert [r["id"] for r in replies] == [1, 2, 3]
-        assert {t["name"] for t in replies[1]["result"]["tools"]} == {"approve_tool", "deny_tool", "message_worker", "hold", "changed_files", "finish"}
+        assert {t["name"] for t in replies[1]["result"]["tools"]} == {"approve_tool", "deny_tool", "message_worker", "hold", "read_worker", "changed_files", "finish"}
         assert "CANNOT_COMPLETE" in replies[2]["result"]["content"][0]["text"]
         assert b.finished == "CANNOT_COMPLETE"
 
@@ -277,24 +374,23 @@ async def test_socket_roundtrip_hook_and_mcp(repo, tmp_path):
 async def test_wrapped_paste_is_not_mistaken_for_human(repo, tmp_path):
     """Claude Code rewrites long pastes (<pasted_content>); our submit must still be recognised."""
     b, sent = make(repo, tmp_path)
-    await start(b)
-    await b.on_hook(WORKER, "UserPromptSubmit", {"prompt": 'Here is your task: <pasted_content id="x">…</pasted_content>'})
-    assert b.panes[WORKER].reason == "task"
+    await start(b)                                # the brief is delivered to the adversary
     await b.on_hook(ADVERSARY, "UserPromptSubmit", {"prompt": "[Pasted text #1 +40 lines]"})
     assert b.panes[ADVERSARY].reason == "init"
+    await stop(b, ADVERSARY, "the plan")          # forwarded to the worker as its plan
+    await b.on_hook(WORKER, "UserPromptSubmit",
+                    {"prompt": "Your supervisor's plan for this task <pasted_content id=\"x\">…</pasted_content>"})
+    assert b.panes[WORKER].reason == "plan"
 
 
 def test_every_delivery_has_a_typed_header():
-    for reason in ("task", "adversary_msg", "init", "worker_msg", ("perm", 3), "other"):
+    for reason in ("task", "plan", "adversary_msg", "init", "worker_msg", ("perm", 3), "other"):
         assert Bridge.header(WORKER, reason).strip()
 
 
 async def test_queued_worker_messages_are_coalesced_with_human_note(repo, tmp_path):
     b, sent = make(repo, tmp_path)
-    await start(b)
-    await submit(b, WORKER, sent)
-    await submit(b, ADVERSARY, sent)
-    await stop(b, ADVERSARY, "Ready.")
+    await ready(b, sent)
     b.toggle_pause()
     await stop(b, WORKER, "first done")
     await b.on_hook(WORKER, "UserPromptSubmit", {"prompt": "also add a line"})
@@ -313,10 +409,7 @@ NOTE = "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n
 async def test_mid_turn_notification_keeps_reply_relayed(repo, tmp_path):
     """A background task finishing mid-turn must not turn the adversary's review into a 'user' turn."""
     b, sent = make(repo, tmp_path)
-    await start(b)
-    await submit(b, WORKER, sent)
-    await submit(b, ADVERSARY, sent)
-    await stop(b, ADVERSARY, "Ready.")
+    await ready(b, sent)
     await stop(b, WORKER, "Done.")
     await submit(b, ADVERSARY, sent)
     await b.on_hook(ADVERSARY, "UserPromptSubmit", {"prompt": NOTE})
@@ -327,10 +420,7 @@ async def test_mid_turn_notification_keeps_reply_relayed(repo, tmp_path):
 
 async def test_idle_notification_continues_previous_turn(repo, tmp_path):
     b, sent = make(repo, tmp_path)
-    await start(b)
-    await submit(b, WORKER, sent)
-    await submit(b, ADVERSARY, sent)
-    await stop(b, ADVERSARY, "Ready.")
+    await ready(b, sent)
     await stop(b, WORKER, "Done.")
     await submit(b, ADVERSARY, sent)
     await stop(b, ADVERSARY, "Tests are running, hold on.")
@@ -347,18 +437,14 @@ async def test_idle_notification_continues_previous_turn(repo, tmp_path):
 
 async def test_worker_notification_is_not_a_human_amendment(repo, tmp_path):
     b, sent = make(repo, tmp_path)
-    await start(b)
-    await submit(b, WORKER, sent)
+    await ready(b, sent)                    # worker mid-turn on its first (plan) turn
     await b.on_hook(WORKER, "UserPromptSubmit", {"prompt": NOTE})
     assert not b.panes[WORKER].human_prompts
 
 
 async def test_human_typing_mid_turn_keeps_reason(repo, tmp_path):
     b, sent = make(repo, tmp_path)
-    await start(b)
-    await submit(b, WORKER, sent)
-    await submit(b, ADVERSARY, sent)
-    await stop(b, ADVERSARY, "Ready.")
+    await ready(b, sent)
     await stop(b, WORKER, "Done.")
     await submit(b, ADVERSARY, sent)
     await b.on_hook(ADVERSARY, "UserPromptSubmit", {"prompt": "also check the docs"})
@@ -368,14 +454,13 @@ async def test_human_typing_mid_turn_keeps_reason(repo, tmp_path):
 
 async def test_message_worker_mid_turn_and_idle(repo, tmp_path):
     b, sent = make(repo, tmp_path)
-    await start(b)
-    await submit(b, WORKER, sent)          # worker is mid-turn on the task
+    await ready(b, sent)                    # worker is mid-turn on its first (plan) turn
     r = b.on_mcp("message_worker", {"message": "Also add a --verbose flag."})
     await settle()
     assert not r.get("error") and sent[-1] == (WORKER, "Also add a --verbose flag.")
-    assert b.panes[WORKER].busy and b.panes[WORKER].reason == "task"
+    assert b.panes[WORKER].busy and b.panes[WORKER].reason == "plan"
     await submit(b, WORKER, sent)           # Claude Code queues it: UserPromptSubmit fires mid-turn
-    assert not b.panes[WORKER].human_prompts and b.panes[WORKER].reason == "task"
+    assert not b.panes[WORKER].human_prompts and b.panes[WORKER].reason == "plan"
     await stop(b, WORKER, "Done, flag added.")
     assert b.panes[ADVERSARY].queue or sent[-1] == (ADVERSARY, "Done, flag added.")
     # idle worker: becomes a normal delivery
@@ -387,8 +472,7 @@ async def test_message_worker_mid_turn_and_idle(repo, tmp_path):
 
 async def test_message_worker_waits_for_pending_permission(repo, tmp_path):
     b, sent = make(repo, tmp_path)
-    await start(b)
-    await submit(b, WORKER, sent)
+    await ready(b, sent)                    # worker mid-turn on its first (plan) turn
     perm = asyncio.create_task(b.on_permission({"tool_name": "Bash", "tool_input": {"command": "ls"}}))
     await settle()
     b.on_mcp("message_worker", {"message": "Use the fixtures dir."})
@@ -402,20 +486,17 @@ async def test_message_worker_waits_for_pending_permission(repo, tmp_path):
 
 async def test_stall_logged_once_when_both_idle(repo, tmp_path):
     b, sent = make(repo, tmp_path, stall_after=60)
-    await start(b)
-    await submit(b, WORKER, sent)
-    await submit(b, ADVERSARY, sent)
-    assert b.check_stall(now=0) is None                 # both busy
-    await stop(b, ADVERSARY, "Ready.")
+    await ready(b, sent)                                # worker busy on plan, adversary idle
+    assert b.check_stall(now=0) is None                 # worker still busy
     b.panes[WORKER].busy = False                        # e.g. a relay was lost: nobody is working
-    b.panes[WORKER].last_reason = "task"
+    b.panes[WORKER].last_reason = "plan"
     assert b.check_stall(now=100) is None               # idle clock starts
     assert b.check_stall(now=150) is None
     rec = b.check_stall(now=161)
-    assert rec and rec["idle_seconds"] == 61 and rec["adversary_last_text"] == "Ready."
+    assert rec and rec["idle_seconds"] == 61 and rec["adversary_last_text"] == "Plan: do the thing."
     assert b.check_stall(now=500) is None               # once per episode
     lines = (tmp_path / "run" / "stalls.jsonl").read_text().splitlines()
-    assert len(lines) == 1 and json.loads(lines[0])["worker_last_reason"] == "'task'"
+    assert len(lines) == 1 and json.loads(lines[0])["worker_last_reason"] == "'plan'"
     assert "STALL" in (tmp_path / "run" / "transcript.md").read_text()
     b.panes[WORKER].busy = True                         # work resumes: re-armed
     assert b.check_stall(now=600) is None
@@ -443,10 +524,7 @@ async def test_no_stall_when_paused_finished_or_disabled(repo, tmp_path):
 async def test_stall_detected_when_turn_ends_without_stop(repo, tmp_path):
     """Esc-interrupting a turn fires no Stop hook: the bridge still thinks the pane is busy."""
     b, sent = make(repo, tmp_path, stall_after=60)
-    await start(b)
-    await submit(b, WORKER, sent)
-    await submit(b, ADVERSARY, sent)
-    await stop(b, ADVERSARY, "Ready.")
+    await ready(b, sent)
     b.check_stall(now=0)
     assert b.check_stall(now=100) is None               # worker busy on screen too
     b.test_screen_idle.add("%1")                         # interrupted: idle prompt, no Stop
@@ -461,9 +539,21 @@ async def test_session_ids_recorded_and_compaction_keeps_busy(repo, tmp_path):
     await b.on_hook(ADVERSARY, "SessionStart", {"session_id": "a-1", "source": "startup"})
     await settle()
     assert RunConfig.load(b.cfg.run_dir).sessions == {"worker": "w-1", "adversary": "a-1"}
-    await submit(b, WORKER, sent)
+    await b.on_hook(WORKER, "UserPromptSubmit", {"prompt": "starting"})  # worker now mid-turn
     await b.on_hook(WORKER, "SessionStart", {"session_id": "w-1", "source": "compact"})  # mid-turn
     assert b.panes[WORKER].busy
+
+
+async def test_a_stub_session_start_does_not_overwrite_a_known_id(repo, tmp_path):
+    """On resume we launch with a known id; a throwaway stub session that fires SessionStart
+    must not replace it, or the next resume opens an empty session."""
+    b, sent = make(repo, tmp_path)
+    b.cfg.sessions = {"worker": "real-worker", "adversary": "real-adv"}
+    await b.on_hook(WORKER, "SessionStart", {"session_id": "stub", "source": "startup"})
+    assert b.cfg.sessions["worker"] == "real-worker"              # the stub didn't win
+    # The session that actually runs a turn is recorded (captures a resume that forks the id).
+    await b.on_hook(WORKER, "Stop", {"last_assistant_message": "done", "session_id": "forked-worker"})
+    assert RunConfig.load(b.cfg.run_dir).sessions["worker"] == "forked-worker"
 
 
 async def test_resume_asks_adversary_and_forwards_its_reply(repo, tmp_path):
@@ -489,10 +579,13 @@ async def test_resume_without_state_keeps_permission_numbers_unique(repo, tmp_pa
 
 
 async def ready(b, sent):
+    """Reach the steady state where the worker is busy on its first turn and the adversary is idle:
+    the adversary picks up the brief and ends its init turn with a plan, which is forwarded to the
+    worker and starts it."""
     await start(b)
-    await submit(b, WORKER, sent)
-    await submit(b, ADVERSARY, sent)
-    await stop(b, ADVERSARY, "Ready.")
+    await submit(b, ADVERSARY, sent)                  # adversary picks up the supervision brief
+    await stop(b, ADVERSARY, "Plan: do the thing.")   # init reply, forwarded to the worker as the plan
+    await submit(b, WORKER, sent)                      # worker starts on the plan (reason "plan")
 
 
 async def test_hold_ends_the_ping_pong(repo, tmp_path):
@@ -532,6 +625,80 @@ async def test_hold_refused_while_worker_busy(repo, tmp_path):
     assert b.on_mcp("hold", {"reason": "x"}).get("error") and b.held is None
 
 
+async def _quiet_round(b, sent, tmp_path, worker_text, *, tool_use, name):
+    """One full round: the adversary replies, the worker runs a turn and ends it."""
+    await submit(b, ADVERSARY, sent)                       # adversary picks up the worker's message
+    await stop(b, ADVERSARY, f"leaving it be ({name})")    # forwarded to the worker
+    await submit(b, WORKER, sent)                          # worker's turn starts (reason adversary_msg)
+    await stop_tx(b, WORKER, worker_text, transcript_file(tmp_path, name, tool_use=tool_use))
+
+
+async def test_quiet_subagent_loop_auto_holds_the_worker(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "awaiting dd-X")                 # worker idle, waiting on a subagent
+    await _quiet_round(b, sent, tmp_path, "still awaiting dd-X (1)", tool_use=False, name="r1")
+    assert not b.held and b.quiet_rounds == 1
+    assert (ADVERSARY, "still awaiting dd-X (1)") in sent  # first no-op was still relayed
+    await _quiet_round(b, sent, tmp_path, "still awaiting dd-X (2)", tool_use=False, name="r2")
+    assert b.held                                          # second no-op trips the auto-hold
+    assert (ADVERSARY, "still awaiting dd-X (2)") not in sent   # not relayed; the loop is cut
+    assert sent[-1][0] == ADVERSARY and "on hold" in sent[-1][1]
+
+
+async def test_worker_doing_real_work_after_a_reply_never_auto_holds(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "working")
+    for i in range(3):                                     # three rounds, each with a real tool call
+        await _quiet_round(b, sent, tmp_path, f"did work {i}", tool_use=True, name=f"w{i}")
+    assert not b.held and b.quiet_rounds == 0
+    assert (ADVERSARY, "did work 2") in sent               # every real turn relays normally
+
+
+async def test_permission_resets_the_quiet_counter(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "awaiting dd-X")
+    await _quiet_round(b, sent, tmp_path, "still awaiting (1)", tool_use=False, name="q1")
+    assert b.quiet_rounds == 1
+    pending = asyncio.create_task(b.on_hook(WORKER, "PermissionRequest", {"tool_name": "Bash", "tool_input": {}}))
+    await settle()
+    assert b.quiet_rounds == 0                             # a permission request is real work
+    b.on_mcp("approve_tool", {"request_id": b.next_perm - 1})
+    await pending
+
+
+async def test_auto_hold_is_released_when_a_subagent_brings_the_worker_back(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "awaiting dd-X")
+    await _quiet_round(b, sent, tmp_path, "still (1)", tool_use=False, name="a1")
+    await _quiet_round(b, sent, tmp_path, "still (2)", tool_use=False, name="a2")
+    assert b.held
+    await submit(b, ADVERSARY, sent)                       # adversary reads the stop-replying note
+    await stop(b, ADVERSARY, "Standing down.")            # its reply to the note goes nowhere
+    assert not any(r == WORKER and t == "Standing down." for r, t in sent)
+    teammate = ('Another Claude session sent a message:\n<teammate-message teammate_id="dd-X">\n'
+                '{"type":"idle_notification","from":"dd-X"}\n</teammate-message>')
+    await b.on_hook(WORKER, "UserPromptSubmit", {"prompt": teammate})
+    assert b.held is None                                  # the worker is back on its own
+    await stop(b, WORKER, "Subagent found three issues.")
+    assert sent[-1][0] == ADVERSARY and sent[-1][1].endswith("Subagent found three issues.")
+
+
+async def test_teammate_message_is_a_notification_not_human(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "done")
+    b.exchanges = 3
+    teammate = ('Another Claude session sent a message:\n<teammate-message teammate_id="dd-X">\n'
+                '{"type":"idle_notification","from":"dd-X"}\n</teammate-message>')
+    assert Bridge._is_notification(teammate)
+    await b.on_hook(WORKER, "UserPromptSubmit", {"prompt": teammate})
+    assert not b.panes[WORKER].human_prompts and b.exchanges == 3
+
+
 async def test_invisible_replies_count_as_empty(repo, tmp_path):
     b, sent = make(repo, tmp_path)
     await ready(b, sent)
@@ -561,13 +728,12 @@ async def test_typed_prompt_beating_a_delivery_is_the_humans_turn(repo, tmp_path
 
 async def test_typed_prompt_beating_a_mid_turn_message_requeues_it(repo, tmp_path):
     b, sent = make(repo, tmp_path)
-    await start(b)
-    await submit(b, WORKER, sent)                          # worker mid-turn on the task
+    await ready(b, sent)                                   # worker mid-turn on its first (plan) turn
     b.on_mcp("message_worker", {"message": "Use the fixtures dir."})
     await settle()
     await b.on_hook(WORKER, "UserPromptSubmit", {"prompt": "human: hurry up"})
     w = b.panes[WORKER]
-    assert w.reason == "task" and w.direct == ["Use the fixtures dir."]
+    assert w.reason == "plan" and w.direct == ["Use the fixtures dir."]
     b._send_direct()
     await settle()
     assert sent[-1] == (WORKER, "Use the fixtures dir.")
@@ -647,8 +813,7 @@ async def test_delivery_waits_for_the_persons_draft(repo, tmp_path):
 
 async def test_mid_turn_message_waits_for_draft_in_worker_pane(repo, tmp_path):
     b, sent = make(repo, tmp_path)
-    await start(b)
-    await submit(b, WORKER, sent)                          # worker mid-turn
+    await ready(b, sent)                                   # worker mid-turn on its first (plan) turn
     b.test_drafts.add(WORKER)
     b.on_mcp("message_worker", {"message": "Use the fixtures dir."})
     await asyncio.sleep(0.01)
@@ -764,3 +929,128 @@ async def test_quit_terminates_then_kills_stragglers():
     finally:
         for p in (polite, stubborn):
             p.kill()
+
+
+def worker_log(path, entries):
+    """A worker session JSONL. Each entry is ("prompt"|"resp", text), ("tool", name, input, result),
+    ("tool_noresult", name, input), or a raw dict passed straight through (thinking, meta, ...)."""
+    lines = []
+    for e in entries:
+        if isinstance(e, dict):
+            lines.append(e)
+        elif e[0] == "prompt":
+            lines.append({"type": "user", "message": {"role": "user", "content": e[1]}})
+        elif e[0] == "resp":
+            lines.append({"type": "assistant", "message": {"content": [{"type": "text", "text": e[1]}]}})
+        elif e[0] in ("tool", "tool_noresult"):
+            tid = f"tu-{len(lines)}"
+            lines.append({"type": "assistant",
+                          "message": {"content": [{"type": "tool_use", "id": tid, "name": e[1], "input": e[2]}]}})
+            if e[0] == "tool":
+                lines.append({"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": tid, "content": e[3]}]}})
+    Path(path).write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+    return str(path)
+
+
+async def test_read_worker_shows_responses_and_tool_calls_oldest_first(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    log = worker_log(tmp_path / "w.jsonl", [
+        ("prompt", "do it"),
+        ("resp", "Reading the file."),
+        ("tool", "Read", {"file_path": "/x/calc.py"}, "1  def add(): ..."),
+        ("tool", "Grep", {"pattern": "TODO", "path": "/x/src"}, "no matches"),
+        ("tool", "Bash", {"command": "pytest -q", "description": "run tests"}, "3 passed"),
+        ("resp", "All tests pass."),
+    ])
+    b.panes[WORKER].transcript_path = log
+    out = b.on_mcp("read_worker", {"count": 10})
+    assert not out.get("error")
+    t = out["text"]
+    assert (t.index("Reading the file.") < t.index("Read: /x/calc.py") < t.index("Grep: TODO")
+            < t.index("Bash: pytest -q") < t.index("All tests pass."))
+    assert "Grep: /x/src" not in t                               # the pattern wins over the path
+    assert "3 passed" in t and "1  def add" in t                 # each tool call shows its result
+
+
+async def test_read_worker_count_clamps_and_limits(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    log = worker_log(tmp_path / "w.jsonl", [("resp", f"line {i}") for i in range(20)])
+    b.panes[WORKER].transcript_path = log
+    few = b.on_mcp("read_worker", {"count": 3})["text"]
+    assert few.count("**Worker:**") == 3 and "line 19" in few and "line 16" not in few   # newest 3
+    big = b.on_mcp("read_worker", {"count": 999})["text"]
+    assert big.count("**Worker:**") == 20                        # clamped to what's there, ceiling 50
+    assert b.on_mcp("read_worker", {"count": 0})["text"].count("**Worker:**") == 1   # floored to 1
+    assert b.on_mcp("read_worker", {"count": "nope"})["text"].count("**Worker:**") == 10  # default on junk
+
+
+async def test_read_worker_marks_a_tool_call_with_no_result_yet(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    log = worker_log(tmp_path / "w.jsonl", [("tool_noresult", "Bash", {"command": "sleep 5"})])
+    b.panes[WORKER].transcript_path = log
+    assert "(no result yet)" in b.on_mcp("read_worker", {})["text"]
+
+
+async def test_read_worker_truncates_big_input_and_output(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    log = worker_log(tmp_path / "w.jsonl", [
+        ("tool", "Write", {"file_path": "x", "content": "Z" * 5000}, "Y" * 5000),
+        ("resp", "Q" * 5000),
+    ])
+    b.panes[WORKER].transcript_path = log
+    t = b.on_mcp("read_worker", {})["text"]
+    assert "… (+" in t and "chars)" in t
+    assert len(t) < 4000                                         # not the full 15k of raw content
+
+
+async def test_read_worker_skips_thinking_and_meta(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    log = worker_log(tmp_path / "w.jsonl", [
+        {"type": "assistant", "message": {"content": [{"type": "thinking", "thinking": "secret reasoning"}]}},
+        {"type": "user", "isMeta": True, "message": {"content": [{"type": "text", "text": "injected reminder"}]}},
+        ("resp", "visible answer"),
+    ])
+    b.panes[WORKER].transcript_path = log
+    t = b.on_mcp("read_worker", {})["text"]
+    assert "visible answer" in t and "secret reasoning" not in t and "injected reminder" not in t
+
+
+async def test_read_worker_falls_back_to_the_recorded_session_log(repo, tmp_path, monkeypatch):
+    from adversary import sessions
+    monkeypatch.setattr(sessions, "CLAUDE_PROJECTS", tmp_path / "projects")
+    folder = tmp_path / "projects" / __import__("re").sub(r"[^A-Za-z0-9]", "-", str(repo))
+    folder.mkdir(parents=True)
+    worker_log(folder / "wsid.jsonl", [("resp", "from the recorded log")])
+    b, sent = make(repo, tmp_path)
+    b.cfg.sessions = {"worker": "wsid"}
+    b.panes[WORKER].transcript_path = None                       # no live path seen yet
+    assert "from the recorded log" in b.on_mcp("read_worker", {})["text"]
+
+
+async def test_read_worker_errors_when_no_log_is_available(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    b.panes[WORKER].transcript_path = None
+    b.cfg.sessions = {}
+    r = b.on_mcp("read_worker", {})
+    assert r.get("error") and "isn't available" in r["text"]
+
+
+async def test_read_worker_is_read_only(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "awaiting dd-X")
+    await _quiet_round(b, sent, tmp_path, "still (1)", tool_use=False, name="ro1")
+    b.panes[WORKER].transcript_path = worker_log(tmp_path / "w.jsonl", [("resp", "hi")])
+    before = (b.quiet_rounds, b.held, b.exchanges, len(sent), list(b.panes[WORKER].direct))
+    b.on_mcp("read_worker", {"count": 5})
+    assert (b.quiet_rounds, b.held, b.exchanges, len(sent), list(b.panes[WORKER].direct)) == before
+
+
+async def test_read_worker_uses_the_live_transcript_path_from_hooks(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    log = worker_log(tmp_path / "live.jsonl", [("resp", "live turn output")])
+    await stop_tx(b, WORKER, "done step", log)                  # Stop payload carries the path
+    assert b.panes[WORKER].transcript_path == log
+    assert "live turn output" in b.on_mcp("read_worker", {})["text"]
