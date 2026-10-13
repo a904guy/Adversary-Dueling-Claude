@@ -588,7 +588,10 @@ class Bridge:
             return
         self.exchanges += 1
         self.total_exchanges += 1
-        self.enqueue(WORKER, text, "adversary_msg")
+        # Sent right away, like message_worker: into the worker's running turn if it is busy (Claude
+        # Code folds it in), else as its next turn — never parked until the worker goes idle.
+        self.panes[WORKER].direct.append(text)
+        self._send_direct()
 
     def _cap_reached(self, text: str) -> None:
         """The two have gone back and forth max_exchanges times without the human: a loop

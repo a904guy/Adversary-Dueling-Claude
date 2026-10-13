@@ -439,7 +439,8 @@ async def test_idle_notification_continues_previous_turn(repo, tmp_path):
     await b.on_hook(ADVERSARY, "UserPromptSubmit", {"prompt": NOTE})
     await stop(b, ADVERSARY, "Tests failed: fix test_x.")
     assert "Tests failed: fix test_x." in [t for r, t in sent if r == WORKER] or \
-        any(t == "Tests failed: fix test_x." for t, _ in b.panes[WORKER].queue)
+        any(t == "Tests failed: fix test_x." for t, _ in b.panes[WORKER].queue) or \
+        "Tests failed: fix test_x." in b.panes[WORKER].direct   # waits on the in-flight paste's submit
 
 
 async def test_worker_notification_is_not_a_human_amendment(repo, tmp_path):
@@ -1484,3 +1485,18 @@ def test_dur_formats_are_readable():
     assert Bridge._dur(45) == "45s"
     assert Bridge._dur(125) == "2m"
     assert Bridge._dur(3 * 3600 + 7 * 60) == "3h 7m"
+
+
+async def test_supervisor_reply_reaches_a_busy_worker_mid_turn(repo, tmp_path):
+    """The supervisor's end-of-turn reply goes to the worker immediately, folded into its running
+    turn — not parked until the worker finishes."""
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "Step 1 done.")
+    await submit(b, ADVERSARY, sent)
+    # Before the supervisor answers, the worker is already busy again (the human, or a notification).
+    await b.on_hook(WORKER, "UserPromptSubmit", {"prompt": "<task-notification>\n<status>completed</status>"})
+    assert b.panes[WORKER].busy
+    await stop(b, ADVERSARY, "Also add a test for the empty case.")
+    assert (WORKER, "Also add a test for the empty case.") in sent      # delivered while the worker works
+    assert not b.panes[WORKER].queue
