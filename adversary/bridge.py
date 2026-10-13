@@ -220,10 +220,16 @@ class Bridge:
         if self.cfg.base_sha:
             return (f"Base commit before any work: {self.cfg.base_sha} (see changes with "
                     f"`git diff {self.cfg.base_sha}` and `git status`, or the changed_files tool)")
-        return ("This folder is NOT a git repository. Its original contents were snapshotted to "
+        text = ("This folder is NOT a git repository. Its original contents were snapshotted to "
                 f"{self.cfg.snapshot_dir}/files before the worker started. Use the changed_files tool to "
                 f"list what changed, and `diff -ru {self.cfg.snapshot_dir}/files <file-or-dir>` (or Read "
                 "both copies) to see how. Large files and dependency/build dirs were not copied.")
+        if self.cfg.git_subdirs:
+            subs = ", ".join(self.cfg.git_subdirs)
+            text += ("\nThese subdirectories ARE git repositories, so you can inspect their history with "
+                     f"`git -C <subdir> log`, `git -C <subdir> status` and `git -C <subdir> diff` "
+                     f"(e.g. `git -C {self.cfg.git_subdirs[0]} log --oneline -20`): {subs}.")
+        return text
 
     def changes_text(self) -> str:
         repo = self.cfg.repo

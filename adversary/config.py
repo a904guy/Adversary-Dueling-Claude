@@ -8,9 +8,13 @@ from pathlib import Path
 
 PROMPTS = Path(__file__).parent / "prompts"
 
+# Read-only git subcommands the adversary may run (bare in the repo root, and with `git -C
+# <subdir>` for each git repo found inside a non-git working folder).
+GIT_READONLY = ["status", "log", "diff", "show", "ls-files"]
+
 # Read/verify-only Bash commands the adversary may run (prefix rules).
 VERIFY_BASH = [
-    "git diff", "git log", "git status", "git show", "git ls-files",
+    *(f"git {verb}" for verb in GIT_READONLY),
     "pytest", "python -m pytest", "python3 -m pytest", "uv run pytest",
     "npm test", "npm run test", "npm run build", "npm run lint", "npx tsc",
     "pnpm test", "yarn test",
@@ -40,9 +44,19 @@ class RunConfig:
     stall_after: int = 120   # seconds both agents may sit idle before it is logged as a stall (0: off)
     origin: str | None = None   # folder the run was started from (differs from repo with --worktree)
     sessions: dict = field(default_factory=dict)   # role -> Claude Code session ID, for resuming
+    git_subdirs: list[str] = field(default_factory=list)   # git repos inside the working folder
 
     def adversary_bash(self) -> list[str]:
-        return VERIFY_BASH + (["diff"] if self.snapshot_dir else []) + self.verify_cmds
+        cmds = list(VERIFY_BASH)
+        if self.snapshot_dir:
+            cmds.append("diff")
+        # When the working folder itself isn't one git repo but holds some (common with a
+        # framework repo beside the app repo), let the adversary inspect each with `git -C
+        # <subdir> <read-only verb>`. Both the path and the verb are pinned, so this stays
+        # read-only — a bare `git -C` prefix would also allow commit/reset/push.
+        for d in self.git_subdirs:
+            cmds += [f"git -C {d} {verb}" for verb in GIT_READONLY]
+        return cmds + self.verify_cmds
 
     def save(self) -> Path:
         path = Path(self.run_dir) / "config.json"

@@ -20,6 +20,33 @@ def git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
 
 
+def find_git_subdirs(root: Path, max_depth: int = 2) -> list[str]:
+    """Git repositories inside `root`, as paths relative to it (for `git -C <subdir>`).
+
+    Scans a couple of levels down, skipping dependency/build dirs, and does not descend into a
+    repo once found. Lets the adversary inspect the history of repos that live inside a working
+    folder which isn't itself one git repo (e.g. an app repo beside its framework repo)."""
+    found: list[str] = []
+
+    def scan(d: Path, depth: int) -> None:
+        if depth > max_depth:
+            return
+        try:
+            children = sorted(d.iterdir())
+        except OSError:
+            return
+        for child in children:
+            if child.is_symlink() or not child.is_dir() or child.name in snapshot.SKIP_DIRS:
+                continue
+            if (child / ".git").exists():
+                found.append(str(child.relative_to(root)))
+            else:
+                scan(child, depth + 1)
+
+    scan(root, 1)
+    return found
+
+
 def die(msg: str) -> None:
     print(f"adversary: {msg}", file=sys.stderr)
     sys.exit(1)
@@ -72,7 +99,11 @@ def run(a: argparse.Namespace) -> None:
         max_exchanges=a.max_exchanges, worker_model=a.worker_model, adversary_model=a.adversary_model,
         verify_cmds=a.verify_cmd or [], session=f"adversary-{ts}", strict_approvals=a.strict_approvals,
         stall_after=a.stall_after, origin=str(Path(a.repo).expanduser().resolve()),
+        git_subdirs=find_git_subdirs(repo),
     )
+    if cfg.git_subdirs:
+        print(f"adversary: git repos inside the folder (the supervisor can inspect these with "
+              f"`git -C <subdir> log/status/diff`): {', '.join(cfg.git_subdirs)}")
     cfg.save()
     launch(cfg, no_attach=a.no_attach)
 
@@ -166,6 +197,10 @@ def resume(a: argparse.Namespace) -> None:
         die(f"run is still open in another tmux window (its bridge answers on {cfg.sock}); close that window first")
 
     cfg.sessions = found
+    # Recompute which subdirectories are git repos: a run started before this existed has none
+    # recorded, and repos may have been added since. write_launch_files then regenerates the
+    # adversary's allowlist with the `git -C <subdir>` rules.
+    cfg.git_subdirs = find_git_subdirs(Path(cfg.repo))
     if os.path.exists(cfg.sock):
         os.remove(cfg.sock)  # left behind by a bridge that didn't exit cleanly
     cfg.save()

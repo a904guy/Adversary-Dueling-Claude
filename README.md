@@ -140,6 +140,7 @@ In a git repo, `changed_files` reports `git status` and `git diff --stat` agains
 - **The adversary cannot change the project, but it can research.**
   - It runs with `--permission-mode dontAsk`.
   - Its allowlist is Read/Grep/Glob, WebFetch/WebSearch, and read and verify Bash prefixes (git diff/log/status, test runners and similar). Web access lets it study a reference the task names — a GitHub repo, docs, an API — and plan from it itself, so it isn't blind to anything outside the local repo.
+  - When the working folder isn't itself one git repo but contains some (an app repo beside its framework repo, say), each is found at launch and the adversary may inspect its history with `git -C <subdir> log/status/diff/show/ls-files`. Both the subdir and the verb are pinned in the allow rules, so this stays read-only.
   - Edit, Write and NotebookEdit are disallowed.
   - `--setting-sources project` keeps personal allow rules from widening its tools.
 - **Startup dialogs are accepted automatically.** The bridge accepts the folder-trust dialog (and the skip-permissions confirmation, if shown) for the working folder.
