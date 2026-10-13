@@ -1016,6 +1016,97 @@ def worker_log(path, entries):
     return str(path)
 
 
+def subagent_log(worker_log, agent_id, meta, entries):
+    """A subagent transcript (all sidechain) + meta beside a worker log, as Claude Code writes them."""
+    worker_log = Path(worker_log)
+    d = worker_log.parent / worker_log.stem / "subagents"
+    d.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for e in entries:
+        if e[0] == "resp":
+            lines.append({"type": "assistant", "isSidechain": True, "message": {"content": [{"type": "text", "text": e[1]}]}})
+        elif e[0] == "tool":
+            tid = f"t{len(lines)}"
+            lines.append({"type": "assistant", "isSidechain": True, "message": {"content": [{"type": "tool_use", "id": tid, "name": e[1], "input": e[2]}]}})
+            lines.append({"type": "user", "isSidechain": True, "message": {"content": [{"type": "tool_result", "tool_use_id": tid, "content": e[3]}]}})
+    m = {"requestShape": "background", **meta}
+    (d / f"agent-{agent_id}.jsonl").write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+    (d / f"agent-{agent_id}.meta.json").write_text(json.dumps(m))
+
+
+async def test_read_worker_reads_a_named_subagent_and_lists_them_otherwise(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    wlog = worker_log(tmp_path / "wsid.jsonl", [("resp", "delegating to a reviewer")])
+    b.panes[WORKER].transcript_path = wlog
+    subagent_log(wlog, "ag777", {"agentType": "reviewer", "description": "review the auth code"},
+                 [("resp", "Checking auth."), ("tool", "Grep", {"pattern": "token"}, "3 hits")])
+    plain = b.on_mcp("read_worker", {})["text"]
+    assert "delegating to a reviewer" in plain
+    assert "Subagents this worker spawned" in plain and "ag777" in plain and "reviewer" in plain
+    sub = b.on_mcp("read_worker", {"agent": "ag777"})
+    assert not sub.get("error")
+    assert "Checking auth." in sub["text"] and "Grep: token" in sub["text"] and "3 hits" in sub["text"]
+    assert "reviewer" in sub["text"]
+    assert "Checking auth." in b.on_mcp("read_worker", {"agent": "reviewer"})["text"]   # by type too
+
+
+async def test_read_worker_unknown_subagent_lists_what_is_available(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    wlog = worker_log(tmp_path / "wsid.jsonl", [("resp", "x")])
+    b.panes[WORKER].transcript_path = wlog
+    subagent_log(wlog, "ag1", {"agentType": "reviewer"}, [("resp", "hi")])
+    r = b.on_mcp("read_worker", {"agent": "ghost"})
+    assert r.get("error") and "reviewer" in r["text"] and "ag1" in r["text"]
+
+
+async def test_permission_from_a_subagent_names_it_and_routes_the_deny_to_it(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    perm = asyncio.create_task(b.on_hook(WORKER, "PermissionRequest",
+        {"tool_name": "Bash", "tool_input": {"command": "rm -rf build"},
+         "agent_id": "ag42", "agent_type": "cleaner"}))
+    await settle()
+    txt = [t for r, t in sent if r == ADVERSARY][-1]
+    assert "cleaner" in txt and "ag42" in txt and 'read_worker(agent="ag42")' in txt
+    assert "subagent" in txt and "deny" in txt                      # tells the supervisor where the deny goes
+    assert b.perms[1].agent_id == "ag42" and b.perms[1].agent_type == "cleaner"
+    b.on_mcp("deny_tool", {"request_id": 1, "reason": "too destructive for a subagent"})
+    out = await perm                                                # the decision returns to the requesting agent
+    assert out["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+    assert out["hookSpecificOutput"]["decision"]["message"] == "too destructive for a subagent"
+
+
+async def test_two_outstanding_permissions_resolve_to_their_own_agents(repo, tmp_path):
+    """Main worker and a subagent both waiting on a decision: resolving them in the opposite order
+    must deliver each decision to the request that asked, never crossed."""
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    p1 = asyncio.create_task(b.on_hook(WORKER, "PermissionRequest",
+                                       {"tool_name": "Bash", "tool_input": {"command": "ls"}}))          # #1 main
+    await settle()
+    p2 = asyncio.create_task(b.on_hook(WORKER, "PermissionRequest",
+        {"tool_name": "Bash", "tool_input": {"command": "rm x"}, "agent_id": "agZ", "agent_type": "cleaner"}))  # #2 sub
+    await settle()
+    assert set(b.perms) == {1, 2}
+    b.on_mcp("deny_tool", {"request_id": 2, "reason": "no"})        # resolve the subagent's first
+    b.on_mcp("approve_tool", {"request_id": 1})                     # then the main worker's
+    o1, o2 = await p1, await p2
+    assert o1["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+    assert o2["hookSpecificOutput"]["decision"] == {"behavior": "deny", "message": "no"}
+
+
+async def test_main_worker_permission_has_no_subagent_note(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    perm = asyncio.create_task(b.on_hook(WORKER, "PermissionRequest",
+                                         {"tool_name": "Bash", "tool_input": {"command": "ls"}}))
+    await settle()
+    txt = [t for r, t in sent if r == ADVERSARY][-1]
+    assert "subagent" not in txt.lower()
+    b.on_mcp("approve_tool", {"request_id": 1})
+    await perm
+
+
 async def test_read_worker_shows_responses_and_tool_calls_oldest_first(repo, tmp_path):
     b, sent = make(repo, tmp_path)
     log = worker_log(tmp_path / "w.jsonl", [

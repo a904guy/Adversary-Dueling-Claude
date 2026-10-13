@@ -72,18 +72,23 @@ TOOLS = [
     {
         "name": "read_worker",
         "description": (
-            "Read the worker's own recent activity: its last N responses and tool calls, with each "
-            "tool call's result, oldest first. Only the worker's turn-end messages reach you on their "
-            "own, and its file reads and searches (Read/Grep/Glob) never surface as permission requests, "
-            "so this is how you see what it actually did. Use it to check a 'done' or 'I verified X' "
-            "claim before accepting it, or when a worker message is vague. It shows the worker's own "
-            "calls; work it handed to a background subagent shows only as that call and its result, not "
-            "the subagent's own steps. Read-only: nothing is sent to the worker."
+            "Read recent activity: the last N responses and tool calls, with each tool call's result, "
+            "oldest first. Only the worker's turn-end messages reach you on their own, and its file "
+            "reads and searches (Read/Grep/Glob) never surface as permission requests, so this is how "
+            "you see what it actually did. Use it to check a 'done' or 'I verified X' claim before "
+            "accepting it, or when a worker message is vague. "
+            "With no `agent`, reads the main worker, and lists any subagents it spawned. Work handed to "
+            "a subagent shows in the worker's log only as that one call and its result, NOT the "
+            "subagent's own steps — to see those, pass `agent` with the subagent's id (the id shown in "
+            "its permission request, or in the spawned-subagents list) or its type name. Read-only: "
+            "nothing is sent to the worker or the subagent."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "count": {"type": "integer", "description": "How many recent items to show (1–50, default 10)."},
+                "agent": {"type": "string", "description": "A subagent to read instead of the main worker: "
+                          "its agent id (from its permission request) or its type name. Omit for the worker."},
             },
         },
     },

@@ -129,15 +129,19 @@ def token_usage(path) -> dict:
 
 
 def recent_activity(path, count: int, input_chars: int = 300, result_chars: int = 800,
-                    text_chars: int = 1500) -> str:
-    """The worker's last `count` responses and tool calls, oldest first, as readable markdown.
+                    text_chars: int = 1500, skip_sidechain: bool = True, speaker: str = "Worker") -> str:
+    """The last `count` responses and tool calls in a session JSONL, oldest first, as markdown.
 
     Walks the session JSONL backwards (tool_results are written after the tool_use they belong
     to, so a backward walk fills a tool_use_id→result map before reaching each call) and stops
     once `count` items are gathered. An item is one assistant text block (a response) or one
-    tool call; thinking blocks and injected metadata are skipped. The worker's own prose (what
+    tool call; thinking blocks and injected metadata are skipped. The agent's own prose (what
     it says it did) gets a larger budget than tool inputs and results, which are clipped so a
     big Write or Read can't flood the supervisor. Returns "" if the log holds no activity.
+
+    By default sidechain (subagent) entries are skipped — the worker's own log and its subagents'
+    are separate files, so this keeps a worker read to the worker. Pass skip_sidechain=False to
+    read a subagent transcript, whose entries are all sidechain.
     """
     path = Path(path)
     if not path.exists():
@@ -151,7 +155,7 @@ def recent_activity(path, count: int, input_chars: int = 300, result_chars: int 
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if entry.get("isMeta") or entry.get("isSidechain"):
+        if entry.get("isMeta") or (skip_sidechain and entry.get("isSidechain")):
             continue
         kind = entry.get("type")
         content = entry.get("message", {}).get("content", [])
@@ -170,12 +174,60 @@ def recent_activity(path, count: int, input_chars: int = 300, result_chars: int 
                 continue
             btype = b.get("type")
             if btype == "text" and b.get("text", "").strip():
-                items.append("**Worker:** " + _clip(b["text"], text_chars))
+                items.append(f"**{speaker}:** " + _clip(b["text"], text_chars))
             elif btype in ("tool_use", "server_tool_use"):
                 gist = _tool_summary(b.get("name", "tool"), b.get("input"), input_chars)
                 res = results.get(b.get("id"), "(no result yet)")
                 items.append(f"**{gist}**\n→ {res}" if res else f"**{gist}**")
     return "\n\n".join(reversed(items))
+
+
+def subagent_logs(worker_log) -> list[tuple[Path, dict]]:
+    """Transcripts of the subagents a worker session spawned, newest first, as (path, meta).
+
+    Claude Code stores them beside the session log in <session>/subagents/agent-<id>.jsonl, each
+    with an agent-<id>.meta.json sidecar (agentType, description, toolUseId, requestShape). The
+    returned meta always carries `agent_id` (the id from the filename, which is what a permission
+    request's `agent_id` matches)."""
+    worker_log = Path(worker_log)
+    d = worker_log.parent / worker_log.stem / "subagents"
+    if not d.is_dir():
+        return []
+    out: list[tuple[Path, dict]] = []
+    try:
+        files = sorted(d.glob("agent-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+    for f in files:
+        try:
+            meta = json.loads(f.with_suffix(".meta.json").read_text())
+        except (OSError, ValueError):
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        meta["agent_id"] = f.stem[len("agent-"):]   # "agent-<id>" -> "<id>"
+        out.append((f, meta))
+    return out
+
+
+def find_subagent_log(worker_log, agent: str) -> tuple[Path, dict] | None:
+    """A worker's subagent transcript matched by the `agent` the supervisor named: its exact id,
+    then an id substring, then its agentType (case-insensitive). None if nothing matches."""
+    agent = (agent or "").strip()
+    if not agent:
+        return None
+    logs = subagent_logs(worker_log)
+    low = agent.lower()
+    for f, meta in logs:
+        if meta.get("agent_id") == agent:
+            return f, meta
+    for f, meta in logs:
+        if low in str(meta.get("agent_id", "")).lower():
+            return f, meta
+    for f, meta in logs:
+        if low == str(meta.get("agentType", "")).lower():
+            return f, meta
+    return None
 
 
 class Transcript:

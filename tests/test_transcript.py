@@ -1,7 +1,50 @@
 import json
 from pathlib import Path
 
-from adversary.transcript import token_usage
+from adversary.transcript import find_subagent_log, recent_activity, subagent_logs, token_usage
+
+
+def _worker_with_subagent(tmp_path, agent_id, agent_type, entries, **meta_extra):
+    """A worker log at wsid.jsonl plus a subagent transcript in wsid/subagents/agent-<id>.jsonl
+    (all sidechain, as Claude Code writes them) with its .meta.json sidecar."""
+    wlog = tmp_path / "wsid.jsonl"
+    wlog.write_text(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "main worker"}]}}) + "\n")
+    d = tmp_path / "wsid" / "subagents"
+    d.mkdir(parents=True)
+    lines = []
+    for e in entries:
+        if e[0] == "resp":
+            lines.append({"type": "assistant", "isSidechain": True, "message": {"content": [{"type": "text", "text": e[1]}]}})
+        elif e[0] == "tool":
+            tid = f"t{len(lines)}"
+            lines.append({"type": "assistant", "isSidechain": True, "message": {"content": [{"type": "tool_use", "id": tid, "name": e[1], "input": e[2]}]}})
+            lines.append({"type": "user", "isSidechain": True, "message": {"content": [{"type": "tool_result", "tool_use_id": tid, "content": e[3]}]}})
+    (d / f"agent-{agent_id}.jsonl").write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+    meta = {"agentType": agent_type, "description": "do the thing", "toolUseId": "toolu_1", "requestShape": "background", **meta_extra}
+    (d / f"agent-{agent_id}.meta.json").write_text(json.dumps(meta))
+    return str(wlog)
+
+
+def test_recent_activity_can_read_a_sidechain_subagent_log(tmp_path):
+    wlog = _worker_with_subagent(tmp_path, "aid123", "reviewer",
+                                 [("resp", "Looking."), ("tool", "Bash", {"command": "pytest"}, "ok")])
+    main = recent_activity(wlog, 10)
+    assert "main worker" in main and "Looking." not in main           # worker read skips sidechain
+    sub = next((tmp_path / "wsid" / "subagents").glob("agent-aid123.jsonl"))
+    assert recent_activity(sub, 10) == ""                              # all sidechain: skipped by default
+    body = recent_activity(sub, 10, skip_sidechain=False)
+    assert "Looking." in body and "Bash: pytest" in body and "ok" in body
+
+
+def test_subagent_logs_and_find(tmp_path):
+    wlog = _worker_with_subagent(tmp_path, "abc123def", "security-reviewer", [("resp", "hi")])
+    subs = subagent_logs(wlog)
+    assert len(subs) == 1 and subs[0][1]["agent_id"] == "abc123def" and subs[0][1]["agentType"] == "security-reviewer"
+    assert find_subagent_log(wlog, "abc123def")[1]["agent_id"] == "abc123def"          # exact id
+    assert find_subagent_log(wlog, "abc123")[1]["agent_id"] == "abc123def"             # id substring
+    assert find_subagent_log(wlog, "SECURITY-reviewer")[1]["agent_id"] == "abc123def"  # type, case-insensitive
+    assert find_subagent_log(wlog, "nope") is None
+    assert subagent_logs(tmp_path / "no" / "such.jsonl") == []
 
 
 def _log(path, entries):

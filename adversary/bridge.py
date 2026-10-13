@@ -27,8 +27,8 @@ from pathlib import Path
 
 from adversary import sessions, snapshot, tmux
 from adversary.config import RunConfig, draft_path
-from adversary.transcript import (Transcript, last_assistant_text, recent_activity, token_usage,
-                                   turn_had_tool_use, write_report)
+from adversary.transcript import (Transcript, find_subagent_log, last_assistant_text, recent_activity,
+                                   subagent_logs, token_usage, turn_had_tool_use, write_report)
 
 WORKER, ADVERSARY = "worker", "adversary"
 PASTE_SETTLE = 0.4   # seconds between paste and Enter (plus a little per KB)
@@ -74,6 +74,8 @@ class PermRequest:
     input: dict
     future: asyncio.Future
     reminders: int = 0
+    agent_id: str = ""      # set when the request comes from a subagent, not the main worker
+    agent_type: str = ""    # the subagent's type/name, e.g. "security-reviewer"
 
 
 class Bridge:
@@ -111,6 +113,7 @@ class Bridge:
         self.nudges = 0            # message_worker calls
         self.human_prompts_count = 0  # prompts the human typed to either pane
         self._started = time.monotonic()  # this process's start, for session runtime
+        self._started_wall = time.time()  # wall-clock start, to scope subagent files to this session
         self._prior_runtime = 0    # runtime from earlier sessions of this run (seconds)
         self._prior_tokens = 0     # tokens written in earlier sessions of this run
         self._session_tokens_cache = 0  # this session's tokens written, refreshed only on a final save
@@ -247,8 +250,16 @@ class Bridge:
         detail = json.dumps(req.input, indent=2)
         if len(detail) > 4000:
             detail = detail[:4000] + "\n… (truncated)"
+        origin = ""
+        if req.agent_id or req.agent_type:
+            who = req.agent_type or "a subagent"
+            origin = (f"\n\nThis is NOT the main worker — it is **{who}**, a subagent the worker spawned"
+                      + (f" (agent id `{req.agent_id}`)" if req.agent_id else "") + ".")
+            if req.agent_id:
+                origin += f" See what it has been doing with `read_worker(agent=\"{req.agent_id}\")`."
+            origin += " If you deny, your reason goes to that subagent (the one that asked), not the main worker."
         return (
-            f"Worker requests permission #{req.id}: {req.tool}\n\n```json\n{detail}\n```\n\n"
+            f"Worker requests permission #{req.id}: {req.tool}{origin}\n\n```json\n{detail}\n```\n\n"
             f"Decide with approve_tool(request_id={req.id}) or deny_tool(request_id={req.id}, reason=...)."
         )
 
@@ -734,12 +745,16 @@ class Bridge:
         if self.finished:
             return {}  # fall back to the on-screen prompt for the human
         loop = asyncio.get_running_loop()
+        # A request from a subagent carries agent_id/agent_type; the main worker's carries neither.
+        # Keep them so the supervisor is told which agent is asking and can read that agent's log.
         req = PermRequest(self.next_perm, payload.get("tool_name", "?"), payload.get("tool_input", {}),
-                          loop.create_future())
+                          loop.create_future(), agent_id=(payload.get("agent_id") or "").strip(),
+                          agent_type=(payload.get("agent_type") or "").strip())
         self.next_perm += 1
         self.perms[req.id] = req
         self.quiet_rounds = 0  # a permission request means the worker is doing real work
-        self.log(f"permission #{req.id}: {req.tool} {self._short(json.dumps(req.input), 70)}")
+        origin = f" (from subagent {req.agent_type or req.agent_id})" if (req.agent_id or req.agent_type) else ""
+        self.log(f"permission #{req.id}: {req.tool}{origin} {self._short(json.dumps(req.input), 70)}")
         self.transcript.add(f"Permission request #{req.id}: {req.tool}", f"```json\n{json.dumps(req.input, indent=2)}\n```")
         self.enqueue(ADVERSARY, self._perm_text(req), ("perm", req.id), priority=True)
         return await req.future
@@ -842,7 +857,8 @@ class Bridge:
         return self._role_log(WORKER)
 
     def _read_worker(self, args: dict) -> dict:
-        """Show the adversary the worker's last N responses and tool calls (read-only)."""
+        """Show the adversary the last N responses and tool calls of the worker, or of one of the
+        subagents it spawned when `agent` is given (read-only)."""
         try:
             count = int(args.get("count", 10))
         except (TypeError, ValueError):
@@ -852,12 +868,65 @@ class Bridge:
         if not path:
             return {"text": "The worker's session log isn't available yet (it may not have started a turn). "
                             "Its turn-end messages still reach you as usual.", "error": True}
+        agent = (args.get("agent") or "").strip()
+        if agent:
+            return self._read_subagent(path, agent, count)
         body = recent_activity(path, count)
         if not body:
             return {"text": "The worker's session log has no responses or tool calls yet.", "error": True}
         self.peeks += 1
         self.log(f"adversary read the worker's last {count}")
-        return {"text": f"Worker's last {count} responses and tool calls (oldest first):\n\n{body}"}
+        return {"text": f"Worker's last {count} responses and tool calls (oldest first):\n\n{body}"
+                        f"{self._subagents_note(path)}"}
+
+    def _read_subagent(self, worker_log: Path, agent: str, count: int) -> dict:
+        found = find_subagent_log(worker_log, agent)
+        if not found:
+            avail = subagent_logs(worker_log)
+            if not avail:
+                return {"text": f"No subagent '{agent}': this worker hasn't spawned any subagents.", "error": True}
+            lst = ", ".join(f"{m.get('agentType', 'agent')} ({m.get('agent_id')})" for _, m in avail[:12])
+            return {"text": f"No subagent matches '{agent}'. Available: {lst}.", "error": True}
+        sub_path, meta = found
+        label = meta.get("agentType") or "subagent"
+        body = recent_activity(sub_path, count, skip_sidechain=False, speaker=label)   # all sidechain
+        if not body:
+            return {"text": f"Subagent {label} ({meta.get('agent_id')}) has no responses or tool calls yet.",
+                    "error": True}
+        self.peeks += 1
+        self.log(f"adversary read subagent {meta.get('agent_id')} last {count}")
+        # If the supervisor named a type (not the exact id) and several subagents share it, it got
+        # the newest — say so, or it reads the wrong one and doesn't know.
+        ambiguous = ""
+        if agent != meta.get("agent_id"):
+            same = sum(1 for _, m in subagent_logs(worker_log) if m.get("agentType") == meta.get("agentType"))
+            if same > 1:
+                ambiguous = f"\n(Newest of {same} '{label}' subagents; pass an agent id to read a different one.)"
+        desc = f" — {self._short(meta['description'], 100)}" if meta.get("description") else ""
+        return {"text": f"Subagent {label} ({meta.get('agent_id')}){desc}{ambiguous}\nLast {count} responses "
+                        f"and tool calls (oldest first):\n\n{body}"}
+
+    def _subagents_note(self, worker_log: Path) -> str:
+        """A short list of the subagents spawned in THIS session, appended to a plain worker read so
+        the supervisor knows they exist — their own steps aren't in the worker's own log. Scoped to
+        this session by file mtime: agent-*.jsonl files persist across resume, and an old run's
+        subagents are not this one's."""
+        cutoff = self._started_wall - 60   # a minute's grace for clock skew
+        recent = []
+        for f, m in subagent_logs(worker_log):
+            try:
+                if f.stat().st_mtime >= cutoff:
+                    recent.append(m)
+            except OSError:
+                continue
+        if not recent:
+            return ""
+        lines = [f"- {m.get('agentType', 'agent')} (agent id `{m.get('agent_id')}`, {m.get('requestShape', '?')})"
+                 + (f": {self._short(m['description'], 80)}" if m.get("description") else "")
+                 + f" — read with read_worker(agent=\"{m.get('agent_id')}\")"
+                 for m in recent[:8]]
+        return ("\n\n── Subagents this worker spawned (their own steps are NOT in the list above) ──\n"
+                + "\n".join(lines))
 
     def reopen(self, why: str) -> None:
         """Bring a finished run back to life so the worker can be started on new work.
