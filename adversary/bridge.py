@@ -1024,6 +1024,24 @@ class Bridge:
         for line in self.stats_lines(state):
             self.log_fn(line)
 
+    def print_status(self) -> None:
+        """For the `s` key: the live status line, then the full stats block. The token and diff
+        caches are only for the one-shot close render, so clear them to show current figures."""
+        self.log(self.status())
+        self._tok_cache, self._diff_cache = None, _UNSET
+        for line in self.stats_lines():
+            self.log_fn(line)
+
+    def save_stats_file(self, state: str | None = None) -> list[str]:
+        """Write the stats block to stats.txt (the launcher reprints it after tmux closes) and
+        return the lines, so the caller can also print them to the bridge pane."""
+        lines = self.stats_lines(state)
+        try:
+            (Path(self.cfg.run_dir) / "stats.txt").write_text("\n".join(lines) + "\n")
+        except OSError as e:
+            self.log(f"could not write stats.txt: {e}")
+        return lines
+
     def stats(self) -> dict:
         """The run metrics as a dict for report.md: lifetime totals, with this session in
         parentheses on a resumed run."""
@@ -1261,7 +1279,7 @@ async def _keyboard(bridge: Bridge, stop: asyncio.Event) -> None:
         if ch == "p":
             bridge.toggle_pause()
         elif ch == "s":
-            bridge.log(bridge.status())
+            bridge.print_status()
         elif ch == "q":
             if not bridge.finished:
                 bridge.finish("ABORTED", "Stopped by the human from the bridge pane.")
@@ -1339,7 +1357,7 @@ async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file
         os.remove(cfg.sock)
     server = await asyncio.start_unix_server(bridge.handle_conn, path=cfg.sock)
     bridge.log(f"bridge up · run dir {run_dir}")
-    bridge.log("keys: p pause/resume relay · s status · q end the run (shows the stats, then closes everything)")
+    bridge.log("keys: p pause/resume relay · s status + stats · q end the run (shows the stats, then closes everything)")
     stop = asyncio.Event()
     # "Asked to close remotely": `resume --kill` sends the tmux session SIGHUP, and a kill from
     # another shell sends SIGTERM. Treat both like q — end the loop cleanly so the stats get
@@ -1373,17 +1391,19 @@ async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file
         if os.path.exists(cfg.sock):
             os.remove(cfg.sock)
     # The loop ends on q or a close signal: record the run's final numbers, close the two Claude
-    # Code sessions, and print the stats. The bridge pane is left up — its launch script waits for
-    # a keypress — so the readout can be read; the worker/adversary panes close on their own as
-    # their sessions exit, leaving this pane full-size for it.
+    # Code sessions, and show the stats. They are written to stats.txt first (durable, and what the
+    # launcher reprints in the user's own terminal after tmux is gone), then printed to the bridge
+    # pane. The worker/adversary panes close on their own as their sessions exit.
     window = _window_of(worker_pane)
     if window:
         # The window-resized hook pins this pane to a few rows; drop it so the stats aren't clipped.
         subprocess.run(["tmux", "set-hook", "-u", "-w", "-t", window, "window-resized"], capture_output=True)
     bridge.save_state(final=True)
     await close_agents(bridge, [worker_pane, adversary_pane])
+    lines = bridge.save_stats_file(None if bridge.finished else "closed (interrupted)")
     try:
-        bridge.print_stats(None if bridge.finished else "closed (interrupted)")
+        for line in lines:
+            bridge.log_fn(line)
     except OSError:
         pass
 

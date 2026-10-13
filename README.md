@@ -85,12 +85,12 @@ Keys in the bridge pane:
 | Key | Action |
 |---|---|
 | `p` | Pause or resume relaying, to take over by hand |
-| `s` | Print status |
-| `q` | End the run: marks it ABORTED and shuts both Claude Code sessions down (SIGTERM, then SIGKILL after 10 s). The bridge then prints the run's stats and waits for a keypress before the window closes. `adversary resume` picks it up again. |
+| `s` | Print the status line and the full run stats (the same block shown at close, with current figures) |
+| `q` | End the run: marks it ABORTED and shuts both Claude Code sessions down (SIGTERM, then SIGKILL after 10 s). `adversary resume` picks it up again. |
 
-Closing the run from outside tmux does the same orderly shutdown — saving state and recording the final numbers — without marking the run ABORTED (a bare close is an interruption, not a finished run). A `kill` on the bridge (SIGTERM) leaves the window up, so the stats print is visible; `adversary resume --kill` tears the session down (SIGHUP) on its way to relaunching, so the numbers are only recorded, not shown.
+Closing the run from outside tmux does the same orderly shutdown — saving state and recording the final numbers — without marking the run ABORTED (a bare close is an interruption, not a finished run). `adversary resume --kill` closes the old session (SIGHUP) on its way to relaunching, and a `kill` on the bridge (SIGTERM) also ends it cleanly.
 
-The stats are also written into `report.md`. When the run was resumed they show this session's numbers alongside the lifetime total; on a first run they are just the totals. Metrics are exchanges relayed, worker and supervisor turns, permission requests (and how many approved/denied), holds, `message_worker` nudges, `read_worker` peeks, stalls, human interjections, runtime, approval rate, tokens written this session (model output; input is mostly repeated cache reads, so it isn't counted), and the diff size since the run started.
+At the close the stats are printed to the bridge pane, written to `stats.txt` in the run dir, and — when the run was started in the foreground (attached) — **reprinted in the terminal you launched from once tmux exits**, so they land in your scrollback and aren't lost when the window closes. (Opened in a new window, or started with `--no-attach`, there's no launching terminal to return to, so the bridge pane holds its readout open until a keypress instead.) The stats also go into `report.md`. When the run was resumed they show this session's numbers alongside the lifetime total; on a first run they are just the totals. Metrics are exchanges relayed, worker and supervisor turns, permission requests (and how many approved/denied), holds, `message_worker` nudges, `read_worker` peeks, stalls, human interjections, runtime, approval rate, tokens written this session (model output; input is mostly repeated cache reads, so it isn't counted), and the diff size since the run started.
 
 The first run in a project opens a short "how this works" popup over the panes, and the first time I select the worker pane, a tip points me back to the adversary pane. Each is shown once per project; which ones I've seen is kept in `~/.local/state/adversary/projects/<folder>.json` (delete it to see them again). A key closes them.
 
@@ -113,6 +113,7 @@ Each run writes to `~/.local/state/adversary/runs/<timestamp>/`:
 - `stalls.jsonl`: one record per stall, written when both agents have been idle for `--stall-after` seconds with the run unfinished. Nothing moves the run forward at that point, so it is almost always a relay failure. Each record holds both sides' last turn, queued messages, pending permissions and last message. It is also shown in the bridge pane and the transcript, and appended to `~/.local/state/adversary/stalls.jsonl` across all runs.
 - `snapshot/`: the folder's original contents (folders without git only)
 - `state.json`: counters, runtime and token totals carried over by `adversary resume`
+- `stats.txt`: the end-of-run stats block, written at close and reprinted in the launching terminal
 - the generated settings, MCP config and launch scripts
 
 ## Without git

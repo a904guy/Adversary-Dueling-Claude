@@ -126,10 +126,19 @@ def launch(cfg: RunConfig, no_attach: bool, resume_file: Path | None = None) -> 
     adversary = tmux.tmux("split-window", "-h", "-P", "-F", "#{pane_id}", "-t", worker, "-c", repo,
                           str(scripts["adversary"]))
     pkg_root = str(Path(__file__).resolve().parent.parent)
-    bridge_cmd = (f"cd {shlex.quote(pkg_root)} && {shlex.quote(sys.executable)} -m adversary.bridge "
-                  f"--run-dir {shlex.quote(str(run_dir))} --worker-pane {worker} --adversary-pane {adversary}"
-                  + (f" --resume-file {shlex.quote(str(resume_file))}" if resume_file else "") + "; "
-                  "echo; echo 'bridge exited, press Enter to close'; read _")
+    attach_mode = not inside and not no_attach
+    base_cmd = (f"cd {shlex.quote(pkg_root)} && {shlex.quote(sys.executable)} -m adversary.bridge "
+                f"--run-dir {shlex.quote(str(run_dir))} --worker-pane {worker} --adversary-pane {adversary}"
+                + (f" --resume-file {shlex.quote(str(resume_file))}" if resume_file else ""))
+    if attach_mode:
+        # The launcher reprints the stats in this terminal after tmux exits, so a clean close lets
+        # the pane (and window, and session) close straight away; only hold it open to show a crash.
+        tail = '; s=$?; [ "$s" -eq 0 ] || { echo; echo "bridge exited with status $s — press Enter to close"; read _; }'
+    else:
+        # No launcher is waiting (opened in a window, or detached): keep the pane up so its stats
+        # readout can be read before it closes.
+        tail = "; echo; echo 'bridge exited — press Enter to close'; read _"
+    bridge_cmd = base_cmd + tail
     bridge = tmux.tmux("split-window", "-v", "-f", "-l", str(BRIDGE_ROWS), "-P", "-F", "#{pane_id}", "-t", worker,
                        "sh", "-c", bridge_cmd)
     # Attaching from a terminal of another size rescales every pane; keep the bridge short.
@@ -155,9 +164,26 @@ def launch(cfg: RunConfig, no_attach: bool, resume_file: Path | None = None) -> 
     if inside:
         print("adversary: opened in a new tmux window")
     elif not no_attach:
-        os.execvp("tmux", ["tmux", "attach-session", "-t", cfg.session])
+        # Attach as a child (not execvp) so that, once tmux exits, control returns here and the
+        # run's final stats can be shown in this terminal — they survive tmux closing.
+        subprocess.run(["tmux", "attach-session", "-t", cfg.session])
+        _print_stats_after_close(cfg)
     else:
         print(f"adversary: started detached; attach with: tmux attach -t {cfg.session}")
+
+
+def _print_stats_after_close(cfg: RunConfig) -> None:
+    """After `tmux attach` returns, print the run's final stats in this terminal so they persist
+    after tmux is gone — unless the user merely detached and the run is still open."""
+    alive = subprocess.run(["tmux", "has-session", "-t", f"={cfg.session}"], capture_output=True).returncode == 0
+    if alive:
+        print(f"adversary: detached; the run is still open (reattach with: tmux attach -t {cfg.session})")
+        return
+    try:
+        text = (Path(cfg.run_dir) / "stats.txt").read_text()
+    except OSError:
+        return
+    print("\n" + text.rstrip("\n"))
 
 
 def resume(a: argparse.Namespace) -> None:

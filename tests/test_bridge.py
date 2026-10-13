@@ -1207,6 +1207,29 @@ async def test_stats_runtime_total_accumulates_across_sessions(repo, tmp_path):
     assert b2._runtime_total() >= b2._prior_runtime        # plus this session's elapsed
 
 
+async def test_print_status_shows_the_status_line_and_the_stats_block(repo, tmp_path):
+    out = []
+    b, sent = make(repo, tmp_path)
+    b.log_fn = out.append                                   # capture both log() and log_fn() lines
+    await ready(b, sent)
+    b.approvals, b.denials = 3, 1
+    b.print_status()
+    text = "\n".join(out)
+    assert "[running]" in text                              # the one-line status
+    assert "adversary run · running" in text                # the full stats block too
+    assert "approval rate: 75%" in text
+
+
+async def test_close_writes_a_stats_file_for_the_launcher_to_reprint(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    b.approvals, b.denials = 3, 1
+    lines = b.save_stats_file("ABORTED")
+    text = (tmp_path / "run" / "stats.txt").read_text()
+    assert "adversary run · ABORTED" in text and "approval rate: 75%" in text
+    assert text.splitlines() == lines                      # same block returned for the pane print
+
+
 def test_dur_formats_are_readable():
     assert Bridge._dur(45) == "45s"
     assert Bridge._dur(125) == "2m"
