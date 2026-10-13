@@ -27,7 +27,7 @@ from pathlib import Path
 
 from adversary import sessions, snapshot, tmux
 from adversary.config import RunConfig, draft_path
-from adversary.transcript import (Transcript, find_subagent_log, last_assistant_text, recent_activity,
+from adversary.transcript import (Transcript, background_running, find_subagent_log, last_assistant_text, recent_activity,
                                    subagent_finished, subagent_logs, token_usage, turn_had_tool_use, write_report)
 
 WORKER, ADVERSARY = "worker", "adversary"
@@ -518,13 +518,17 @@ class Bridge:
             if self._blank(text):
                 text = "(the worker ended its turn without a message)"
             # A turn the adversary's own reply started, in which the worker did nothing (no tool
-            # call), means the worker had nothing to do with that reply. Repeated, the two are only
-            # echoing while the worker waits on a background subagent. Park it rather than relay
-            # another no-op that the adversary will just answer, restarting the loop.
-            if reason == "adversary_msg" and not had_tool_use:
+            # call), while background work it launched is still out, means it is only waiting on
+            # that work. Repeated, the two are only echoing ("still waiting" / "ok"); park it rather
+            # than relay another no-op that the adversary will just answer, restarting the loop.
+            # With nothing in the background, a text-only reply is conversation — "I don't
+            # understand X", "I'll get to that after Y" — and always goes through; the exchange
+            # cap still guards against a genuine back-and-forth loop.
+            waiting = (self._background_work() if reason == "adversary_msg" and not had_tool_use else [])
+            if waiting:
                 self.quiet_rounds += 1
                 if self.quiet_rounds >= QUIET_HOLD_AT and not self.held:
-                    self._quiet_hold()
+                    self._quiet_hold(waiting)
                     return
             else:
                 self.quiet_rounds = 0
@@ -588,19 +592,32 @@ class Bridge:
                      "that, send the worker what it needs with message_worker. Your reply to this note isn't "
                      "forwarded.", "cap_note")
 
-    def _quiet_hold(self) -> None:
-        """The worker has ended turn after turn doing nothing in reply to the adversary: it is
-        waiting on something that will bring it back on its own (a background subagent or task),
+    def _background_work(self) -> list[str]:
+        """Background tasks/subagents the worker launched this session that are still out."""
+        path = self._worker_log()
+        if not path:
+            return []
+        try:
+            return background_running(path, since=self._started_wall - 60)   # this session, as in _subagents_note
+        except Exception as e:   # never let a log quirk break relaying
+            self.log(f"couldn't check the worker's background work: {e}")
+            return []
+
+    def _quiet_hold(self, waiting: list[str] | None = None) -> None:
+        """The worker has ended turn after turn doing nothing in reply to the adversary while
+        background work it launched is still running: that work will bring it back on its own,
         and the two are only echoing. Park the worker and tell the adversary to stop replying."""
+        on = ", ".join(waiting[:4]) + (f" (+{len(waiting) - 4} more)" if len(waiting or []) > 4 else "") if waiting else ""
         self.holds += 1
-        self.held = "worker idle, waiting on a background subagent or task"
+        self.held = "worker idle, waiting on background work" + (f": {on}" if on else "")
         self.quiet_rounds = 0
         self.log("quiet-loop hold: the worker did nothing after the adversary's replies; worker on hold")
         self.transcript.add("Quiet-loop hold: worker on hold",
                             "The worker ended consecutive turns with no action after the adversary's replies.")
         self.enqueue(ADVERSARY,
                      "The worker has ended several turns in a row without doing anything after your replies. It "
-                     "has nothing for you right now — it is waiting on a background subagent or task, which will "
+                     "has nothing for you right now — it is waiting on background work"
+                     + (f" ({on})" if on else "") + ", which will "
                      "bring it back to you on its own when it finishes. The worker is now on hold, so stop "
                      "replying: don't send it anything and don't check in, or you'll just restart the loop. End "
                      "your turn. It will return to you when there is real work; if the human gives you something "

@@ -81,11 +81,15 @@ async def stop(b, role, text):
     await settle()
 
 
-def transcript_file(tmp_path, name, *, tool_use):
-    """A minimal session JSONL for one turn, so turn_had_tool_use can read it."""
+def transcript_file(tmp_path, name, *, tool_use, background=False):
+    """A minimal session JSONL for one turn, so turn_had_tool_use can read it. With background,
+    an earlier turn launched a background command that hasn't reported back yet."""
     p = tmp_path / f"t-{name}.jsonl"
     content = ([{"type": "tool_use", "name": "Bash", "input": {}}] if tool_use else []) + [{"type": "text", "text": "x"}]
-    p.write_text("\n".join([
+    bg = [json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "toolu_bg1", "name": "Bash",
+         "input": {"command": "./long-job.sh", "run_in_background": True}}]}})] if background else []
+    p.write_text("\n".join(bg + [
         json.dumps({"type": "user", "message": {"role": "user", "content": "the adversary's reply"}}),
         json.dumps({"type": "assistant", "message": {"role": "assistant", "content": content}}),
     ]) + "\n")
@@ -670,12 +674,13 @@ async def test_hold_refused_while_worker_busy(repo, tmp_path):
     assert b.on_mcp("hold", {"reason": "x"}).get("error") and b.held is None
 
 
-async def _quiet_round(b, sent, tmp_path, worker_text, *, tool_use, name):
-    """One full round: the adversary replies, the worker runs a turn and ends it."""
+async def _quiet_round(b, sent, tmp_path, worker_text, *, tool_use, name, background=True):
+    """One full round: the adversary replies, the worker runs a turn and ends it. By default the
+    worker has a background task still out (what the quiet-loop guard is for)."""
     await submit(b, ADVERSARY, sent)                       # adversary picks up the worker's message
     await stop(b, ADVERSARY, f"leaving it be ({name})")    # forwarded to the worker
     await submit(b, WORKER, sent)                          # worker's turn starts (reason adversary_msg)
-    await stop_tx(b, WORKER, worker_text, transcript_file(tmp_path, name, tool_use=tool_use))
+    await stop_tx(b, WORKER, worker_text, transcript_file(tmp_path, name, tool_use=tool_use, background=background))
 
 
 async def test_quiet_subagent_loop_auto_holds_the_worker(repo, tmp_path):
@@ -689,6 +694,46 @@ async def test_quiet_subagent_loop_auto_holds_the_worker(repo, tmp_path):
     assert b.held                                          # second no-op trips the auto-hold
     assert (ADVERSARY, "still awaiting dd-X (2)") not in sent   # not relayed; the loop is cut
     assert sent[-1][0] == ADVERSARY and "on hold" in sent[-1][1]
+
+
+async def test_text_only_replies_with_nothing_in_the_background_always_go_through(repo, tmp_path):
+    """A worker answering the supervisor in words ("I don't understand", "I'll do that after Y")
+    is conversation, not a wait loop: with no background work out, every reply is relayed."""
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "done with step 1")
+    for i, text in enumerate(["I don't know what 'the retry shim' refers to.",
+                              "Still unclear: there's no retry module in this repo.",
+                              "Got it, but I'm finishing the parser first; I'll come back to it."]):
+        await _quiet_round(b, sent, tmp_path, text, tool_use=False, name=f"c{i}", background=False)
+        assert (ADVERSARY, text) in sent
+    assert not b.held and b.quiet_rounds == 0
+
+
+async def test_a_background_task_that_reported_back_no_longer_counts(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "kicked off the build")
+    for name in ("n1", "n2"):
+        path = transcript_file(tmp_path, name, tool_use=False, background=True)
+        with open(path, "a") as f:   # Claude Code's notification that the background task ended
+            f.write(json.dumps({"type": "queue-operation", "content": "<task-notification>\n<tool-use-id>toolu_bg1"
+                                "</tool-use-id>\n<status>completed</status>\n</task-notification>"}) + "\n")
+        await submit(b, ADVERSARY, sent)
+        await stop(b, ADVERSARY, f"ok ({name})")
+        await submit(b, WORKER, sent)
+        await stop_tx(b, WORKER, f"what next? ({name})", path)
+    assert not b.held and (ADVERSARY, "what next? (n2)") in sent
+
+
+async def test_quiet_hold_names_what_the_worker_is_waiting_on(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "awaiting the job")
+    await _quiet_round(b, sent, tmp_path, "still (1)", tool_use=False, name="h1")
+    await _quiet_round(b, sent, tmp_path, "still (2)", tool_use=False, name="h2")
+    assert b.held and "long-job.sh" in b.held
+    assert "long-job.sh" in sent[-1][1]
 
 
 async def test_worker_doing_real_work_after_a_reply_never_auto_holds(repo, tmp_path):

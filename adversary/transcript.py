@@ -1,6 +1,7 @@
 """Run log (transcript.md), final report (report.md), and last-message extraction."""
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -226,6 +227,67 @@ def subagent_finished(path) -> bool:
         msg = entry.get("message") or {}
         return entry.get("type") == "assistant" and msg.get("stop_reason") == "end_turn"
     return False
+
+
+_NOTIFIED = re.compile(r"<tool-use-id>([^<\s]+)</tool-use-id>")
+
+
+def _entry_time(entry: dict) -> float | None:
+    try:
+        return datetime.fromisoformat(str(entry.get("timestamp")).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def background_running(worker_log, since: float = 0.0) -> list[str]:
+    """Background work the worker started (at or after `since`, epoch seconds) that hasn't
+    reported back yet, as short labels; empty when nothing is outstanding.
+
+    Covers background tool calls (any tool_use with run_in_background, e.g. Bash) and background
+    subagents and agent-team teammates (their transcripts sit in <session>/subagents). Claude Code
+    reports each finished background task to the worker with a <task-notification> naming the
+    launching <tool-use-id> (status completed/failed/killed/stopped — all terminal), so a launch
+    with no such notification is still out. A subagent whose transcript ends in a final reply
+    counts as done too (a teammate that has gone idle won't wake the worker on its own). Work
+    launched before `since` (an earlier session of a resumed run) is ignored: a task cut off when
+    that session ended never reports back, and would otherwise look outstanding forever.
+    """
+    worker_log = Path(worker_log)
+    try:
+        text = worker_log.read_text()
+    except OSError:
+        return []
+    notified = set(_NOTIFIED.findall(text))
+    out: list[str] = []
+    for line in text.splitlines():
+        if '"run_in_background"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        when = _entry_time(entry)
+        if entry.get("type") != "assistant" or (when is not None and when < since):
+            continue
+        for b in (entry.get("message") or {}).get("content") or []:
+            if (isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id") not in notified
+                    and (b.get("input") or {}).get("run_in_background")):
+                inp = b.get("input") or {}
+                what = inp.get("description") or inp.get("command") or inp.get("prompt") or ""
+                out.append(f"{b.get('name', 'tool')}: {_clip(str(what), 60)}" if what else b.get("name", "tool"))
+                notified.add(b.get("id"))   # don't count it again as a subagent below
+    for f, meta in subagent_logs(worker_log):
+        try:
+            if f.stat().st_mtime < since:
+                continue
+        except OSError:
+            continue
+        if meta.get("requestShape") != "background" and not meta.get("teamName"):
+            continue   # a foreground subagent runs inside the worker's turn
+        if meta.get("toolUseId") in notified or subagent_finished(f):
+            continue
+        out.append(f"{meta.get('name') or meta.get('agentType') or 'subagent'} ({meta.get('agent_id')})")
+    return out
 
 
 def find_subagent_log(worker_log, agent: str) -> tuple[Path, dict] | None:

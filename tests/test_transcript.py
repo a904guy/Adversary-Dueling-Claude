@@ -7,6 +7,7 @@ from adversary.transcript import find_subagent_log, recent_activity, subagent_lo
 def _worker_with_subagent(tmp_path, agent_id, agent_type, entries, **meta_extra):
     """A worker log at wsid.jsonl plus a subagent transcript in wsid/subagents/agent-<id>.jsonl
     (all sidechain, as Claude Code writes them) with its .meta.json sidecar."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
     wlog = tmp_path / "wsid.jsonl"
     wlog.write_text(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "main worker"}]}}) + "\n")
     d = tmp_path / "wsid" / "subagents"
@@ -83,3 +84,51 @@ def test_token_usage_counts_entries_without_an_id(tmp_path):
         {"type": "assistant", "message": {"content": [{"type": "text"}], "usage": {"output_tokens": 3}}},
     ])
     assert token_usage(log) == {"in": 0, "out": 10, "total": 10}
+
+
+def _bg_log(tmp_path, entries):
+    p = tmp_path / "w.jsonl"
+    p.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+    return p
+
+
+def _bg_launch(tid, cmd, ts=None):
+    e = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": tid, "name": "Bash", "input": {"command": cmd, "run_in_background": True}}]}}
+    if ts:
+        e["timestamp"] = ts
+    return e
+
+
+def test_background_running_tracks_launches_until_notified(tmp_path):
+    from adversary.transcript import background_running
+    log = _bg_log(tmp_path, [
+        _bg_launch("toolu_a", "make build"),
+        _bg_launch("toolu_b", "npm run e2e"),
+        {"type": "queue-operation", "content": "<task-notification>\n<tool-use-id>toolu_a</tool-use-id>\n"
+                                               "<status>failed</status>\n</task-notification>"},
+    ])
+    out = background_running(log)
+    assert len(out) == 1 and "npm run e2e" in out[0]
+
+
+def test_background_running_ignores_launches_before_since(tmp_path):
+    from adversary.transcript import background_running
+    log = _bg_log(tmp_path, [_bg_launch("toolu_old", "sleep 999", ts="2020-01-01T00:00:00.000Z")])
+    assert background_running(log, since=1_700_000_000) == []      # cut off in an earlier session
+    assert len(background_running(log)) == 1
+
+
+def test_background_running_counts_unfinished_background_subagents_and_teammates(tmp_path):
+    from adversary.transcript import background_running
+    wlog = _worker_with_subagent(tmp_path, "ag1", "researcher", [("tool", "WebSearch", {"query": "x"}, "r")])
+    assert background_running(wlog) == ["researcher (ag1)"]          # mid-work, not notified
+    d = tmp_path / "wsid" / "subagents"
+    (d / "agent-ag1.jsonl").open("a").write(json.dumps(
+        {"type": "assistant", "isSidechain": True, "message": {"stop_reason": "end_turn", "content": [{"type": "text", "text": "done"}]}}) + "\n")
+    assert background_running(wlog) == []                           # final reply: finished
+    fg = _worker_with_subagent(tmp_path / "fg", "ag2", "helper", [("resp", "hi")], requestShape="foreground")
+    assert background_running(fg) == []                             # foreground runs inside the turn
+    tm = _worker_with_subagent(tmp_path / "tm", "ag3", "general", [("resp", "hi")],
+                               requestShape=None, teamName="crew", name="dd-X")
+    assert background_running(tm) == ["dd-X (ag3)"]                 # a teammate still working
