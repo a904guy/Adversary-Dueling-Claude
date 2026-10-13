@@ -86,7 +86,11 @@ Keys in the bridge pane:
 |---|---|
 | `p` | Pause or resume relaying, to take over by hand |
 | `s` | Print status |
-| `q` | End the run: marks it ABORTED, shuts both Claude Code sessions down (SIGTERM, then SIGKILL after 10 s) and closes the tmux window. `adversary resume` picks it up again. |
+| `q` | End the run: marks it ABORTED and shuts both Claude Code sessions down (SIGTERM, then SIGKILL after 10 s). The bridge then prints the run's stats and waits for a keypress before the window closes. `adversary resume` picks it up again. |
+
+Closing the run from outside tmux does the same orderly shutdown — saving state and recording the final numbers — without marking the run ABORTED (a bare close is an interruption, not a finished run). A `kill` on the bridge (SIGTERM) leaves the window up, so the stats print is visible; `adversary resume --kill` tears the session down (SIGHUP) on its way to relaunching, so the numbers are only recorded, not shown.
+
+The stats are also written into `report.md`. When the run was resumed they show this session's numbers alongside the lifetime total; on a first run they are just the totals. Metrics are exchanges relayed, worker and supervisor turns, permission requests (and how many approved/denied), holds, `message_worker` nudges, `read_worker` peeks, stalls, human interjections, runtime, approval rate, tokens written this session (model output; input is mostly repeated cache reads, so it isn't counted), and the diff size since the run started.
 
 The first run in a project opens a short "how this works" popup over the panes, and the first time I select the worker pane, a tip points me back to the adversary pane. Each is shown once per project; which ones I've seen is kept in `~/.local/state/adversary/projects/<folder>.json` (delete it to see them again). A key closes them.
 
@@ -105,10 +109,10 @@ If the adversary doesn't hold and instead keeps replying to a worker that does n
 Each run writes to `~/.local/state/adversary/runs/<timestamp>/`:
 
 - `transcript.md`: every relayed message, permission decision and human input
-- `report.md`: outcome, the adversary's summary, and the files changed since the run started
+- `report.md`: outcome, the adversary's summary, the run's metrics (exchanges, worker/supervisor turns, permission decisions, holds, nudges, peeks, stalls, runtime, tokens, diff size — this session alongside the lifetime total on a resumed run) and the files changed since the run started
 - `stalls.jsonl`: one record per stall, written when both agents have been idle for `--stall-after` seconds with the run unfinished. Nothing moves the run forward at that point, so it is almost always a relay failure. Each record holds both sides' last turn, queued messages, pending permissions and last message. It is also shown in the bridge pane and the transcript, and appended to `~/.local/state/adversary/stalls.jsonl` across all runs.
 - `snapshot/`: the folder's original contents (folders without git only)
-- `state.json`: counters carried over by `adversary resume`
+- `state.json`: counters, runtime and token totals carried over by `adversary resume`
 - the generated settings, MCP config and launch scripts
 
 ## Without git

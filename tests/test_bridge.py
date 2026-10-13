@@ -1054,3 +1054,97 @@ async def test_read_worker_uses_the_live_transcript_path_from_hooks(repo, tmp_pa
     await stop_tx(b, WORKER, "done step", log)                  # Stop payload carries the path
     assert b.panes[WORKER].transcript_path == log
     assert "live turn output" in b.on_mcp("read_worker", {})["text"]
+
+
+# ── end-of-run stats ────────────────────────────────────────────────────
+
+async def test_stats_first_run_is_single_column_with_totals(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    b.approvals, b.denials, b.holds, b.nudges, b.peeks = 3, 1, 2, 4, 5
+    lines = b.stats_lines()
+    text = "\n".join(lines)
+    assert not b.is_resume
+    assert "session" not in text and "this session" not in text   # one column on a first run
+    assert "approval rate: 75% of 4 decided" in text
+    # A metric row shows its total in the single value column.
+    assert any(l.strip().startswith("Holds") and l.rstrip().endswith("2") for l in lines)
+
+
+async def test_stats_resume_shows_session_and_total_columns(repo, tmp_path):
+    b, _ = make(repo, tmp_path)
+    b.total_exchanges, b.approvals, b.holds = 10, 8, 3
+    b.save_state()
+    b2 = Bridge(b.cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=b.deliver, log=lambda m: None,
+                focus=lambda p: None, pane_mode=lambda p: None, screen_idle=lambda p: False,
+                resume="Resumed.")
+    # Session deltas start at 0 even though the lifetime totals were loaded.
+    rows = {label.strip(): (s, t) for label, s, t in b2._metric_rows()}
+    assert rows["Exchanges (relayed to worker)"] == (0, 10)
+    assert rows["· approved"] == (0, 8) and rows["Holds (worker parked)"] == (0, 3)
+    # Do one exchange and one approval this session: the session column moves, the total follows.
+    b2.total_exchanges += 1
+    b2.approvals += 1
+    rows = {label.strip(): (s, t) for label, s, t in b2._metric_rows()}
+    assert rows["Exchanges (relayed to worker)"] == (1, 11)
+    assert rows["· approved"] == (1, 9)
+    text = "\n".join(b2.stats_lines())
+    assert b2.is_resume and "session" in text and "total" in text
+
+
+async def test_counters_increment_and_survive_a_resume(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)                                   # adversary ran its init turn
+    await stop(b, WORKER, "done a bit")                    # one worker turn-end
+    b.on_mcp("message_worker", {"message": "carry on"})    # a nudge
+    await settle()
+    b.panes[WORKER].transcript_path = worker_log(tmp_path / "w.jsonl", [("resp", "hi")])
+    b.on_mcp("read_worker", {"count": 5})                  # a peek
+    await b.on_hook(ADVERSARY, "UserPromptSubmit", {"prompt": "human note"})  # a human interjection
+    assert b.worker_turns >= 1 and b.adversary_turns >= 1
+    assert b.nudges == 1 and b.peeks == 1 and b.human_prompts_count == 1
+    b.save_state(final=True)
+    state = json.loads((tmp_path / "run" / "state.json").read_text())
+    assert state["nudges"] == 1 and state["peeks"] == 1 and state["human_prompts_count"] == 1
+    assert state["worker_turns"] == b.worker_turns and "runtime_seconds" in state
+    # A resumed bridge reloads the lifetime totals.
+    b2 = Bridge(b.cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=b.deliver, log=lambda m: None,
+                focus=lambda p: None, pane_mode=lambda p: None, screen_idle=lambda p: False, resume="r")
+    assert b2.nudges == 1 and b2.peeks == 1 and b2.worker_turns == b.worker_turns
+
+
+async def test_holds_counts_every_kind_of_park(repo, tmp_path):
+    b, sent = make(repo, tmp_path, max_exchanges=1)
+    await ready(b, sent)
+    # Manual hold.
+    await stop(b, WORKER, "idle")
+    await submit(b, ADVERSARY, sent)
+    b.on_mcp("hold", {"reason": "waiting"})
+    assert b.holds == 1
+    b.release_hold("go")
+    # Exchange-cap hold.
+    b._cap_reached("looping reply")
+    assert b.holds == 2
+    b.release_hold("go")
+    # Quiet-loop hold.
+    b._quiet_hold()
+    assert b.holds == 3
+
+
+async def test_stats_runtime_total_accumulates_across_sessions(repo, tmp_path):
+    b, _ = make(repo, tmp_path)
+    b._prior_runtime = 0
+    b._started -= 120                                      # pretend this session has run two minutes
+    b.save_state(final=True)
+    state = json.loads((tmp_path / "run" / "state.json").read_text())
+    assert state["runtime_seconds"] >= 120
+    b2 = Bridge(b.cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=b.deliver, log=lambda m: None,
+                focus=lambda p: None, pane_mode=lambda p: None, screen_idle=lambda p: False, resume="r")
+    assert b2._prior_runtime >= 120                        # carried forward
+    assert b2._runtime_total() >= b2._prior_runtime        # plus this session's elapsed
+
+
+def test_dur_formats_are_readable():
+    assert Bridge._dur(45) == "45s"
+    assert Bridge._dur(125) == "2m"
+    assert Bridge._dur(3 * 3600 + 7 * 60) == "3h 7m"

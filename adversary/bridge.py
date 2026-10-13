@@ -27,8 +27,8 @@ from pathlib import Path
 
 from adversary import sessions, snapshot, tmux
 from adversary.config import RunConfig, draft_path
-from adversary.transcript import (Transcript, last_assistant_text, recent_activity, turn_had_tool_use,
-                                   write_report)
+from adversary.transcript import (Transcript, last_assistant_text, recent_activity, token_usage,
+                                   turn_had_tool_use, write_report)
 
 WORKER, ADVERSARY = "worker", "adversary"
 PASTE_SETTLE = 0.4   # seconds between paste and Enter (plus a little per KB)
@@ -40,6 +40,7 @@ DELIVERY_RETRY = 5.0  # seconds before retrying a delivery tmux refused
 QUIT_GRACE = 10.0    # seconds the agents get to exit on SIGTERM before SIGKILL
 MAX_PERM_REMINDERS = 2
 QUIET_HOLD_AT = 2    # consecutive no-op worker turns (after an adversary reply) before an auto-hold
+_UNSET = object()    # sentinel: a cached value not computed yet (None is a valid result)
 HELP_DIR = Path(__file__).resolve().parent / "help"
 # One-time help popups: (key, title, pane it relates to). Each is shown once per project.
 POPUPS = {"intro": ("how this works", ADVERSARY), "worker_tip": ("the worker pane", WORKER)}
@@ -100,6 +101,20 @@ class Bridge:
         self.quiet_rounds = 0      # worker turns in a row that did nothing after an adversary reply
         self.approvals = 0
         self.denials = 0
+        # Lifetime counters for the end-of-run stats (all persisted; see STATE_KEYS).
+        self.worker_turns = 0      # worker turn-ends seen
+        self.adversary_turns = 0   # adversary turn-ends seen
+        self.holds = 0             # times the worker was parked (cap, quiet loop, or the hold tool)
+        self.peeks = 0             # read_worker calls
+        self.nudges = 0            # message_worker calls
+        self.human_prompts_count = 0  # prompts the human typed to either pane
+        self._started = time.monotonic()  # this process's start, for session runtime
+        self._prior_runtime = 0    # runtime from earlier sessions of this run (seconds)
+        self._prior_tokens = 0     # tokens written in earlier sessions of this run
+        self._session_tokens_cache = 0  # this session's tokens written, refreshed only on a final save
+        self._tok_cache: dict | None = None   # memoised token read for one shutdown render
+        self._diff_cache = _UNSET  # memoised diff read for one shutdown render
+        self.is_resume = resume is not None
         self.paused = False
         self.finished: str | None = None
         self.held: str | None = None           # adversary's hold reason: worker parked, nothing to relay
@@ -119,16 +134,30 @@ class Bridge:
             self._load_state()
             self.transcript.add("Run resumed", resume)
             self.enqueue(ADVERSARY, resume, "resume")
+        # Session metrics are deltas against this snapshot of the lifetime counters: on a fresh
+        # run every baseline is 0 (session == total); on resume they start at the loaded totals.
+        self._base = {k: getattr(self, k) for k in self.STATE_KEYS}
 
     # ── state kept across resumes ───────────────────────────────────────
-    STATE_KEYS = ("total_exchanges", "approvals", "denials", "stalls", "next_perm")
+    STATE_KEYS = ("total_exchanges", "approvals", "denials", "stalls", "next_perm",
+                  "worker_turns", "adversary_turns", "holds", "peeks", "nudges", "human_prompts_count")
 
     def _state_path(self) -> Path:
         return Path(self.cfg.run_dir) / "state.json"
 
-    def save_state(self) -> None:
+    def save_state(self, final: bool = False) -> None:
+        # Tokens and the diff mean reading the session logs and shelling out to git, so only
+        # refresh them on a final save (finish or the run closing), not on every turn-end; carry
+        # the last token figure forward in between. The caches dedupe the reads within one
+        # shutdown render; clear them so a final save recomputes against the latest state.
+        if final:
+            self._tok_cache, self._diff_cache = None, _UNSET
+            self._session_tokens_cache = self._session_tokens()["total"]
+        data = {k: getattr(self, k) for k in self.STATE_KEYS}
+        data["runtime_seconds"] = self._runtime_total()
+        data["tokens_total"] = self._prior_tokens + self._session_tokens_cache
         try:
-            self._state_path().write_text(json.dumps({k: getattr(self, k) for k in self.STATE_KEYS}))
+            self._state_path().write_text(json.dumps(data))
         except OSError as e:
             self.log(f"could not save state: {e}")
 
@@ -143,6 +172,10 @@ class Bridge:
         for k in self.STATE_KEYS:
             if isinstance(state.get(k), int):
                 setattr(self, k, state[k])
+        if isinstance(state.get("runtime_seconds"), (int, float)):
+            self._prior_runtime = int(state["runtime_seconds"])
+        if isinstance(state.get("tokens_total"), int):
+            self._prior_tokens = state["tokens_total"]
         # `exchanges` starts again at 0: resuming is the human picking the run back up.
 
     # ── text sent to the agents ─────────────────────────────────────────
@@ -415,6 +448,7 @@ class Bridge:
                     # message_worker call, so a parting "thanks" doesn't reopen the run.)
                     self.reopen("the human typed new work into the worker")
                 self._human_spoke()
+                self.human_prompts_count += 1
                 pane.human_prompts.append(prompt)
                 self.log(f"human typed into {role}: {self._short(prompt)}")
                 self.transcript.add(f"Human → {role}", prompt)
@@ -449,6 +483,10 @@ class Bridge:
         self.save_state()
 
     def _on_stop(self, role: str, reason, text: str, had_tool_use: bool = True) -> None:
+        if role == WORKER:
+            self.worker_turns += 1
+        else:
+            self.adversary_turns += 1
         if role == WORKER:
             self.transcript.add("Worker", text or "(no text)")
             self.log(f"worker ended turn: {self._short(text or '(no text)')}")
@@ -520,6 +558,7 @@ class Bridge:
         """The two have gone back and forth max_exchanges times without the human: a loop
         guard. The worker is put on hold, not the run ended; the human picks it back up."""
         cap = self.cfg.max_exchanges
+        self.holds += 1
         self.held = f"{cap} exchanges since the human last spoke"
         self.log(f"exchange cap: {cap} round trips without you; worker on hold, the adversary's reply not forwarded")
         self.transcript.add(f"Exchange cap ({cap}): worker on hold", f"Not forwarded to the worker:\n\n{text}")
@@ -533,6 +572,7 @@ class Bridge:
         """The worker has ended turn after turn doing nothing in reply to the adversary: it is
         waiting on something that will bring it back on its own (a background subagent or task),
         and the two are only echoing. Park the worker and tell the adversary to stop replying."""
+        self.holds += 1
         self.held = "worker idle, waiting on a background subagent or task"
         self.quiet_rounds = 0
         self.log("quiet-loop hold: the worker did nothing after the adversary's replies; worker on hold")
@@ -728,6 +768,7 @@ class Bridge:
             reopened = bool(self.finished)
             if reopened:
                 self.reopen("the adversary sent the worker new work with message_worker")
+            self.nudges += 1
             self.transcript.add("Adversary → worker (message_worker)", text)
             self.plan_sent = True  # the worker has its instructions; don't also auto-forward an init reply
             self.quiet_rounds = 0  # the adversary gave the worker real work; start the loop count fresh
@@ -747,6 +788,7 @@ class Bridge:
                 return {"text": "The worker is busy or has a message on its way, so its next turn-end will reach "
                                 "you anyway. Call hold once it is idle.", "error": True}
             reason = (args.get("reason") or "").strip() or "no reason given"
+            self.holds += 1
             self.held = reason
             self.log(f"worker on hold: {reason}")
             self.transcript.add("Worker on hold", reason)
@@ -764,13 +806,16 @@ class Bridge:
                             "run back up and starts the worker again."}
         return {"text": f"Unknown tool {tool}", "error": True}
 
-    def _worker_log(self) -> Path | None:
-        """The worker session's JSONL: its live hook path, else the recorded-id fallback."""
-        tp = self.panes[WORKER].transcript_path
+    def _role_log(self, role: str) -> Path | None:
+        """A role's session JSONL: its live hook path, else the recorded-id fallback."""
+        tp = self.panes[role].transcript_path
         if tp and Path(tp).exists():
             return Path(tp)
-        path = sessions.session_log(self.cfg, WORKER)
+        path = sessions.session_log(self.cfg, role)
         return path if path and path.exists() else None
+
+    def _worker_log(self) -> Path | None:
+        return self._role_log(WORKER)
 
     def _read_worker(self, args: dict) -> dict:
         """Show the adversary the worker's last N responses and tool calls (read-only)."""
@@ -786,6 +831,7 @@ class Bridge:
         body = recent_activity(path, count)
         if not body:
             return {"text": "The worker's session log has no responses or tool calls yet.", "error": True}
+        self.peeks += 1
         self.log(f"adversary read the worker's last {count}")
         return {"text": f"Worker's last {count} responses and tool calls (oldest first):\n\n{body}"}
 
@@ -814,7 +860,7 @@ class Bridge:
         path = write_report(self.cfg.run_dir, self.cfg.repo, self._baseline_label(), outcome, summary,
                             self.stats(), self.changes_text())
         self.log(f"FINISHED: {outcome}. Report: {path}")
-        self.save_state()
+        self.save_state(final=True)
         return path
 
     def _baseline_label(self) -> str:
@@ -822,9 +868,159 @@ class Bridge:
             return f"git commit `{self.cfg.base_sha}`"
         return f"folder snapshot `{self.cfg.snapshot_dir}` (no git)"
 
+    # ── run metrics / end-of-run stats ──────────────────────────────────
+    def _elapsed(self) -> int:
+        return max(0, int(time.monotonic() - self._started))
+
+    def _runtime_total(self) -> int:
+        return self._prior_runtime + self._elapsed()
+
+    @staticmethod
+    def _dur(seconds: int) -> str:
+        h, rem = divmod(int(seconds), 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}h {m}m"
+        if m:
+            return f"{m}m"
+        return f"{s}s"
+
+    def _session_tokens(self) -> dict:
+        """Tokens *written* (model output) this session per pane, plus a combined total. Output
+        is the meaningful "work produced" figure; input is dominated by repeated cache reads, so
+        it would run to tens of millions and swamp the readout. Memoised for one shutdown render."""
+        if self._tok_cache is None:
+            out = {"total": 0}
+            for role in (WORKER, ADVERSARY):
+                path = self._role_log(role)
+                out[role] = token_usage(path)["out"] if path else 0
+                out["total"] += out[role]
+            self._tok_cache = out
+        return self._tok_cache
+
+    def _diff_shortstat(self) -> tuple[int, int, int] | None:
+        """(files changed, insertions, deletions) since the run started, or None if unknown.
+        Memoised for one shutdown render."""
+        if self._diff_cache is not _UNSET:
+            return self._diff_cache
+        self._diff_cache = self._compute_diff_shortstat()
+        return self._diff_cache
+
+    def _compute_diff_shortstat(self) -> tuple[int, int, int] | None:
+        try:
+            if self.cfg.base_sha:
+                git = lambda *a: subprocess.run(["git", *a], cwd=self.cfg.repo,
+                                                capture_output=True, text=True).stdout
+                out = git("diff", "--shortstat", self.cfg.base_sha)
+                f = re.search(r"(\d+) files? changed", out)
+                a = re.search(r"(\d+) insertion", out)
+                d = re.search(r"(\d+) deletion", out)
+                # git diff ignores untracked files, so count them from status (new files a worker
+                # created but didn't commit are most of the point of the number).
+                untracked = sum(1 for line in git("status", "--porcelain").splitlines()
+                                if line.startswith("??"))
+                return (untracked + (int(f.group(1)) if f else 0),
+                        int(a.group(1)) if a else 0, int(d.group(1)) if d else 0)
+            if self.cfg.snapshot_dir:
+                c = snapshot.changes(self.cfg.repo, self.cfg.snapshot_dir)
+                return (sum(len(v) for v in c.values()), 0, 0)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+        return None
+
+    def _diff_text(self) -> str | None:
+        d = self._diff_shortstat()
+        if d is None:
+            return None
+        return f"{d[0]} file{'' if d[0] == 1 else 's'}, +{d[1]} −{d[2]}"
+
+    def _metric_rows(self) -> list[tuple[str, int, int]]:
+        """Each run metric as (label, this-session value, lifetime total). Session is the delta
+        against the counters at launch, so it is 0-based even on a resumed run."""
+        b = self._base
+        def pair(current: int, key: str) -> tuple[int, int]:
+            return current - b.get(key, 0), current
+        return [
+            ("Exchanges (relayed to worker)", *pair(self.total_exchanges, "total_exchanges")),
+            ("Worker turns", *pair(self.worker_turns, "worker_turns")),
+            ("Supervisor turns", *pair(self.adversary_turns, "adversary_turns")),
+            ("Permission requests", self.next_perm - b.get("next_perm", 1), self.next_perm - 1),
+            ("  · approved", *pair(self.approvals, "approvals")),
+            ("  · denied", *pair(self.denials, "denials")),
+            ("Holds (worker parked)", *pair(self.holds, "holds")),
+            ("Nudges (message_worker)", *pair(self.nudges, "nudges")),
+            ("Peeks (read_worker)", *pair(self.peeks, "peeks")),
+            ("Stalls detected", *pair(self.stalls, "stalls")),
+            ("Human interjections", *pair(self.human_prompts_count, "human_prompts_count")),
+        ]
+
+    def stats_lines(self, state: str | None = None) -> list[str]:
+        """The end-of-run stats block, as plain lines for the bridge pane. Session and total
+        columns on a resumed run; a single column on a first run (they are the same)."""
+        rows = self._metric_rows()
+        resumed = self.is_resume
+        label_w = max(len(r[0]) for r in rows)
+        bar = "─" * (label_w + 24)
+        try:
+            started = sessions.run_started(self.cfg.run_dir).strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            started = Path(self.cfg.run_dir).name
+        state = state or self.finished or ("PAUSED" if self.paused else "running")
+        lines = [bar, f"  adversary run · {state}",
+                 f"  task: {self._short(self.cfg.task, label_w + 14)}"]
+        if resumed:
+            lines.append(f"  started {started} · total {self._dur(self._runtime_total())} "
+                         f"· this session {self._dur(self._elapsed())}")
+        else:
+            lines.append(f"  started {started} · ran {self._dur(self._elapsed())}")
+        lines.append(bar)
+        if resumed:
+            lines.append(f"  {'':<{label_w}}  {'session':>8}  {'total':>8}")
+            lines += [f"  {label:<{label_w}}  {s:>8}  {t:>8}" for label, s, t in rows]
+        else:
+            lines += [f"  {label:<{label_w}}  {t:>8}" for label, _, t in rows]
+        lines.append(bar)
+        decided = self.approvals + self.denials
+        if decided:
+            lines.append(f"  approval rate: {round(100 * self.approvals / decided)}% of {decided} decided")
+        tok = self._session_tokens()
+        if tok["total"]:
+            line = (f"  tokens written: worker {tok[WORKER]:,} · supervisor {tok[ADVERSARY]:,} "
+                    f"· total {tok['total']:,}")
+            if resumed and self._prior_tokens:
+                line += f"  (run total {self._prior_tokens + tok['total']:,})"
+            lines.append(line)
+        diff = self._diff_text()
+        if diff:
+            lines.append(f"  diff vs start: {diff}")
+            lines.append(bar)
+        return lines
+
+    def print_stats(self, state: str | None = None) -> None:
+        for line in self.stats_lines(state):
+            self.log_fn(line)
+
     def stats(self) -> dict:
-        return {"Exchanges": self.total_exchanges, "Stalls": self.stalls, "Permission approvals": self.approvals,
-                "Permission denials": self.denials, "Run dir": f"`{self.cfg.run_dir}`"}
+        """The run metrics as a dict for report.md: lifetime totals, with this session in
+        parentheses on a resumed run."""
+        def val(s: int, t: int) -> str:
+            return f"{t} (this session {s})" if self.is_resume and s != t else f"{t}"
+        d = {label.lstrip(" ·"): val(s, t) for label, s, t in self._metric_rows()}
+        d["Runtime"] = (f"{self._dur(self._runtime_total())} (this session {self._dur(self._elapsed())})"
+                        if self.is_resume else self._dur(self._elapsed()))
+        decided = self.approvals + self.denials
+        if decided:
+            d["Approval rate"] = f"{round(100 * self.approvals / decided)}%"
+        tok = self._session_tokens()
+        if tok["total"]:
+            run = f"; run total {self._prior_tokens + tok['total']:,}" if self.is_resume and self._prior_tokens else ""
+            d["Tokens written (this session)"] = (f"worker {tok[WORKER]:,}, supervisor {tok[ADVERSARY]:,}, "
+                                                  f"total {tok['total']:,}{run}")
+        diff = self._diff_text()
+        if diff:
+            d["Diff vs start"] = diff
+        d["Run dir"] = f"`{self.cfg.run_dir}`"
+        return d
 
     # ── stall watchdog ──────────────────────────────────────────────────
     def check_stall(self, now: float | None = None) -> dict | None:
@@ -1110,8 +1306,18 @@ async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file
         os.remove(cfg.sock)
     server = await asyncio.start_unix_server(bridge.handle_conn, path=cfg.sock)
     bridge.log(f"bridge up · run dir {run_dir}")
-    bridge.log("keys: p pause/resume relay · s status · q end the run and close everything")
+    bridge.log("keys: p pause/resume relay · s status · q end the run (shows the stats, then closes everything)")
     stop = asyncio.Event()
+    # "Asked to close remotely": `resume --kill` sends the tmux session SIGHUP, and a kill from
+    # another shell sends SIGTERM. Treat both like q — end the loop cleanly so the stats get
+    # recorded and shown — but, unlike q, don't write a finish report (a bare close is an
+    # interruption, not a finished run).
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (ValueError, RuntimeError, NotImplementedError):
+            pass
     watch = asyncio.create_task(_startup_watch(bridge))
     last_status = ""
     try:
@@ -1133,11 +1339,20 @@ async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file
         watch.cancel()
         if os.path.exists(cfg.sock):
             os.remove(cfg.sock)
-    # The loop only ends on q: close both Claude Code sessions, then the run's tmux window.
+    # The loop ends on q or a close signal: record the run's final numbers, close the two Claude
+    # Code sessions, and print the stats. The bridge pane is left up — its launch script waits for
+    # a keypress — so the readout can be read; the worker/adversary panes close on their own as
+    # their sessions exit, leaving this pane full-size for it.
     window = _window_of(worker_pane)
-    await close_agents(bridge, [worker_pane, adversary_pane])
     if window:
-        subprocess.run(["tmux", "kill-window", "-t", window], capture_output=True)
+        # The window-resized hook pins this pane to a few rows; drop it so the stats aren't clipped.
+        subprocess.run(["tmux", "set-hook", "-u", "-w", "-t", window, "window-resized"], capture_output=True)
+    bridge.save_state(final=True)
+    await close_agents(bridge, [worker_pane, adversary_pane])
+    try:
+        bridge.print_stats(None if bridge.finished else "closed (interrupted)")
+    except OSError:
+        pass
 
 
 def main() -> None:

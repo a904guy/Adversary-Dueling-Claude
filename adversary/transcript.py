@@ -92,6 +92,42 @@ def _clip(text: str, limit: int) -> str:
     return text[:limit] + f"… (+{len(text) - limit} chars)"
 
 
+def token_usage(path) -> dict:
+    """Sum the model-reported token usage across a session JSONL.
+
+    Claude Code splits one assistant message across several JSONL entries (one per content
+    block) that all repeat the same `message.usage`, so a naive sum over-counts by the block
+    count; dedupe on `message.id` (first seen wins). Input counts the real input plus both
+    cache tiers (what the model actually read); output is the generated tokens. Returns
+    {"in", "out", "total"} of ints, zeros if the log can't be read.
+    """
+    path = Path(path)
+    out = {"in": 0, "out": 0, "total": 0}
+    if not path.exists():
+        return out
+    seen: set[str] = set()
+    for line in path.read_text().splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        msg = entry.get("message") or {}
+        usage = msg.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        mid = msg.get("id")
+        if isinstance(mid, str):
+            if mid in seen:
+                continue
+            seen.add(mid)
+        inp = sum(usage.get(k) or 0 for k in
+                  ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+        out["in"] += inp
+        out["out"] += usage.get("output_tokens") or 0
+    out["total"] = out["in"] + out["out"]
+    return out
+
+
 def recent_activity(path, count: int, input_chars: int = 300, result_chars: int = 800,
                     text_chars: int = 1500) -> str:
     """The worker's last `count` responses and tool calls, oldest first, as readable markdown.
