@@ -41,6 +41,8 @@ DELIVERY_RETRY = 5.0  # seconds before retrying a delivery tmux refused
 QUIT_GRACE = 10.0    # seconds the agents get to exit on SIGTERM before SIGKILL
 MAX_PERM_REMINDERS = 2
 QUIET_HOLD_AT = 2    # consecutive no-op worker turns (after an adversary reply) before an auto-hold
+HOLD_CHECK_AFTER = 600   # seconds a hold on background work lasts before the supervisor is asked to check
+HOLD_CHECK_MAX = 3600    # each unanswered check-in doubles the wait, up to this
 _UNSET = object()    # sentinel: a cached value not computed yet (None is a valid result)
 HELP_DIR = Path(__file__).resolve().parent / "help"
 # One-time help popups: (key, title, pane it relates to). Each is shown once per project.
@@ -123,6 +125,10 @@ class Bridge:
         self.paused = False
         self.finished: str | None = None
         self.held: str | None = None           # adversary's hold reason: worker parked, nothing to relay
+        self.held_backlog: list[str] = []      # worker messages kept back by an auto-hold, sent with its next one
+        self.hold_check_at: float | None = None   # monotonic time to ask the supervisor about a hold
+        self.hold_check_every = HOLD_CHECK_AFTER
+        self._held_since = 0.0
         self.summary = ""
         self.idle_since: float | None = None   # when both agents last went idle together
         self.stalls = 0
@@ -272,12 +278,15 @@ class Bridge:
         state = self.finished or ("PAUSED" if self.paused else "running")
         return (f"[{state}] exchanges since you {self.exchanges}/{self.cfg.max_exchanges} · approvals {self.approvals} · "
                 f"denials {self.denials} · pending perms {len(self.perms)} · worker {'busy' if w.busy else 'idle'} · "
-                f"adversary {'busy' if a.busy else 'idle'}" + (" · worker on hold" if self.held else "")
+                f"adversary {'busy' if a.busy else 'idle'}" + (" · worker on hold" + (f" ({len(self.held_backlog)} msg kept)" if self.held_backlog else "")
+                   if self.held else "")
                 + "".join(f" · waiting on you in the {p.role} pane ({p.waiting_on})" for p in (w, a) if p.waiting_on))
 
     # ── delivery ────────────────────────────────────────────────────────
     def enqueue(self, role: str, text: str, reason, priority: bool = False) -> None:
         pane = self.panes[role]
+        if reason == "worker_msg" and self.held_backlog:
+            text = self._with_backlog(text)
         if reason == "worker_msg":
             # Several worker turns piled up (adversary busy, or relay paused): deliver them as one.
             for i, (body, r) in enumerate(pane.queue):
@@ -528,6 +537,9 @@ class Bridge:
             if waiting:
                 self.quiet_rounds += 1
                 if self.quiet_rounds >= QUIET_HOLD_AT and not self.held:
+                    # Not relayed now (that restarts the echo), but not lost either: kept and sent
+                    # with the worker's next message, so the supervisor sees the whole chain.
+                    self.held_backlog.append(text)
                     self._quiet_hold(waiting)
                     return
             else:
@@ -583,7 +595,7 @@ class Bridge:
         guard. The worker is put on hold, not the run ended; the human picks it back up."""
         cap = self.cfg.max_exchanges
         self.holds += 1
-        self.held = f"{cap} exchanges since the human last spoke"
+        self._set_hold(f"{cap} exchanges since the human last spoke", None)   # waits on the human: no check-in
         self.log(f"exchange cap: {cap} round trips without you; worker on hold, the adversary's reply not forwarded")
         self.transcript.add(f"Exchange cap ({cap}): worker on hold", f"Not forwarded to the worker:\n\n{text}")
         self.enqueue(ADVERSARY, f"Your last reply was not forwarded: you and the worker have gone back and forth {cap} "
@@ -609,7 +621,7 @@ class Bridge:
         and the two are only echoing. Park the worker and tell the adversary to stop replying."""
         on = ", ".join(waiting[:4]) + (f" (+{len(waiting) - 4} more)" if len(waiting or []) > 4 else "") if waiting else ""
         self.holds += 1
-        self.held = "worker idle, waiting on background work" + (f": {on}" if on else "")
+        self._set_hold("worker idle, waiting on background work" + (f": {on}" if on else ""), HOLD_CHECK_AFTER)
         self.quiet_rounds = 0
         self.log("quiet-loop hold: the worker did nothing after the adversary's replies; worker on hold")
         self.transcript.add("Quiet-loop hold: worker on hold",
@@ -620,8 +632,11 @@ class Bridge:
                      + (f" ({on})" if on else "") + ", which will "
                      "bring it back to you on its own when it finishes. The worker is now on hold, so stop "
                      "replying: don't send it anything and don't check in, or you'll just restart the loop. End "
-                     "your turn. It will return to you when there is real work; if the human gives you something "
-                     "new in the meantime, use message_worker then. Your reply to this note isn't forwarded.",
+                     "your turn. Its latest message wasn't lost: it is kept and comes to you together with its "
+                     "next one. It will return to you when there is real work, and if it hasn't within "
+                     f"{HOLD_CHECK_AFTER // 60} minutes the bridge will ask you to check on it; if the human gives "
+                     "you something new in the meantime, use message_worker then. Your reply to this note isn't "
+                     "forwarded.",
                      "quiet_note")
 
     def _human_spoke(self) -> None:
@@ -752,8 +767,64 @@ class Bridge:
         pane.queue.appendleft((body, reason))
         return False
 
+    def _set_hold(self, reason: str, check_after: float | None) -> None:
+        """Park the worker. With check_after (seconds), the supervisor is asked to look at the hold
+        if nothing has woken the worker by then — a background task can hang, or finish without
+        the notification that would bring the worker back, and the run would sit parked forever."""
+        if not self.held:
+            self._held_since = time.monotonic()
+        self.held = reason
+        self.hold_check_every = check_after or HOLD_CHECK_AFTER
+        self.hold_check_at = time.monotonic() + check_after if check_after else None
+
+    def _with_backlog(self, text: str) -> str:
+        """Prefix a message for the supervisor with what the worker said while it was on hold."""
+        kept, self.held_backlog = self.held_backlog, []
+        n = len(kept)
+        head = ("(While the worker was on hold it also said the following, which wasn't forwarded at the "
+                f"time — {n} message{'s' if n > 1 else ''}, oldest first:)\n\n")
+        return head + "\n\n---\n\n".join(kept) + f"\n\n---\n\n(Then:)\n\n{text}"
+
+    def check_hold(self, now: float | None = None) -> bool:
+        """Called every second: once a hold's check-in time passes with the worker still parked, tell
+        the supervisor how long it has been and what is (or isn't) still running, and let it decide.
+        Re-armed at double the interval (capped), so an unanswered hold is never silent for good."""
+        now = time.monotonic() if now is None else now
+        if not self.held or self.finished or self.hold_check_at is None or now < self.hold_check_at:
+            return False
+        if self.panes[WORKER].busy:
+            return False   # the worker woke; its turn-end releases or replaces the hold
+        waiting = self._background_work()
+        mins = max(1, round((now - self._held_since) / 60))
+        self.hold_check_every = min(self.hold_check_every * 2, HOLD_CHECK_MAX)
+        self.hold_check_at = now + self.hold_check_every
+        if waiting:
+            state = ("Still running in the background: " + "; ".join(waiting[:6])
+                     + (f" (+{len(waiting) - 6} more)" if len(waiting) > 6 else "") + ". It may just be slow, "
+                     "or stuck — `list_agents` shows when each was last active, and `read_worker(agent=...)` "
+                     "what a subagent is doing.")
+        else:
+            state = ("Nothing the worker launched in the background is still running, yet it hasn't been brought "
+                     "back: the work may have ended without the notification that wakes it, or the worker may "
+                     "be waiting on something the bridge can't see. Check with `read_worker` / `list_agents`.")
+        kept = ""
+        if self.held_backlog:
+            kept = "\n\nWhat the worker said that was kept back:\n\n" + "\n\n---\n\n".join(self.held_backlog)
+            self.held_backlog = []
+        self.log(f"hold check-in: worker on hold {mins}m ({len(waiting)} background item(s) running)")
+        self.transcript.add("Hold check-in", f"on hold {mins}m: {self.held}")
+        self.enqueue(ADVERSARY,
+                     f"Check-in: the worker has been on hold for {mins} minute{'s' if mins != 1 else ''} "
+                     f"({self.held}). {state}{kept}\n\nDecide: to keep waiting, call `hold` again (optionally "
+                     "with `check_after_minutes`); to get it moving, `message_worker` with what to do (e.g. "
+                     "check on or stop the stuck task, or carry on without it). If you do neither, you'll be "
+                     f"asked again in {self.hold_check_every // 60} minutes. Your reply to this note isn't forwarded.",
+                     "hold_check")
+        return True
+
     def release_hold(self, why: str) -> None:
         if self.held:
+            self.hold_check_at = None
             self.held = None
             self.log(f"hold released: {why}")
             self.transcript.add(f"Hold released: {why}")
@@ -844,12 +915,25 @@ class Bridge:
                 return {"text": "The worker is busy or has a message on its way, so its next turn-end will reach "
                                 "you anyway. Call hold once it is idle.", "error": True}
             reason = (args.get("reason") or "").strip() or "no reason given"
-            self.holds += 1
-            self.held = reason
-            self.log(f"worker on hold: {reason}")
+            # A hold on background work gets a check-in by default (the work can hang, or end without
+            # waking the worker); a hold waiting on the human doesn't, unless asked for.
+            try:
+                minutes = float(args["check_after_minutes"]) if args.get("check_after_minutes") is not None else None
+            except (TypeError, ValueError):
+                minutes = None
+            if minutes is None:
+                check_after = HOLD_CHECK_AFTER if self._background_work() else None
+            else:
+                check_after = max(60.0, minutes * 60) if minutes > 0 else None
+            if not self.held:
+                self.holds += 1   # renewing a hold (e.g. after a check-in) isn't a new one
+            self._set_hold(reason, check_after)
+            self.log(f"worker on hold: {reason}" + (f" (check-in in {round(check_after / 60)}m)" if check_after else ""))
             self.transcript.add("Worker on hold", reason)
+            when = (f" If nothing has woken it in {round(check_after / 60)} minutes, the bridge will ask you to "
+                    "check on it." if check_after else "")
             return {"text": "The worker is on hold. Your reply this turn is not forwarded, and nothing is sent "
-                            "to it until you call message_worker (or the human types to it). End your turn."}
+                            "to it until you call message_worker (or the human types to it)." + when + " End your turn."}
         if tool == "read_worker":
             return self._read_worker(args)
         if tool == "list_agents":
@@ -1497,6 +1581,7 @@ async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file
                     bridge.log(status)
                     last_status = status
                 bridge.check_stall()
+                bridge.check_hold()
                 bridge.check_popups()
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=1)

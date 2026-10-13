@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -734,6 +735,84 @@ async def test_quiet_hold_names_what_the_worker_is_waiting_on(repo, tmp_path):
     await _quiet_round(b, sent, tmp_path, "still (2)", tool_use=False, name="h2")
     assert b.held and "long-job.sh" in b.held
     assert "long-job.sh" in sent[-1][1]
+
+
+async def _auto_held(b, sent, tmp_path):
+    """Drive the bridge into a quiet-loop hold with a background task still out."""
+    await ready(b, sent)
+    await stop(b, WORKER, "awaiting the job")
+    await _quiet_round(b, sent, tmp_path, "still (1)", tool_use=False, name="k1")
+    await _quiet_round(b, sent, tmp_path, "still (2) - also, YAML or TOML for the config?", tool_use=False, name="k2")
+    assert b.held
+
+
+async def test_auto_hold_keeps_the_withheld_message_and_sends_it_with_the_next(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await _auto_held(b, sent, tmp_path)
+    assert not any("YAML or TOML" in t for r, t in sent if r == ADVERSARY)   # not relayed at the time
+    assert b.held_backlog and "msg kept" in b.status()
+    await submit(b, ADVERSARY, sent)
+    await stop(b, ADVERSARY, "Standing down.")                 # the quiet note's reply goes nowhere
+    # The background job finishes: Claude Code wakes the worker, which reports back.
+    await b.on_hook(WORKER, "UserPromptSubmit", {"prompt": "<task-notification>\n<status>completed</status>"})
+    assert b.held is None
+    await stop(b, WORKER, "The job finished; results are in out.txt.")
+    got = [t for r, t in sent if r == ADVERSARY][-1]
+    assert "YAML or TOML" in got and "The job finished" in got     # the whole chain, in order
+    assert got.index("YAML or TOML") < got.index("The job finished")
+    assert not b.held_backlog
+
+
+async def test_hold_check_in_asks_the_supervisor_after_the_deadline(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await _auto_held(b, sent, tmp_path)
+    await submit(b, ADVERSARY, sent)
+    await stop(b, ADVERSARY, "ok")
+    n = len(sent)
+    assert not b.check_hold(now=time.monotonic() + 30)             # too early
+    assert b.check_hold(now=time.monotonic() + bridge_mod.HOLD_CHECK_AFTER + 1)
+    await settle()
+    note = sent[-1][1]
+    assert len(sent) == n + 1 and sent[-1][0] == ADVERSARY and note.startswith("Check-in")
+    assert "long-job.sh" in note and "YAML or TOML" in note        # what's running, and what was kept back
+    assert b.held and not b.held_backlog                           # still held; backlog handed over
+    assert b.hold_check_every == 2 * bridge_mod.HOLD_CHECK_AFTER   # next ask is later, never silent for good
+    await submit(b, ADVERSARY, sent)
+    await stop(b, ADVERSARY, "I'll keep waiting.")
+    assert not any(r == WORKER and t == "I'll keep waiting." for r, t in sent)   # not forwarded
+
+
+async def test_hold_check_in_says_when_nothing_is_running_anymore(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await _auto_held(b, sent, tmp_path)
+    await submit(b, ADVERSARY, sent)
+    await stop(b, ADVERSARY, "ok")
+    b._background_work = lambda: []                                # the job ended without waking the worker
+    assert b.check_hold(now=time.monotonic() + bridge_mod.HOLD_CHECK_AFTER + 1)
+    await settle()
+    assert "Nothing the worker launched in the background is still running" in sent[-1][1]
+
+
+async def test_hold_tool_check_in_defaults(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "need a decision")
+    b._background_work = lambda: []
+    r = b.on_mcp("hold", {"reason": "waiting on the human"})
+    assert b.held and b.hold_check_at is None and "check on it" not in r["text"]   # waits on a person: no check-in
+    b.release_hold("test")
+    b._background_work = lambda: ["Bash: make e2e"]
+    r = b.on_mcp("hold", {"reason": "waiting on e2e"})
+    assert b.hold_check_at is not None and "10 minutes" in r["text"]
+    holds = b.holds
+    b.on_mcp("hold", {"reason": "renewed", "check_after_minutes": 30})
+    assert b.holds == holds                                        # renewing isn't a new hold
+    assert 29 * 60 < b.hold_check_at - time.monotonic() <= 30 * 60
+    b.on_mcp("hold", {"reason": "no check", "check_after_minutes": 0})
+    assert b.hold_check_at is None
+    b.on_mcp("hold", {"reason": "x", "check_after_minutes": 5})
+    b.release_hold("the worker started a turn")
+    assert b.hold_check_at is None and not b.check_hold(now=time.monotonic() + 9999)
 
 
 async def test_worker_doing_real_work_after_a_reply_never_auto_holds(repo, tmp_path):

@@ -65,7 +65,12 @@ TOOLS = [
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"reason": {"type": "string", "description": "What the worker is waiting for, for the run log."}},
+            "properties": {
+                "reason": {"type": "string", "description": "What the worker is waiting for, for the run log."},
+                "check_after_minutes": {"type": "number", "description": "Ask me to check on the hold if the "
+                                        "worker hasn't come back by then. Default: 10 when it is waiting on "
+                                        "background work, otherwise never. 0 turns the check-in off."},
+            },
             "required": ["reason"],
         },
     },
