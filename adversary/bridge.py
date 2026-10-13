@@ -89,6 +89,7 @@ class Bridge:
         self.has_draft = has_draft or self._draft_file_says
         self.pane_mode = pane_mode or self._tmux_pane_mode
         self._popup_task: asyncio.Task | None = None
+        self._popups_unsupported = False   # this tmux rejected display-popup; stop retrying
         # Per-project record (which help popups were shown), kept with the runs, keyed by folder.
         project = re.sub(r"[^\w.-]+", "-", cfg.origin or cfg.repo).strip("-")
         self.project_file = Path(cfg.run_dir).parent.parent / "projects" / f"{project}.json"
@@ -1114,7 +1115,8 @@ class Bridge:
     def check_popups(self) -> None:
         """Called every second. Once per project: explain the layout once the adversary has
         loaded, and point the human to the adversary pane the first time they select the worker."""
-        if (self._popup_task and not self._popup_task.done()) or not self.panes[ADVERSARY].started:
+        if (self._popups_unsupported or (self._popup_task and not self._popup_task.done())
+                or not self.panes[ADVERSARY].started):
             return
         shown = self.project_data().get("shown", {})
         if "intro" not in shown:
@@ -1140,7 +1142,9 @@ class Bridge:
 
     async def _tmux_popup(self, pane: Pane, title: str, text: str) -> bool:
         """Show `text` in a popup on a client viewing the pane's session; True once it was shown
-        and closed. False (try again later) when nobody is attached."""
+        and closed. False (try again later) when nobody is attached. If tmux rejects the popup
+        itself (an older tmux without some option), popups are disabled for the session so the
+        one-time help isn't retried every second."""
         try:
             session = tmux.tmux("display", "-p", "-t", pane.target, "#{session_name}")
             clients = tmux.tmux("list-clients", "-t", session, "-F",
@@ -1150,18 +1154,24 @@ class Bridge:
         if not clients:
             return False
         client, width, height = clients[0].rsplit(" ", 2)
-        lines = text.splitlines()
+        # Title goes in the content: `display-popup -T` (title) and `-b` (border style) need a
+        # newer tmux (3.3+) than `-w/-h/-E` do, and spamming failures on 3.2 is worse than a
+        # borderless, titleless popup. Keep to the widely supported options.
+        content = f"  adversary · {title}\n\n{text}"
+        lines = content.splitlines()
         path = Path(self.cfg.run_dir) / f"popup-{title.replace(' ', '-')}.txt"
-        path.write_text(text)
+        path.write_text(content)
         cmd = f"bash -c {shlex.quote(f'cat {shlex.quote(str(path))}; read -rsn1 -p "  Press any key to close "')}"
         proc = await asyncio.create_subprocess_exec(
-            "tmux", "display-popup", "-c", client, "-t", pane.target, "-E", "-b", "rounded",
-            "-T", f" adversary · {title} ", "-w", str(min(max(map(len, lines)) + 4, int(width))),
+            "tmux", "display-popup", "-c", client, "-t", pane.target, "-E",
+            "-w", str(min(max(map(len, lines)) + 4, int(width))),
             "-h", str(min(len(lines) + 4, int(height))), cmd,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
         _, err = await proc.communicate()
         if proc.returncode:
-            self.log(f"could not show the {title} popup: {err.decode().strip()}")
+            self._popups_unsupported = True
+            self.log(f"could not show the {title} popup ({err.decode().strip() or 'tmux rejected it'}); "
+                     "skipping the one-time help popups for this run")
             return False
         return True
 

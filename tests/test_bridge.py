@@ -748,6 +748,25 @@ async def test_adversary_pane_focused_once_loaded(repo, tmp_path):
     assert b.test_focused == [ADVERSARY]
 
 
+async def test_popups_stop_retrying_after_tmux_rejects_them(repo, tmp_path):
+    """On a tmux too old for some display-popup option, the popup fails. It must not be retried
+    every second (the real _tmux_popup sets _popups_unsupported); check_popups then stands down."""
+    b, sent = make(repo, tmp_path)
+    calls = []
+
+    async def failing_popup(pane, title, text):
+        calls.append(title)
+        b._popups_unsupported = True          # what _tmux_popup does on a hard failure
+        return False                           # not shown, so it is never marked shown
+    b.popup = failing_popup
+    await start(b)
+    for _ in range(5):                         # five "seconds"
+        b.check_popups()
+        await settle()
+    assert calls == ["how this works"]         # attempted once, then disabled -- no spam
+    assert b._popups_unsupported and not b.project_file.exists()  # nothing marked shown either
+
+
 async def test_help_popups_once_per_project(repo, tmp_path):
     b, sent = make(repo, tmp_path)
     b.check_popups()
