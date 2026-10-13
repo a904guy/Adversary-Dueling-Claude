@@ -3,7 +3,7 @@
 Hooks tell the bridge what happened (a turn ended, a prompt was submitted, a
 permission is wanted). The bridge speaks by pasting text into a pane. It never
 interprets what the agents say. The only structured signals are the
-adversary's MCP tool calls (approve_tool, deny_tool, message_worker, hold, read_worker,
+adversary's MCP tool calls (approve_tool, deny_tool, message_worker, hold, read_worker, list_agents,
 changed_files, finish).
 """
 
@@ -28,7 +28,7 @@ from pathlib import Path
 from adversary import sessions, snapshot, tmux
 from adversary.config import RunConfig, draft_path
 from adversary.transcript import (Transcript, find_subagent_log, last_assistant_text, recent_activity,
-                                   subagent_logs, token_usage, turn_had_tool_use, write_report)
+                                   subagent_finished, subagent_logs, token_usage, turn_had_tool_use, write_report)
 
 WORKER, ADVERSARY = "worker", "adversary"
 PASTE_SETTLE = 0.4   # seconds between paste and Enter (plus a little per KB)
@@ -835,6 +835,8 @@ class Bridge:
                             "to it until you call message_worker (or the human types to it). End your turn."}
         if tool == "read_worker":
             return self._read_worker(args)
+        if tool == "list_agents":
+            return self._list_agents(bool(args.get("all")))
         if tool == "changed_files":
             return {"text": self.changes_text()}
         if tool == "finish":
@@ -905,6 +907,35 @@ class Bridge:
         desc = f" — {self._short(meta['description'], 100)}" if meta.get("description") else ""
         return {"text": f"Subagent {label} ({meta.get('agent_id')}){desc}{ambiguous}\nLast {count} responses "
                         f"and tool calls (oldest first):\n\n{body}"}
+
+    def _list_agents(self, include_old: bool = False) -> dict:
+        """The worker and its subagents, with the ids read_worker(agent=...) takes (read-only)."""
+        w = self.panes[WORKER]
+        state = "busy (in a turn)" if w.busy else ("held" if self.held else "idle")
+        lines = [f"- **worker** (main) — {state}; read with read_worker()"]
+        path = self._worker_log()
+        subs = subagent_logs(path) if path else []
+        cutoff = self._started_wall - 60   # this session, as in _subagents_note
+        now, older = time.time(), 0
+        for f, m in subs:
+            try:
+                mtime = f.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < cutoff and not include_old:
+                older += 1
+                continue
+            status = "finished" if subagent_finished(f) else "running"
+            lines.append(f"- **{m.get('agentType', 'agent')}** — agent id `{m.get('agent_id')}`, "
+                         f"{m.get('requestShape') or '?'}, {status}, last activity {self._dur(now - mtime)} ago"
+                         + (f": {self._short(m['description'], 100)}" if m.get("description") else "")
+                         + f" — read with read_worker(agent=\"{m.get('agent_id')}\")")
+        if len(lines) == 1:
+            lines.append("- no subagents spawned" + (" this session" if not include_old else ""))
+        if older:
+            lines.append(f"({older} more from earlier sessions of this run; list_agents(all=true) shows them.)")
+        self.log("adversary listed agents")
+        return {"text": "Agents on this run (newest subagent first):\n" + "\n".join(lines)}
 
     def _subagents_note(self, worker_log: Path) -> str:
         """A short list of the subagents spawned in THIS session, appended to a plain worker read so

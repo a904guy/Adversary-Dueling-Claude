@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -367,7 +368,7 @@ async def test_socket_roundtrip_hook_and_mcp(repo, tmp_path):
         out, _ = await proc.communicate("".join(json.dumps(m) + "\n" for m in msgs).encode())
         replies = [json.loads(l) for l in out.decode().splitlines()]
         assert [r["id"] for r in replies] == [1, 2, 3]
-        assert {t["name"] for t in replies[1]["result"]["tools"]} == {"approve_tool", "deny_tool", "message_worker", "hold", "read_worker", "changed_files", "finish"}
+        assert {t["name"] for t in replies[1]["result"]["tools"]} == {"approve_tool", "deny_tool", "message_worker", "hold", "read_worker", "list_agents", "changed_files", "finish"}
         assert "CANNOT_COMPLETE" in replies[2]["result"]["content"][0]["text"]
         assert b.finished == "CANNOT_COMPLETE"
 
@@ -1025,6 +1026,9 @@ def subagent_log(worker_log, agent_id, meta, entries):
     for e in entries:
         if e[0] == "resp":
             lines.append({"type": "assistant", "isSidechain": True, "message": {"content": [{"type": "text", "text": e[1]}]}})
+        elif e[0] == "done":   # its final reply: the subagent has finished
+            lines.append({"type": "assistant", "isSidechain": True,
+                          "message": {"stop_reason": "end_turn", "content": [{"type": "text", "text": e[1]}]}})
         elif e[0] == "tool":
             tid = f"t{len(lines)}"
             lines.append({"type": "assistant", "isSidechain": True, "message": {"content": [{"type": "tool_use", "id": tid, "name": e[1], "input": e[2]}]}})
@@ -1048,6 +1052,37 @@ async def test_read_worker_reads_a_named_subagent_and_lists_them_otherwise(repo,
     assert "Checking auth." in sub["text"] and "Grep: token" in sub["text"] and "3 hits" in sub["text"]
     assert "reviewer" in sub["text"]
     assert "Checking auth." in b.on_mcp("read_worker", {"agent": "reviewer"})["text"]   # by type too
+
+
+async def test_list_agents_shows_the_worker_and_each_subagent_with_id_and_status(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    wlog = worker_log(tmp_path / "wsid.jsonl", [("resp", "x")])
+    b.panes[WORKER].transcript_path = wlog
+    subagent_log(wlog, "agrun1", {"agentType": "tester", "description": "run the suite"},
+                 [("tool", "Bash", {"command": "pytest"}, "ok")])              # mid-work: running
+    subagent_log(wlog, "agdone2", {"agentType": "reviewer", "requestShape": "foreground"},
+                 [("resp", "looking"), ("done", "All good.")])                  # final reply: finished
+    out = b.on_mcp("list_agents", {})
+    assert not out.get("error")
+    txt = out["text"]
+    assert "**worker** (main) — busy" in txt
+    run_line = next(l for l in txt.splitlines() if "agrun1" in l)
+    done_line = next(l for l in txt.splitlines() if "agdone2" in l)
+    assert "tester" in run_line and "running" in run_line and "background" in run_line and "run the suite" in run_line
+    assert "reviewer" in done_line and "finished" in done_line and "foreground" in done_line
+    assert 'read_worker(agent="agrun1")' in run_line
+
+
+async def test_list_agents_hides_subagents_from_before_this_session_unless_asked(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    wlog = worker_log(tmp_path / "wsid.jsonl", [("resp", "x")])
+    b.panes[WORKER].transcript_path = wlog
+    subagent_log(wlog, "agold", {"agentType": "reviewer"}, [("done", "ok")])
+    old = Path(wlog).parent / "wsid" / "subagents" / "agent-agold.jsonl"
+    os.utime(old, (b._started_wall - 3600, b._started_wall - 3600))     # from an earlier session
+    txt = b.on_mcp("list_agents", {})["text"]
+    assert "agold" not in txt and "no subagents spawned this session" in txt and "1 more" in txt
+    assert "agold" in b.on_mcp("list_agents", {"all": True})["text"]
 
 
 async def test_read_worker_unknown_subagent_lists_what_is_available(repo, tmp_path):

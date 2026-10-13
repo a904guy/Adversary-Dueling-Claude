@@ -48,6 +48,16 @@ def test_adversary_bash_without_subdirs_is_unchanged():
     assert "git log" in cmds and "git status" in cmds
 
 
+def test_adversary_can_call_its_read_only_inspection_tools(tmp_path):
+    """dontAsk refuses any tool not on --allowedTools, so each MCP tool must be listed there."""
+    from adversary.config import write_launch_files
+    from adversary.mcp_server import TOOLS
+    cfg = RunConfig(task="t", repo=str(tmp_path), run_dir=str(tmp_path), sock="/s", base_sha="abc")
+    script = write_launch_files(cfg)["adversary"].read_text()
+    for tool in TOOLS:
+        assert f"mcp__adversary__{tool['name']}" in script, tool["name"]
+
+
 def test_effort_defaults_to_high_for_the_worker_and_xhigh_for_the_adversary(tmp_path):
     from adversary.config import write_launch_files
     cfg = RunConfig(task="t", repo=str(tmp_path), run_dir=str(tmp_path), sock="/s", base_sha="abc")

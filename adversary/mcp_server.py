@@ -93,6 +93,20 @@ TOOLS = [
         },
     },
     {
+        "name": "list_agents",
+        "description": (
+            "List the agents working on this run: the main worker (busy or idle) and every subagent it "
+            "spawned this session, each with its agent id, type, task, foreground/background, and whether "
+            "it is still running or finished. Pass an id to read_worker(agent=...) to read that agent's "
+            "own steps. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"all": {"type": "boolean", "description": "Also list subagents from earlier "
+                           "sessions of this run (before a resume). Default false."}},
+        },
+    },
+    {
         "name": "changed_files",
         "description": (
             "List files the worker added (A), modified (M) or deleted (D) since the run started. "

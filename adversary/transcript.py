@@ -210,6 +210,24 @@ def subagent_logs(worker_log) -> list[tuple[Path, dict]]:
     return out
 
 
+def subagent_finished(path) -> bool:
+    """Whether a subagent's transcript shows it done: its last entry is a final assistant reply
+    (stop_reason end_turn). Anything else — a tool call awaiting its result, a result awaiting the
+    next reply — means it is still running. An unreadable log counts as not finished."""
+    try:
+        lines = [l for l in Path(path).read_text().splitlines() if l.strip()]
+    except OSError:
+        return False
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        msg = entry.get("message") or {}
+        return entry.get("type") == "assistant" and msg.get("stop_reason") == "end_turn"
+    return False
+
+
 def find_subagent_log(worker_log, agent: str) -> tuple[Path, dict] | None:
     """A worker's subagent transcript matched by the `agent` the supervisor named: its exact id,
     then an id substring, then its agentType (case-insensitive). None if nothing matches."""
