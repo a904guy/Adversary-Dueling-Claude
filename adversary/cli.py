@@ -111,6 +111,7 @@ def run(a: argparse.Namespace) -> None:
 
 BRIDGE_ROWS = 4  # the bridge pane only shows status and log lines
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]   # what `claude --effort` accepts
+PERMISSION_MODES = ["manual", "acceptEdits", "auto", "plan"]   # worker modes that still ask the adversary
 
 
 def launch(cfg: RunConfig, no_attach: bool, resume_file: Path | None = None) -> None:
@@ -229,9 +230,10 @@ def resume(a: argparse.Namespace) -> None:
     # recorded, and repos may have been added since. write_launch_files then regenerates the
     # adversary's allowlist with the `git -C <subdir>` rules.
     cfg.git_subdirs = find_git_subdirs(Path(cfg.repo))
-    # Keep the effort levels the run started with unless new ones are given.
-    cfg.worker_effort = a.worker_effort or cfg.worker_effort
-    cfg.adversary_effort = a.adversary_effort or cfg.adversary_effort
+    # Settings given on the command line replace the saved ones; the rest keep what the run used.
+    changed = apply_settings(cfg, a)
+    if changed:
+        print(f"adversary: changed for this and later sessions: {', '.join(changed)}")
     if os.path.exists(cfg.sock):
         os.remove(cfg.sock)  # left behind by a bridge that didn't exit cleanly
     cfg.save()
@@ -298,6 +300,65 @@ def short(text: str, n: int = 100) -> str:
     return one if len(one) <= n else one[: n - 1] + "…"
 
 
+def add_settings(p: argparse.ArgumentParser, resume: bool) -> None:
+    """The run settings, shared by `run` and `resume` so the two take the same flags. On `run` each
+    has its default; on `resume` each defaults to None, meaning "keep what the run used", and a
+    given value replaces the saved one for this and later sessions (see apply_settings)."""
+    keep = " (default: what the run used)" if resume else ""
+
+    def d(value):
+        return None if resume else value
+
+    perms = p.add_mutually_exclusive_group()
+    perms.add_argument("--skip-permissions", action="store_true", default=None if resume else False,
+                       help="run the worker with --dangerously-skip-permissions (no approval traffic)")
+    perms.add_argument("--worker-permission-mode", choices=PERMISSION_MODES,
+                       help="worker permission mode; prompts that remain go to the adversary"
+                            + (keep or " (default: manual)"))
+    p.add_argument("--strict-approvals", action=argparse.BooleanOptionalAction, default=d(False),
+                   help="ignore user-level settings for the worker so no user allow rule bypasses the adversary" + keep)
+    p.add_argument("--max-exchanges", type=int, default=d(30),
+                   help="round trips between the agents without you before the worker is put on hold"
+                        + (keep or " (default 30)") + "; the count restarts whenever you type to either side, and on resume")
+    p.add_argument("--stall-after", type=int, default=d(120), metavar="SECONDS",
+                   help="log a stall when both agents sit idle this long with the run unfinished"
+                        + (keep or " (default 120)") + "; 0 = off")
+    p.add_argument("--worker-model", help="model for the worker" + keep)
+    p.add_argument("--adversary-model", help="model for the adversary" + keep)
+    p.add_argument("--worker-effort", choices=EFFORTS, default=d("high"),
+                   help="effort level for the worker (claude --effort)" + (keep or "; default: high"))
+    p.add_argument("--adversary-effort", choices=EFFORTS, default=d("xhigh"),
+                   help="effort level for the adversary (claude --effort)" + (keep or "; default: xhigh"))
+    p.add_argument("--verify-cmd", action="append",
+                   help="extra command prefix the adversary may run (repeatable)"
+                        + ("; added to the run's existing ones" if resume else ""))
+    p.add_argument("--no-attach", action="store_true", help="don't attach to the tmux session")
+
+
+def apply_settings(cfg: RunConfig, a: argparse.Namespace) -> list[str]:
+    """Overlay the settings given to `resume` on the run's saved config; return what changed."""
+    changed = []
+    for name in ("strict_approvals", "max_exchanges", "stall_after", "worker_model", "adversary_model",
+                 "worker_effort", "adversary_effort"):
+        value = getattr(a, name, None)
+        if value is not None and value != getattr(cfg, name):
+            setattr(cfg, name, value)
+            changed.append(f"{name.replace('_', '-')}={value}")
+    # The worker's permission handling: switching one way clears the other.
+    mode, skip = getattr(a, "worker_permission_mode", None), getattr(a, "skip_permissions", None)
+    if mode and (cfg.skip_permissions or mode != cfg.worker_permission_mode):
+        cfg.worker_permission_mode, cfg.skip_permissions = mode, False
+        changed.append(f"worker-permission-mode={mode}")
+    elif skip and not cfg.skip_permissions:
+        cfg.skip_permissions = True
+        changed.append("skip-permissions")
+    for cmd in getattr(a, "verify_cmd", None) or []:
+        if cmd not in cfg.verify_cmds:
+            cfg.verify_cmds.append(cmd)
+            changed.append(f"verify-cmd={cmd}")
+    return changed
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="adversary", description="Supervise a Claude Code worker with an adversarial Claude Code reviewer.")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -305,36 +366,16 @@ def main() -> None:
     r.add_argument("task", nargs="?", help="the task for the worker (or use --task-file)")
     r.add_argument("--task-file", help="read the task from a file")
     r.add_argument("--repo", default=".", help="folder to work in (default: current directory)")
-    perms = r.add_mutually_exclusive_group()
-    perms.add_argument("--skip-permissions", action="store_true",
-                       help="run the worker with --dangerously-skip-permissions (no approval traffic)")
-    perms.add_argument("--worker-permission-mode", choices=["manual", "acceptEdits", "auto", "plan"],
-                       help="worker permission mode; prompts that remain go to the adversary (default: manual)")
-    r.add_argument("--strict-approvals", action="store_true",
-                   help="ignore user-level settings for the worker so no user allow rule bypasses the adversary")
     r.add_argument("--worktree", action="store_true", help="run in a fresh git worktree on branch adversary/<ts>")
-    r.add_argument("--max-exchanges", type=int, default=30, help="round trips between the agents without you before the worker is put on hold (default 30); "
-                        "the count restarts whenever you type to either side, and on resume")
-    r.add_argument("--stall-after", type=int, default=120, metavar="SECONDS",
-                   help="log a stall when both agents sit idle this long with the run unfinished (default 120, 0 = off)")
-    r.add_argument("--worker-model", help="model for the worker")
-    r.add_argument("--adversary-model", help="model for the adversary")
-    r.add_argument("--worker-effort", choices=EFFORTS, default="high",
-                   help="effort level for the worker (claude --effort; default: high)")
-    r.add_argument("--adversary-effort", choices=EFFORTS, default="xhigh",
-                   help="effort level for the adversary (claude --effort; default: xhigh)")
-    r.add_argument("--verify-cmd", action="append", help="extra command prefix the adversary may run (repeatable)")
-    r.add_argument("--no-attach", action="store_true", help="don't attach to the tmux session")
-    s = sub.add_parser("resume", help="resume the last run in this folder (or a given run)")
+    add_settings(r, resume=False)
+    s = sub.add_parser("resume", help="resume the last run in this folder (or a given run)",
+                       description="Resume a run. Every setting flag is optional: anything not given keeps "
+                                   "what the run used, and a given one is saved for later resumes too.")
     s.add_argument("message", nargs="?", help="optional new instructions, passed to the adversary")
     s.add_argument("--repo", default=".", help="folder whose last run to resume (default: current directory)")
     s.add_argument("--run", help="a specific run: its directory or timestamp (e.g. 20261001-143802)")
-    s.add_argument("--worker-effort", choices=EFFORTS,
-                   help="change the worker's effort level (default: what the run started with)")
-    s.add_argument("--adversary-effort", choices=EFFORTS,
-                   help="change the adversary's effort level (default: what the run started with)")
-    s.add_argument("--kill",action="store_true", help="close the run's tmux session if it is still open")
-    s.add_argument("--no-attach", action="store_true", help="don't attach to the tmux session")
+    s.add_argument("--kill", action="store_true", help="close the run's tmux session if it is still open")
+    add_settings(s, resume=True)
     a = ap.parse_args()
     if a.cmd == "run":
         run(a)

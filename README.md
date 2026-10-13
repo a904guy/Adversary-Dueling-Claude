@@ -70,6 +70,7 @@ This picks up the last run in the current directory (or the folder it was starte
 - **Both sessions come back:** each Claude Code session is reopened with `claude --resume`, with its full history.
 - **The adversary decides what's next:** it is told the run was resumed and given the worker's last message (or told the worker's last turn left none). It checks the current state, then sends the worker what to do next, calls `hold`, or calls `finish`. This is the same hand-off as at the start of a run: the worker stays idle until the adversary's reply reaches it.
 - **New instructions are optional:** `adversary resume "Also add a --verbose flag"` passes them to the adversary as an amendment to the task, and the worker starts on them first. Without them, the adversary is told to carry on with the task as it stood, including changes asked for earlier.
+- **Settings can change on resume:** `resume` takes the same setting flags as `run` — `--worker-permission-mode` / `--skip-permissions`, `--strict-approvals` (or `--no-strict-approvals`), `--max-exchanges`, `--stall-after`, `--worker-model`, `--adversary-model`, `--worker-effort`, `--adversary-effort`, `--verify-cmd` (added to the run's existing ones) and `--no-attach`. Anything not given keeps what the run used; anything given is saved for later resumes too, and the launcher prints what changed. Only the task, `--task-file` and `--worktree` are `run`-only.
 - **Counters carry over:** exchange, approval, denial and stall counts, and permission request numbers.
 
 | Flag | Effect |
