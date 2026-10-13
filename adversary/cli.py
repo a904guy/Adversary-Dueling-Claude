@@ -10,7 +10,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from adversary import sessions, snapshot, tmux
+from adversary import mcps, sessions, snapshot, tmux
 from adversary.config import RunConfig, write_launch_files
 
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "adversary" / "runs"
@@ -100,8 +100,10 @@ def run(a: argparse.Namespace) -> None:
         worker_effort=a.worker_effort, adversary_effort=a.adversary_effort,
         verify_cmds=a.verify_cmd or [], session=f"adversary-{ts}", strict_approvals=a.strict_approvals,
         stall_after=a.stall_after, origin=str(Path(a.repo).expanduser().resolve()),
-        git_subdirs=find_git_subdirs(repo),
+        git_subdirs=find_git_subdirs(repo), adversary_mcps=a.adversary_mcp or [],
     )
+    if cfg.adversary_mcps:
+        print(f"adversary: MCP servers for the supervisor: {mcp_summary(cfg)}")
     if cfg.git_subdirs:
         print(f"adversary: git repos inside the folder (the supervisor can inspect these with "
               f"`git -C <subdir> log/status/diff`): {', '.join(cfg.git_subdirs)}")
@@ -234,6 +236,8 @@ def resume(a: argparse.Namespace) -> None:
     changed = apply_settings(cfg, a)
     if changed:
         print(f"adversary: changed for this and later sessions: {', '.join(changed)}")
+    if cfg.adversary_mcps:
+        print(f"adversary: MCP servers for the supervisor: {mcp_summary(cfg)}")
     if os.path.exists(cfg.sock):
         os.remove(cfg.sock)  # left behind by a bridge that didn't exit cleanly
     cfg.save()
@@ -332,7 +336,22 @@ def add_settings(p: argparse.ArgumentParser, resume: bool) -> None:
     p.add_argument("--verify-cmd", action="append",
                    help="extra command prefix the adversary may run (repeatable)"
                         + ("; added to the run's existing ones" if resume else ""))
+    p.add_argument("--adversary-mcp", action="append", metavar="SPEC",
+                   help="give the adversary an MCP server by its name in your MCP config (repeatable; default: "
+                        "none): NAME for all its tools, NAME:readonly for a look-only browser preset, "
+                        "NAME:tool1,tool2 for just those; claude-in-chrome for Claude in Chrome"
+                        + ("; replaces the run's choice, none clears it" if resume else ""))
     p.add_argument("--no-attach", action="store_true", help="don't attach to the tmux session")
+
+
+def mcp_summary(cfg: RunConfig) -> str:
+    """Check the run's --adversary-mcp specs against what's enabled (exit on a bad one) and
+    describe what the adversary gets, for the launch output."""
+    try:
+        plan = mcps.plan(cfg.adversary_mcps, cfg.repo, strict=True)
+    except ValueError as e:
+        die(f"--adversary-mcp: {e}")
+    return ", ".join(plan.labels) if plan.labels else "none"
 
 
 def apply_settings(cfg: RunConfig, a: argparse.Namespace) -> list[str]:
@@ -352,6 +371,10 @@ def apply_settings(cfg: RunConfig, a: argparse.Namespace) -> list[str]:
     elif skip and not cfg.skip_permissions:
         cfg.skip_permissions = True
         changed.append("skip-permissions")
+    specs = getattr(a, "adversary_mcp", None)
+    if specs and specs != cfg.adversary_mcps:
+        cfg.adversary_mcps = list(specs)
+        changed.append(f"adversary-mcp={','.join(specs)}")
     for cmd in getattr(a, "verify_cmd", None) or []:
         if cmd not in cfg.verify_cmds:
             cfg.verify_cmds.append(cmd)

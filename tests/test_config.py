@@ -141,3 +141,11 @@ def test_run_defaults_are_unchanged():
     a = _parse("run", "do it")
     assert (a.max_exchanges, a.stall_after, a.worker_effort, a.adversary_effort, a.strict_approvals,
             a.skip_permissions) == (30, 120, "high", "xhigh", False, False)
+
+
+def test_resume_adversary_mcp_replaces_the_runs_choice():
+    from adversary.cli import apply_settings
+    cfg = RunConfig(task="t", repo="/x", run_dir="/r", sock="/s", base_sha="abc", adversary_mcps=["none"])
+    assert apply_settings(cfg, _parse("resume")) == [] and cfg.adversary_mcps == ["none"]
+    changed = apply_settings(cfg, _parse("resume", "--adversary-mcp", "chrome-devtools"))
+    assert cfg.adversary_mcps == ["chrome-devtools"] and changed == ["adversary-mcp=chrome-devtools"]

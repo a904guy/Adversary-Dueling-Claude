@@ -1,10 +1,13 @@
 """Run configuration and the per-run files handed to the two Claude Code instances."""
 
 import json
+import os
 import shlex
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+from adversary import mcps
 
 PROMPTS = Path(__file__).parent / "prompts"
 
@@ -47,6 +50,7 @@ class RunConfig:
     origin: str | None = None   # folder the run was started from (differs from repo with --worktree)
     sessions: dict = field(default_factory=dict)   # role -> Claude Code session ID, for resuming
     git_subdirs: list[str] = field(default_factory=list)   # git repos inside the working folder
+    adversary_mcps: list[str] = field(default_factory=list)   # --adversary-mcp specs; empty = none
 
     def adversary_bash(self) -> list[str]:
         cmds = list(VERIFY_BASH)
@@ -90,6 +94,14 @@ def _hooks(cfg: RunConfig, role: str, events: list[str]) -> dict:
     return {"hooks": hooks}
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Write a file only its owner can read: copied MCP definitions can carry API keys."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.chmod(path, 0o600)   # an existing file keeps its old mode through O_CREAT
+
+
 def draft_path(cfg: RunConfig, role: str) -> Path:
     """Where the draft mod in `role`'s session reports whether its prompt box holds a draft."""
     return Path(cfg.run_dir) / f"draft-{role}.json"
@@ -104,15 +116,30 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
     worker_events = base_events + ([] if cfg.skip_permissions else ["PermissionRequest"])
     (run / "worker-settings.json").write_text(json.dumps(_hooks(cfg, "worker", worker_events), indent=2))
     (run / "adversary-settings.json").write_text(json.dumps(_hooks(cfg, "adversary", base_events), indent=2))
-    (run / "adversary-mcp.json").write_text(json.dumps({
+    # The supervisor's MCP servers: the bridge's own, plus any named with --adversary-mcp. Its
+    # launch doesn't load the user's servers, so named ones are handed over here.
+    mcp = mcps.plan(cfg.adversary_mcps, cfg.repo)
+    _write_private(run / "adversary-mcp.json", json.dumps({
         "mcpServers": {
+            **mcp.servers,
             "adversary": {
                 "command": sys.executable,
                 "args": ["-m", "adversary.mcp_server"],
                 "env": {"ADVERSARY_SOCK": cfg.sock, "PYTHONPATH": pkg_root},
-            }
+            },
         }
     }, indent=2))
+    # The role prompt, plus a note of the external tools this run's supervisor has.
+    role = (PROMPTS / "adversary_role.md").read_text()
+    if mcp.labels:
+        role += (
+            "\n\n## External tools this run\n"
+            f"You also have these MCP servers: {', '.join(mcp.labels)}. Use them to **verify** the worker's "
+            "claims — load the page it built, take a snapshot or screenshot, read the console and network "
+            "errors — not to do the work or change anything outside the repo. A browser server that drives a "
+            "shared, logged-in browser profile may already be in use by the worker (or fail as busy); prefer "
+            "an isolated/headless one when there is a choice.\n")
+    (run / "adversary-role.md").write_text(role)
 
     worker = ["claude", "--settings", str(run / "worker-settings.json"), "--disallowedTools", "AskUserQuestion"]
     if cfg.strict_approvals:
@@ -134,6 +161,7 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
                "mcp__adversary__approve_tool", "mcp__adversary__deny_tool",
                "mcp__adversary__finish", "mcp__adversary__changed_files", "mcp__adversary__message_worker",
                "mcp__adversary__hold", "mcp__adversary__read_worker", "mcp__adversary__list_agents"]
+    allowed += mcp.allow
     allowed += [f"Bash({c}:*)" for c in cfg.adversary_bash()]
     adversary = [
         "claude",
@@ -145,8 +173,10 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
         "--permission-mode", "dontAsk",
         "--allowedTools", ",".join(allowed),
         "--disallowedTools", "Edit,Write,NotebookEdit,AskUserQuestion",
-        "--append-system-prompt-file", str(PROMPTS / "adversary_role.md"),
+        "--append-system-prompt-file", str(run / "adversary-role.md"),
     ]
+    if mcp.chrome:
+        adversary.append("--chrome")
     if cfg.snapshot_dir:
         adversary += ["--add-dir", cfg.snapshot_dir]
     if cfg.adversary_model:
