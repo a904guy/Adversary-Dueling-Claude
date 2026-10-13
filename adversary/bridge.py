@@ -35,6 +35,7 @@ PASTE_SETTLE = 0.4   # seconds between paste and Enter (plus a little per KB)
 SUBMIT_RETRY = 2.5   # seconds to wait for UserPromptSubmit before pressing Enter again
 SUBMIT_RETRIES = 3
 IDLE_SETTLE = 1.0    # seconds after Stop/SessionStart before pasting
+RESUME_SETTLE = 1.5  # seconds after a permission decision before pasting a queued message_worker
 DRAFT_RECHECK = 1.0  # seconds between checks while a person has a draft in the pane
 DELIVERY_RETRY = 5.0  # seconds before retrying a delivery tmux refused
 QUIT_GRACE = 10.0    # seconds the agents get to exit on SIGTERM before SIGKILL
@@ -123,6 +124,7 @@ class Bridge:
         self.idle_since: float | None = None   # when both agents last went idle together
         self.stalls = 0
         self.plan_sent = False                  # the worker has been given its first instructions
+        self._resumed_at = 0.0                   # monotonic time of the last permission decision
         self._flush_tasks: set[asyncio.Task] = set()
 
         if resume is None:
@@ -346,8 +348,8 @@ class Bridge:
             # something a person typed, or a shell command.
             report = self._draft_report(pane)
             if report is not None and not str(report.get("head", "")).startswith(header[:40]):
-                self.log(f"{role}: no submit seen, and the prompt box no longer holds the bridge's message; "
-                         "not pressing Enter")
+                self.log(f"{role}: the pasted message never reached the prompt box (it holds something else, "
+                         f"or is empty) and wasn't submitted; it was NOT delivered: {self._short(body)}")
                 return
             if self.pane_mode(pane):
                 self.log(f"{role}: no submit seen, and the pane is in {self.pane_mode(pane)}; not pressing Enter")
@@ -609,6 +611,16 @@ class Bridge:
             return
         if pane.busy and self._waiting_on_person(pane):
             return  # (an idle worker's message goes through the queue, which checks too)
+        if pane.busy:
+            # Just after a permission decision the worker is resuming and its prompt box isn't
+            # back yet; a paste now is lost. Wait out the rest of the resume settle, then retry.
+            remaining = RESUME_SETTLE - (time.monotonic() - self._resumed_at)
+            if remaining > 0:
+                try:
+                    asyncio.get_running_loop().call_later(remaining, self._send_direct)
+                    return
+                except RuntimeError:
+                    pass
         body = "\n\n---\n\n".join(pane.direct)
         pane.direct.clear()
         if not pane.busy:
@@ -743,6 +755,11 @@ class Bridge:
             req.future.set_result(output)
         self.log(note)
         self.transcript.add(note)
+        # The worker is resuming from the permission hook; mark the moment so the next mid-turn
+        # paste waits for it to come back (see _send_direct). This covers a message_worker queued
+        # during the wait and one the human prompts a beat after the decision — both race the
+        # worker's return from the permission-pending state, where a paste is simply lost.
+        self._resumed_at = time.monotonic()
         self._send_direct()
 
     # ── MCP tool calls from the adversary ───────────────────────────────

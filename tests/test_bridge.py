@@ -13,6 +13,7 @@ from adversary.config import RunConfig
 @pytest.fixture(autouse=True)
 def fast(monkeypatch):
     monkeypatch.setattr(bridge_mod, "IDLE_SETTLE", 0)
+    monkeypatch.setattr(bridge_mod, "RESUME_SETTLE", 0)
     monkeypatch.setattr(bridge_mod, "DRAFT_RECHECK", 0)
 
 
@@ -482,6 +483,49 @@ async def test_message_worker_waits_for_pending_permission(repo, tmp_path):
     await settle()
     assert (await perm)["hookSpecificOutput"]["decision"]["behavior"] == "allow"
     assert sent[-1] == (WORKER, "Use the fixtures dir.")
+
+
+async def test_direct_message_after_permission_is_deferred_so_the_worker_can_resume(repo, tmp_path, monkeypatch):
+    """A message_worker reply queued during a permission wait must not be pasted the instant the
+    decision is sent (the worker's prompt box isn't back yet and the paste is lost); it waits
+    RESUME_SETTLE so the worker resumes first, then is delivered."""
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    monkeypatch.setattr(bridge_mod, "RESUME_SETTLE", 0.05)   # real but short, so we can observe the wait
+    perm = asyncio.create_task(b.on_permission({"tool_name": "Bash", "tool_input": {"command": "ls"}}))
+    await settle()
+    b.on_mcp("message_worker", {"message": "Use the fixtures dir."})
+    await settle()
+    assert (WORKER, "Use the fixtures dir.") not in sent     # held while the permission is pending
+    b.on_mcp("approve_tool", {"request_id": 1})
+    await settle()
+    assert (WORKER, "Use the fixtures dir.") not in sent     # NOT pasted instantly: worker still resuming
+    assert b.panes[WORKER].direct == ["Use the fixtures dir."]   # still queued, not lost
+    await asyncio.sleep(0.08)
+    await settle()
+    assert sent[-1] == (WORKER, "Use the fixtures dir.")     # delivered once the worker has resumed
+    assert (await perm)["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+
+
+async def test_direct_message_prompted_just_after_the_approve_is_also_deferred(repo, tmp_path, monkeypatch):
+    """The race isn't only for a message queued before the decision: if the human prompts the
+    supervisor a beat AFTER it approves, the resulting message_worker still pastes into a worker
+    that is mid-resume. The deferral keys off the decision time, so this ordering is covered too."""
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    monkeypatch.setattr(bridge_mod, "RESUME_SETTLE", 0.05)
+    perm = asyncio.create_task(b.on_permission({"tool_name": "Bash", "tool_input": {"command": "ls"}}))
+    await settle()
+    b.on_mcp("approve_tool", {"request_id": 1})             # approve first; no message queued yet
+    await settle()
+    await b.on_hook(ADVERSARY, "UserPromptSubmit", {"prompt": "actually, skip the cache test"})
+    b.on_mcp("message_worker", {"message": "Skip the cache test."})
+    await settle()
+    assert (WORKER, "Skip the cache test.") not in sent     # still inside the resume window: deferred
+    await asyncio.sleep(0.08)
+    await settle()
+    assert sent[-1] == (WORKER, "Skip the cache test.")     # delivered once the worker has resumed
+    await perm
 
 
 async def test_stall_logged_once_when_both_idle(repo, tmp_path):
