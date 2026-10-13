@@ -102,7 +102,13 @@ def launch(cfg: RunConfig, no_attach: bool, resume_file: Path | None = None) -> 
     bridge = tmux.tmux("split-window", "-v", "-f", "-l", str(BRIDGE_ROWS), "-P", "-F", "#{pane_id}", "-t", worker,
                        "sh", "-c", bridge_cmd)
     # Attaching from a terminal of another size rescales every pane; keep the bridge short.
-    tmux.tmux("set-hook", "-w", "-t", worker, "window-resized", f"resize-pane -t {bridge} -y {BRIDGE_ROWS}")
+    # Window-scoped hooks and the window-resized hook need tmux >= 3.2; on an older tmux this
+    # is unavailable, so treat it as a best-effort nicety rather than aborting the whole run.
+    try:
+        tmux.tmux("set-hook", "-w", "-t", worker, "window-resized", f"resize-pane -t {bridge} -y {BRIDGE_ROWS}")
+    except subprocess.CalledProcessError as e:
+        print(f"adversary: note: couldn't pin the bridge pane height ({(e.stderr or '').strip() or 'tmux refused the hook'}); "
+              "the bridge pane may grow if you resize the terminal")
     # Label panes with a user option: Claude Code rewrites the pane title (OSC escapes), so
     # #{pane_title} would show its process title instead of the role.
     for pane, label in ((worker, "WORKER · does the task"),
