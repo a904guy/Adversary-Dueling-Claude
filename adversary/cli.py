@@ -97,6 +97,7 @@ def run(a: argparse.Namespace) -> None:
         task=task, repo=str(repo), run_dir=str(run_dir), sock=str(sock_dir / f"adversary-{ts}.sock"),
         base_sha=base_sha, snapshot_dir=snapshot_dir, skip_permissions=a.skip_permissions, worker_permission_mode=a.worker_permission_mode,
         max_exchanges=a.max_exchanges, worker_model=a.worker_model, adversary_model=a.adversary_model,
+        worker_effort=a.worker_effort, adversary_effort=a.adversary_effort,
         verify_cmds=a.verify_cmd or [], session=f"adversary-{ts}", strict_approvals=a.strict_approvals,
         stall_after=a.stall_after, origin=str(Path(a.repo).expanduser().resolve()),
         git_subdirs=find_git_subdirs(repo),
@@ -109,6 +110,7 @@ def run(a: argparse.Namespace) -> None:
 
 
 BRIDGE_ROWS = 4  # the bridge pane only shows status and log lines
+EFFORTS = ["low", "medium", "high", "xhigh", "max"]   # what `claude --effort` accepts
 
 
 def launch(cfg: RunConfig, no_attach: bool, resume_file: Path | None = None) -> None:
@@ -227,6 +229,9 @@ def resume(a: argparse.Namespace) -> None:
     # recorded, and repos may have been added since. write_launch_files then regenerates the
     # adversary's allowlist with the `git -C <subdir>` rules.
     cfg.git_subdirs = find_git_subdirs(Path(cfg.repo))
+    # Keep the effort levels the run started with unless new ones are given.
+    cfg.worker_effort = a.worker_effort or cfg.worker_effort
+    cfg.adversary_effort = a.adversary_effort or cfg.adversary_effort
     if os.path.exists(cfg.sock):
         os.remove(cfg.sock)  # left behind by a bridge that didn't exit cleanly
     cfg.save()
@@ -314,13 +319,21 @@ def main() -> None:
                    help="log a stall when both agents sit idle this long with the run unfinished (default 120, 0 = off)")
     r.add_argument("--worker-model", help="model for the worker")
     r.add_argument("--adversary-model", help="model for the adversary")
+    r.add_argument("--worker-effort", choices=EFFORTS, default="high",
+                   help="effort level for the worker (claude --effort; default: high)")
+    r.add_argument("--adversary-effort", choices=EFFORTS, default="xhigh",
+                   help="effort level for the adversary (claude --effort; default: xhigh)")
     r.add_argument("--verify-cmd", action="append", help="extra command prefix the adversary may run (repeatable)")
     r.add_argument("--no-attach", action="store_true", help="don't attach to the tmux session")
     s = sub.add_parser("resume", help="resume the last run in this folder (or a given run)")
     s.add_argument("message", nargs="?", help="optional new instructions, passed to the adversary")
     s.add_argument("--repo", default=".", help="folder whose last run to resume (default: current directory)")
     s.add_argument("--run", help="a specific run: its directory or timestamp (e.g. 20261001-143802)")
-    s.add_argument("--kill", action="store_true", help="close the run's tmux session if it is still open")
+    s.add_argument("--worker-effort", choices=EFFORTS,
+                   help="change the worker's effort level (default: what the run started with)")
+    s.add_argument("--adversary-effort", choices=EFFORTS,
+                   help="change the adversary's effort level (default: what the run started with)")
+    s.add_argument("--kill",action="store_true", help="close the run's tmux session if it is still open")
     s.add_argument("--no-attach", action="store_true", help="don't attach to the tmux session")
     a = ap.parse_args()
     if a.cmd == "run":

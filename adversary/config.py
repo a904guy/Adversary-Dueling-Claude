@@ -37,6 +37,8 @@ class RunConfig:
     max_exchanges: int = 30   # round trips without the human before the worker is held
     worker_model: str | None = None
     adversary_model: str | None = None
+    worker_effort: str | None = "high"        # claude --effort for each side (low … max; None: Claude Code's own)
+    adversary_effort: str | None = "xhigh"
     verify_cmds: list[str] = field(default_factory=list)
     session: str = ""
     strict_approvals: bool = False
@@ -122,6 +124,8 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
         worker += ["--permission-mode", cfg.worker_permission_mode or "manual"]
     if cfg.worker_model:
         worker += ["--model", cfg.worker_model]
+    if cfg.worker_effort:
+        worker += ["--effort", cfg.worker_effort]
 
     # Read-only inspection plus web research (WebFetch/WebSearch) so the supervisor can study
     # references the task points at — a GitHub repo, docs, an API — and plan from them itself,
@@ -147,6 +151,8 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
         adversary += ["--add-dir", cfg.snapshot_dir]
     if cfg.adversary_model:
         adversary += ["--model", cfg.adversary_model]
+    if cfg.adversary_effort:
+        adversary += ["--effort", cfg.adversary_effort]
 
     # The draft mod reports whether the prompt box holds an unsent message (bridge waits if so).
     draftmod = str(Path(__file__).resolve().parent / "draftmod")

@@ -54,6 +54,7 @@ That is all that's required. It works in the current directory. Every flag below
 | `--max-exchanges N` | Loop guard: after this many round trips between the agents without me (default 30), the worker is put on hold. The count restarts whenever I type to either side and on resume, and the run is never ended by it. Permission requests don't count. |
 | `--stall-after SECONDS` | Log a stall when both agents sit idle this long while the run is unfinished (default 120, `0` turns it off). |
 | `--worker-model`, `--adversary-model` | Pick the model for each side. |
+| `--worker-effort LEVEL`, `--adversary-effort LEVEL` | Effort level for each side (`low`, `medium`, `high`, `xhigh`, `max`; passed as `claude --effort`). Defaults: worker `high`, adversary `xhigh`. Also accepted by `adversary resume` to change them; otherwise a resume keeps the run's levels. |
 | `--verify-cmd "just test"` | Extra command prefix the adversary may run (repeatable). |
 | `--task-file FILE` | Read the task from a file. |
 | `--no-attach` | Start the tmux session detached. |

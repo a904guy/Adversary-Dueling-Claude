@@ -46,3 +46,15 @@ def test_adversary_bash_without_subdirs_is_unchanged():
     cmds = cfg.adversary_bash()
     assert not any(c.startswith("git -C") for c in cmds)
     assert "git log" in cmds and "git status" in cmds
+
+
+def test_effort_defaults_to_high_for_the_worker_and_xhigh_for_the_adversary(tmp_path):
+    from adversary.config import write_launch_files
+    cfg = RunConfig(task="t", repo=str(tmp_path), run_dir=str(tmp_path), sock="/s", base_sha="abc")
+    scripts = write_launch_files(cfg)
+    assert "--effort high" in scripts["worker"].read_text()
+    assert "--effort xhigh" in scripts["adversary"].read_text()
+    cfg.worker_effort, cfg.adversary_effort = "low", None    # None: leave it to Claude Code
+    scripts = write_launch_files(cfg)
+    assert "--effort low" in scripts["worker"].read_text()
+    assert "--effort" not in scripts["adversary"].read_text()
