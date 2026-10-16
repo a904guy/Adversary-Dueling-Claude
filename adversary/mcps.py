@@ -68,6 +68,22 @@ def _settings(repo: Path, home: Path) -> dict:
     return merged
 
 
+def approvals(repo, home: Path | None = None) -> dict:
+    """The answers already given to Claude Code's "New MCP servers found" dialog for `repo`'s
+    .mcp.json. They're saved in local/user settings, which the supervisor's launch doesn't read,
+    so it would ask again every launch; its own --settings carries them over instead."""
+    repo, home = Path(repo), (home or Path.home())
+    proj = (_load(home / ".claude.json").get("projects") or {}).get(str(repo)) or {}
+    out = _settings(repo, home)
+    for key in ("enabledMcpjsonServers", "disabledMcpjsonServers"):
+        names = list(out.get(key) or []) + [n for n in proj.get(key) or [] if n not in (out.get(key) or [])]
+        if names:
+            out[key] = names
+    if proj.get("enableAllProjectMcpServers"):
+        out["enableAllProjectMcpServers"] = True
+    return out
+
+
 def enabled_servers(repo, home: Path | None = None) -> dict[str, dict]:
     """The MCP servers Claude Code would load in `repo`, name -> definition."""
     repo, home = Path(repo), (home or Path.home())

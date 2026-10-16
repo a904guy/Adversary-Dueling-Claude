@@ -152,7 +152,10 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
 
     worker_events = base_events + ([] if cfg.skip_permissions else ["PermissionRequest"])
     (run / "worker-settings.json").write_text(json.dumps(_hooks(cfg, "worker", worker_events), indent=2))
-    (run / "adversary-settings.json").write_text(json.dumps(_hooks(cfg, "adversary", base_events), indent=2))
+    # Its launch skips the settings where your .mcp.json answers are saved; pass them on so it
+    # doesn't stop at the "New MCP servers found" dialog every launch.
+    (run / "adversary-settings.json").write_text(json.dumps(
+        {**_hooks(cfg, "adversary", base_events), **mcps.approvals(cfg.repo)}, indent=2))
     # The supervisor's MCP servers: the bridge's own, plus any named with --adversary-mcp. Its
     # launch doesn't load the user's servers, so named ones are handed over here.
     mcp = mcps.plan(cfg.adversary_mcps, cfg.repo)

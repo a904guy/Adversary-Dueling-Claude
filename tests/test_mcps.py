@@ -89,3 +89,17 @@ def test_launch_files_hand_the_servers_to_the_supervisor_privately(tmp_path):
     cfg.adversary_mcps = ["none"]
     adv = write_launch_files(cfg)["adversary"].read_text()
     assert "mcp__chrome-devtools" not in adv and "--chrome" not in adv
+
+
+def test_supervisor_keeps_your_mcp_json_answers(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".claude").mkdir(parents=True)
+    _home(repo, project={"a": FIREFOX, "b": FIREFOX, "c": FIREFOX}, disabledMcpjsonServers=["b"])
+    (repo / ".claude" / "settings.local.json").write_text(json.dumps({"enabledMcpjsonServers": ["a"]}))
+    run = tmp_path / "run"
+    run.mkdir()
+    write_launch_files(RunConfig(task="t", repo=str(repo), run_dir=str(run), sock="/s", base_sha="abc"))
+    adv = json.loads((run / "adversary-settings.json").read_text())
+    assert adv["enabledMcpjsonServers"] == ["a"] and adv["disabledMcpjsonServers"] == ["b"]
+    assert "enableAllProjectMcpServers" not in adv and "hooks" in adv       # nothing new is switched on
+    assert "enabledMcpjsonServers" not in json.loads((run / "worker-settings.json").read_text())
