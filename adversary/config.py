@@ -62,7 +62,16 @@ class RunConfig:
         # read-only — a bare `git -C` prefix would also allow commit/reset/push.
         for d in self.git_subdirs:
             cmds += [f"git -C {d} {verb}" for verb in GIT_READONLY]
+        # Marking a repo safe only relaxes git's ownership check so it can be read; the launch
+        # already does this for the repos found at start, this covers one that appears later.
+        cmds.append("git config --global --add safe.directory")
         return cmds + self.verify_cmds
+
+    def safe_dirs(self) -> list[str]:
+        """The repos git must trust despite their owner: the working folder and each git repo
+        inside it. On a server where the agents run as root over files another user owns, git
+        refuses them as "dubious ownership" (no log, no status) until they're safe.directory."""
+        return [self.repo] + [str(Path(self.repo) / d) for d in self.git_subdirs]
 
     def save(self) -> Path:
         path = Path(self.run_dir) / "config.json"
@@ -92,6 +101,34 @@ def _hooks(cfg: RunConfig, role: str, events: list[str]) -> dict:
             entry["matcher"] = "*"
         hooks[event] = [entry]
     return {"hooks": hooks}
+
+
+def git_safe_env(dirs: list[str], env: dict | None = None) -> dict[str, str]:
+    """Environment entries that make git trust `dirs` for this process and its children, without
+    touching anyone's ~/.gitconfig: git reads GIT_CONFIG_COUNT/KEY_n/VALUE_n as command-line
+    config, one of the scopes safe.directory is honoured from. Appends after any already set."""
+    env = os.environ if env is None else env
+    try:
+        n = int(env.get("GIT_CONFIG_COUNT", "0"))
+    except ValueError:
+        n = 0
+    out = {}
+    for d in dirs:
+        out[f"GIT_CONFIG_KEY_{n}"], out[f"GIT_CONFIG_VALUE_{n}"] = "safe.directory", d
+        n += 1
+    out["GIT_CONFIG_COUNT"] = str(n)
+    return out
+
+
+def _git_safe_sh(dirs: list[str]) -> str:
+    """The same as git_safe_env, as POSIX sh for a launch script (counting from what's set)."""
+    if not dirs:
+        return ""
+    return ("_n=${GIT_CONFIG_COUNT:-0}\n"
+            f"for _d in {' '.join(shlex.quote(d) for d in dirs)}; do\n"
+            '  export "GIT_CONFIG_KEY_$_n=safe.directory" "GIT_CONFIG_VALUE_$_n=$_d"; _n=$((_n + 1))\n'
+            "done\n"
+            "export GIT_CONFIG_COUNT=$_n\n")
 
 
 def _write_private(path: Path, text: str) -> None:
@@ -201,6 +238,8 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
             f"cd {shlex.quote(cfg.repo)}\n"
             f"export PYTHONPATH={shlex.quote(pkg_root)}${{PYTHONPATH:+:$PYTHONPATH}}\n"
             f"export ADVERSARY_DRAFT_FILE={shlex.quote(str(draft_file))}\n"
+            # Trust the run's repos for git even when another user owns them (see safe_dirs).
+            + _git_safe_sh(cfg.safe_dirs()) +
             f"exec {shlex.join(argv)}\n"
         )
         script.chmod(0o755)

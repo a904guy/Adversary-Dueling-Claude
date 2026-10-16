@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from adversary import mcps, sessions, snapshot, tmux
-from adversary.config import RunConfig, write_launch_files
+from adversary.config import RunConfig, git_safe_env, write_launch_files
 
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "adversary" / "runs"
 
@@ -63,6 +63,9 @@ def run(a: argparse.Namespace) -> None:
     repo = Path(a.repo).expanduser().resolve()
     if not repo.is_dir():
         die(f"{repo} is not a directory")
+    # A repo another user owns is "dubious ownership" to git (it won't even rev-parse), which would
+    # wrongly send the run to snapshot mode; trust it for this process, as the agents' scripts do.
+    os.environ.update(git_safe_env([str(repo)]))
     try:
         base_sha = git(repo, "rev-parse", "HEAD") if shutil.which("git") else None
     except subprocess.CalledProcessError:

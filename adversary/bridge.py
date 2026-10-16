@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 
 from adversary import sessions, snapshot, tmux
-from adversary.config import RunConfig, draft_path
+from adversary.config import RunConfig, draft_path, git_safe_env
 from adversary.transcript import (Transcript, background_running, find_subagent_log, last_assistant_text, recent_activity,
                                    subagent_finished, subagent_logs, token_usage, turn_had_tool_use, write_report)
 
@@ -1555,6 +1555,7 @@ async def close_agents(bridge: Bridge, panes: list[str]) -> None:
 
 async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file: str | None = None) -> None:
     cfg = RunConfig.load(run_dir)
+    os.environ.update(git_safe_env(cfg.safe_dirs()))   # the bridge's own git calls (diff stats)
     resume = Path(resume_file).read_text() if resume_file else None
     bridge = Bridge(cfg, {WORKER: worker_pane, ADVERSARY: adversary_pane}, resume=resume)
     if os.path.exists(cfg.sock):

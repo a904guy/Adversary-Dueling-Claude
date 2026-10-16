@@ -149,3 +149,35 @@ def test_resume_adversary_mcp_replaces_the_runs_choice():
     assert apply_settings(cfg, _parse("resume")) == [] and cfg.adversary_mcps == ["none"]
     changed = apply_settings(cfg, _parse("resume", "--adversary-mcp", "chrome-devtools"))
     assert cfg.adversary_mcps == ["chrome-devtools"] and changed == ["adversary-mcp=chrome-devtools"]
+
+
+def test_launch_scripts_trust_the_runs_repos_for_git(tmp_path):
+    """Agents running as another user than the repos' owner get "dubious ownership" from git; the
+    launch scripts mark the folder and each sub-repo safe.directory via env, not ~/.gitconfig."""
+    from adversary.config import write_launch_files
+    cfg = RunConfig(task="t", repo=str(tmp_path), run_dir=str(tmp_path), sock="/s", base_sha=None,
+                    git_subdirs=["AnyDigits", "AnyFork"])
+    assert cfg.safe_dirs() == [str(tmp_path), str(tmp_path / "AnyDigits"), str(tmp_path / "AnyFork")]
+    for role, script in write_launch_files(cfg).items():
+        body = "\n".join(l for l in script.read_text().splitlines() if not l.startswith("while "))  # no socket wait
+        out = subprocess.run(["sh", "-c", body.split("exec ")[0] + "env | grep ^GIT_CONFIG | sort"],
+                             capture_output=True, text=True, timeout=10,
+                             env={"PATH": "/usr/bin:/bin", "GIT_CONFIG_COUNT": "1",
+                                  "GIT_CONFIG_KEY_0": "core.pager", "GIT_CONFIG_VALUE_0": "cat"}).stdout
+        assert "GIT_CONFIG_COUNT=4" in out                         # appended after the one already set
+        assert "GIT_CONFIG_VALUE_0=cat" in out and f"GIT_CONFIG_VALUE_2={tmp_path}/AnyDigits" in out
+    assert "git config --global --add safe.directory" in cfg.adversary_bash()
+
+
+def test_git_trusts_a_repo_owned_by_someone_else_with_the_env(tmp_path):
+    """The env really is honoured by git for safe.directory (command-line scope)."""
+    import os
+    from adversary.config import git_safe_env
+    repo = tmp_path / "r"
+    _repo(repo)
+    env = {**os.environ, "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}   # git's own hook to fake another owner
+    bad = subprocess.run(["git", "-C", str(repo), "status"], capture_output=True, text=True, env=env)
+    assert bad.returncode != 0 and "dubious ownership" in bad.stderr
+    env.update(git_safe_env([str(repo)], env={}))
+    ok = subprocess.run(["git", "-C", str(repo), "status"], capture_output=True, text=True, env=env)
+    assert ok.returncode == 0, ok.stderr
