@@ -24,7 +24,7 @@ VERIFY_BASH = [
     "cargo test", "cargo build", "cargo check", "cargo clippy",
     "go test", "go build", "go vet",
     "make test", "make check", "make lint",
-    "ls", "wc",
+    "ls", "wc", "diff",
 ]
 
 
@@ -54,8 +54,6 @@ class RunConfig:
 
     def adversary_bash(self) -> list[str]:
         cmds = list(VERIFY_BASH)
-        if self.snapshot_dir:
-            cmds.append("diff")
         # When the working folder itself isn't one git repo but holds some (common with a
         # framework repo beside the app repo), let the adversary inspect each with `git -C
         # <subdir> <read-only verb>`. Both the path and the verb are pinned, so this stays

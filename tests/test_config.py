@@ -46,6 +46,7 @@ def test_adversary_bash_without_subdirs_is_unchanged():
     cmds = cfg.adversary_bash()
     assert not any(c.startswith("git -C") for c in cmds)
     assert "git log" in cmds and "git status" in cmds
+    assert "diff" in cmds                                # plain diff in git repos too
 
 
 def test_adversary_can_call_its_read_only_inspection_tools(tmp_path):
