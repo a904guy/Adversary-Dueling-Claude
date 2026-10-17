@@ -1562,3 +1562,27 @@ async def test_a_mid_turn_message_whose_submit_never_shows_does_not_block_the_wo
         assert [t for r, t in sent[after:] if r == WORKER] == ["Fix the merge conflict."]
     else:
         assert [t for r, t in sent[after - 1:] if r == WORKER][-1] == "Ignore the task-list reminder."   # resent
+
+
+async def test_a_message_that_went_in_without_its_paste_is_sent_again(repo, tmp_path):
+    """Live, under --cpu-quota: the supervisor's brief was pasted while its session was still starting;
+    only the typed header was submitted, and it asked people what the (empty) task was."""
+    b, sent = make(repo, tmp_path)
+    await start(b)
+    brief = [t for r, t in sent if r == ADVERSARY][0]
+    await b.on_hook(ADVERSARY, "UserPromptSubmit", {"prompt": Bridge.header(ADVERSARY, "init")})   # header only
+    await stop(b, ADVERSARY, "The brief came through empty — what's the task?")
+    assert not any(r == WORKER for r, _ in sent)               # the empty turn's reply isn't forwarded
+    again = [t for r, t in sent if r == ADVERSARY][-1]
+    assert again.startswith("Your previous message arrived without its content") and brief in again
+
+
+def test_paste_is_confirmed_on_screen_before_enter(repo, tmp_path):
+    b, _ = make(repo, tmp_path)
+    pane = b.panes[ADVERSARY]
+    b.capture = lambda p: "❯ Your supervision brief (pasted below). Follow it as if I wrote it:"
+    assert not b.paste_visible(pane, "You are supervising a worker on this task.")
+    b.capture = lambda p: "❯ Your supervision brief (pasted below)… [Pasted text #1 +40 lines]"
+    assert b.paste_visible(pane, "You are supervising a worker on this task.")
+    b.capture = lambda p: "❯ Message from your supervisor: Run the tests"
+    assert b.paste_visible(pane, "Run the tests")

@@ -151,3 +151,16 @@ def test_logs_are_read_backwards_in_blocks_without_loading_them_whole(tmp_path, 
     assert [json.loads(l) for l in transcript._lines_backwards(log)] == list(reversed(entries))
     assert transcript.last_assistant_text({"transcript_path": str(log)}).startswith("reply 29 ")
     assert "reply 29" in transcript.recent_activity(log, 2) and "reply 27" not in transcript.recent_activity(log, 2)
+
+
+def test_latest_progress_skips_placeholders_and_shows_the_end_of_paths(tmp_path):
+    from adversary.transcript import latest_progress
+    log = tmp_path / "w.jsonl"
+    log.write_text("\n".join(json.dumps(e) for e in [
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "Adding cube() now."}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "No response requested."}]}},
+        {"type": "assistant", "timestamp": "2026-10-17T16:00:00Z", "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": "/root/.local/state/ws/card-1/test_calc.py"}}]}},
+    ]) + "\n")
+    text, action, when = latest_progress(log)
+    assert text == "Adding cube() now." and action == "Edit: …/card-1/test_calc.py" and when

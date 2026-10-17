@@ -235,6 +235,16 @@ class Fake4ga:
             items = sorted((c for c in self.comments.values() if c["cardId"] == r.group(1)
                             and (before is None or int(c["id"]) < before)), key=lambda c: -int(c["id"]))
             return 200, {"items": items[:50], "included": {}}
+        if method == "PATCH" and (r := m(r"/api/comments/(\d+)")):
+            c = self.comments[r.group(1)]
+            if c["userId"] != BOT:
+                return 403, {"code": "E_FORBIDDEN"}
+            c["data"]["text"] = body["text"]
+            self.edits = getattr(self, "edits", 0) + 1
+            return 200, {"item": c}
+        if method == "DELETE" and (r := m(r"/api/comments/(\d+)")):
+            self.comments.pop(r.group(1))
+            return 200, {"item": {}}
         if method == "POST" and (r := m(r"/api/cards/(\d+)/comments")):
             return 200, {"item": self.add_comment(r.group(1), body["text"], user=BOT, name="Claude")}
         if method == "POST" and (r := m(r"/api/cards/(\d+)/tasks")):

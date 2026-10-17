@@ -102,7 +102,7 @@ async def test_comments_relay_feedback_gates_done_and_done_moves_the_card(fake, 
     b.held = "waiting on the people"
     b.panes[ADVERSARY].busy, b.panes[ADVERSARY].reason = True, "worker_msg"
     await stop(b, ADVERSARY, "Waiting for the colour decision.")
-    assert bot_comments(fake, card)[-1] == "**Supervisor:**\n\nWaiting for the colour decision."
+    assert bot_comments(fake, card)[-1] == "**Message from Supervisor:**\n\nWaiting for the colour decision."
 
     # A person answers: relayed to the supervisor, the request closes, the card goes back to In Progress.
     fake.add_comment(card["id"], "Green, please.", user=HUMAN, name="Pat")
@@ -282,7 +282,7 @@ async def test_follow_up_on_a_done_card_answers_on_the_card_or_reopens_for_work(
     await start(b2)
     await submit(b2, ADVERSARY, [(r, x) for r, _, x in sent])
     await stop(b2, ADVERSARY, "Because Pat asked for it on the card; raising would break their callers.")
-    assert bot_comments(fake, card)[-1].startswith("**Supervisor:**\n\nBecause Pat asked")
+    assert bot_comments(fake, card)[-1].startswith("**Message from Supervisor:**\n\nBecause Pat asked")
     assert not any(role == WORKER for role, _, _ in sent)      # the question didn't wake the worker
     assert fake.column_of(card["id"]) == "In Progress"         # an agent is on it while it answers
     b2.on_mcp("message_worker", {"message": "Make divide raise ZeroDivisionError instead."})
@@ -537,3 +537,111 @@ async def test_done_is_refused_while_checklist_items_are_unticked(fake, tmp_path
     r = b.on_mcp("report_done", {"summary": "done", "leave_unticked": "The manager commits; nothing to do."})
     assert not r.get("error") and fake.column_of(card["id"]) == "Done"
     assert "**Left unticked:** Commit on the branch — The manager commits" in bot_comments(fake, card)[-1]
+
+
+async def test_the_conversation_between_the_agents_is_posted_with_its_direction(fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge_mod, "CARD_PART_MAX", 60)
+    _, card = board_with_card(fake)
+    b, sent = make(fake, tmp_path, card)
+    await b.card_tick(now=0)
+    await start(b)
+    await open_turn(b, sent)                                    # the plan goes to the worker
+    assert bot_comments(fake, card)[-1] == "**Message from Supervisor to Worker:**\n\nPlan: add the button."
+    await submit(b, WORKER, [(r, x) for r, _, x in sent])
+    await stop(b, WORKER, "Added the button; tests pass.")
+    assert bot_comments(fake, card)[-1] == "**Message from Worker to Supervisor:**\n\nAdded the button; tests pass."
+    before = len(bot_comments(fake, card))
+    b.on_mcp("message_worker", {"message": "Also add a tooltip.\n\n" + "Make it short. " * 6})
+    parts = bot_comments(fake, card)[before:]
+    n = len(parts)
+    assert n >= 2 and parts[0].startswith(f"**Message from Supervisor to Worker (part 1 of {n}):**")
+    assert parts[-1].startswith(f"**Message from Supervisor to Worker (part {n} of {n}):**")
+    squash = lambda t: "".join(t.split())
+    assert squash("".join(p.split(":**\n\n", 1)[1] for p in parts)) == \
+        squash("Also add a tooltip." + "Make it short. " * 6)              # nothing lost
+    await submit(b, ADVERSARY, [(r, x) for r, _, x in sent])
+    await stop(b, ADVERSARY, "Looks right; one more thing: add a test for the tooltip.")   # a reply to the worker
+    assert bot_comments(fake, card)[-1].startswith("**Message from Supervisor to Worker:**\n\nLooks right")
+
+
+def test_split_message_keeps_paragraphs_and_code_blocks_whole():
+    from adversary.bridge import split_message
+    assert split_message("short", 100) == ["short"]
+    text = "Intro paragraph.\n\n```python\n" + "\n".join(f"x{i} = {i}" for i in range(40)) + "\n```\n\nAfter."
+    parts = split_message(text, 120)
+    assert all(len(p) <= 120 for p in parts) and len(parts) > 2
+    assert parts[0].startswith("Intro paragraph.") and parts[0].endswith("```")   # cut code block closed...
+    for p in parts[1:]:
+        assert p.startswith("```python")                                   # ...and reopened in the next part
+    assert parts[-1].endswith("After.")
+    assert split_message("a" * 30 + "\n\n" + "b" * 30, 50) == ["a" * 30, "b" * 30]   # a paragraph break wins
+    joined = "\n".join(parts)
+    for i in range(40):
+        assert f"x{i} = {i}" in joined                                     # nothing lost
+
+
+async def test_a_plan_written_as_the_reply_to_a_comment_doesnt_strand_the_worker(fake, tmp_path):
+    """Live: the worker was on hold for a feedback answer; the person answered; the supervisor wrote
+    the worker's plan as its reply to that comment, which goes on the card, not to the worker — and
+    the run sat still. Now it's told the worker is idle and to use message_worker."""
+    _, card = board_with_card(fake)
+    b, sent = make(fake, tmp_path, card)
+    await b.card_tick(now=0)
+    await start(b)
+    await submit(b, ADVERSARY, [(r, x) for r, _, x in sent])
+    b.on_mcp("request_feedback", {"question": "What should modulo(x, 0) do?"})
+    b.on_mcp("hold", {"reason": "waiting for the answer"})
+    await stop(b, ADVERSARY, "Holding for the answer.")
+    fake.add_comment(card["id"], "Raise ZeroDivisionError.", user=HUMAN, name="Pat")
+    await tick(b)
+    relay = [body for _, h, body in sent if h.startswith("A person commented")][-1]
+    assert "message_worker" in relay                            # told up front how to start the worker
+    await submit(b, ADVERSARY, [(r, x) for r, _, x in sent])
+    await stop(b, ADVERSARY, "Got it. Worker: implement modulo raising ZeroDivisionError.")
+    assert not any(role == WORKER for role, _, _ in sent)       # (a reply to a person never reaches it)
+    nudge = [body for role, _, body in sent if role == ADVERSARY][-1]
+    assert "still idle" in nudge and "message_worker" in nudge  # ...so the supervisor is told, once
+    await submit(b, ADVERSARY, [(r, x) for r, _, x in sent])
+    await stop(b, ADVERSARY, "Understood.")
+    assert [body for role, _, body in sent if role == ADVERSARY][-1] == nudge   # not nagged again
+
+
+async def test_the_live_comment_shows_both_agents_working_first_edited_while_newest(fake, tmp_path):
+    _, card = board_with_card(fake)
+    b, sent = make(fake, tmp_path, card)
+    await b.card_tick(now=0)
+    await start(b)
+    wlog, slog = tmp_path / "worker.jsonl", tmp_path / "sup.jsonl"
+    b._worker_log = lambda: wlog
+    b._role_log = lambda role: slog
+    def says(log, text, cmd):
+        with log.open("a") as f:
+            f.write(json.dumps({"type": "assistant", "timestamp": "2026-10-17T16:00:00Z", "message": {"content": [
+                {"type": "text", "text": text}, {"type": "tool_use", "name": "Bash", "input": {"command": cmd}}]}}) + "\n")
+    live = lambda: [t for t in bot_comments(fake, card) if t.startswith("**Live**")]
+    for p in b.panes.values():
+        p.busy = False
+    says(wlog, "Starting.", "ls")
+    b._update_status(10)
+    assert live() == []                                        # nobody working: nothing to show
+    b.panes[WORKER].busy = True
+    b._update_status(20)
+    assert len(live()) == 1 and "**Worker** ● working" in live()[0] and "> Starting." in live()[0]
+    assert "Now: Bash: ls" in live()[0]
+    fake.edits = 0
+    b._update_status(30)                                       # nothing new, too soon: left alone
+    assert fake.edits == 0
+    # The worker hands over; the supervisor reviews: it goes first, the worker shows its last words.
+    says(wlog, "isqrt done; 18 tests pass.", "python3 -m pytest -q")
+    b.panes[WORKER].busy, b.panes[WORKER].idle_at = False, 1_760_000_000
+    b.panes[ADVERSARY].busy = True
+    says(slog, "Checking the edge cases myself.", "python3 -m pytest -q -k isqrt")
+    b._update_status(40)
+    body = live()[0]
+    assert fake.edits == 1 and body.index("**Supervisor** ● working") < body.index("**Worker** · idle since")
+    assert "> Checking the edge cases myself." in body and "Now: Bash: python3 -m pytest -q -k isqrt" in body
+    assert "> isqrt done; 18 tests pass." in body and body.count("Now:") == 1   # only the one working
+    fake.add_comment(card["id"], "Looks good so far.", user=HUMAN, name="Pat")
+    says(slog, "All good; reporting done.", "git log -1")
+    b._update_status(50)                                       # something new since: a new one below
+    assert len(live()) == 2 and "Checking the edge cases" in live()[0] and bot_comments(fake, card)[-1] == live()[-1]

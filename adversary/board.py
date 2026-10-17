@@ -303,6 +303,20 @@ class Board:
     def comment(self, card_id: str, text: str) -> dict:
         return self.call("POST", f"/api/cards/{card_id}/comments", {"text": text})["item"]
 
+    def edit_comment(self, comment_id: str, text: str) -> None:
+        self.call("PATCH", f"/api/comments/{comment_id}", {"text": text})
+
+    def delete_comment(self, comment_id: str) -> None:
+        try:
+            self.call("DELETE", f"/api/comments/{comment_id}")
+        except BoardError as e:
+            if e.status != 404:   # already gone
+                raise
+
+    def newest_comment_id(self, card_id: str) -> str | None:
+        items = self.call("GET", f"/api/cards/{card_id}/comments").get("items") or []
+        return str(max(items, key=lambda c: int(c["id"]))["id"]) if items else None
+
 
 def comment_text(c: dict) -> str:
     return ((c.get("data") or {}).get("text") or "").strip()

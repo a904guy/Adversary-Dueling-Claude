@@ -122,6 +122,69 @@ def _clip(text: str, limit: int) -> str:
     return text[:limit] + f"… (+{len(text) - limit} chars)"
 
 
+# Text Claude Code writes itself for a turn with no real reply; not the agent's words.
+_PLACEHOLDERS = {"no response requested."}
+
+
+def latest_progress(path, text_chars: int = 1500) -> tuple[str, str, float | None]:
+    """A session's latest words and action, for a live progress view: (the last text block it
+    wrote, its latest tool call as a one-line gist, when that call was made). Reads only the end of
+    the log; the text may come from before the latest call."""
+    text, action, when = "", "", None
+    try:
+        for line in _lines_backwards(path):
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("type") != "assistant" or entry.get("isSidechain"):
+                continue
+            for b in reversed((entry.get("message") or {}).get("content") or []):
+                if not isinstance(b, dict):
+                    continue
+                if not action and not text and b.get("type") in ("tool_use", "server_tool_use"):
+                    inp = b.get("input")
+                    path = inp.get("file_path") or inp.get("path") if isinstance(inp, dict) else None
+                    if isinstance(path, str) and path.strip():
+                        # The end of a path says which file; the start is the same long workspace prefix.
+                        tail = "/".join(Path(path).parts[-2:])
+                        action = f"{b.get('name', 'tool')}: …/{tail}" if len(Path(path).parts) > 2 else \
+                            f"{b.get('name', 'tool')}: {path}"
+                    else:
+                        action = _tool_summary(b.get("name", "tool"), inp, 90)
+                    when = _entry_time(entry)
+                elif not text and b.get("type") == "text" and b.get("text", "").strip() \
+                        and b["text"].strip().lower() not in _PLACEHOLDERS:
+                    text = _clip(b["text"], text_chars)
+            if text:
+                break
+    except OSError:
+        pass
+    return text, action, when
+
+
+def last_action(path) -> tuple[str, float | None]:
+    """What a session did last, for a status line: its latest tool call ("Bash: pytest -q") or
+    "writing a reply", and when (epoch seconds). Reads only the end of the log."""
+    try:
+        for line in _lines_backwards(path):
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("type") != "assistant":
+                continue
+            when = _entry_time(entry)
+            for b in reversed((entry.get("message") or {}).get("content") or []):
+                if isinstance(b, dict) and b.get("type") in ("tool_use", "server_tool_use"):
+                    return _tool_summary(b.get("name", "tool"), b.get("input"), 70), when
+                if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip():
+                    return "writing a reply", when
+    except OSError:
+        pass
+    return "", None
+
+
 def token_usage(path) -> dict:
     """Sum the model-reported token usage across a session JSONL.
 

@@ -28,13 +28,14 @@ from pathlib import Path
 from adversary import board as fourga
 from adversary import cardmode, sessions, snapshot, tmux, workspace
 from adversary.config import RunConfig, draft_path, git_safe_env
-from adversary.transcript import (Transcript, background_running, find_subagent_log, last_assistant_text, recent_activity,
+from adversary.transcript import (Transcript, background_running, latest_progress, find_subagent_log, last_assistant_text, recent_activity,
                                    subagent_finished, subagent_logs, token_usage, turn_had_tool_use, write_report)
 
 WORKER, ADVERSARY = "worker", "adversary"
 PASTE_SETTLE = 0.4   # seconds between paste and Enter (plus a little per KB)
 SUBMIT_RETRY = 2.5   # seconds to wait for UserPromptSubmit before pressing Enter again
 SUBMIT_RETRIES = 3
+PASTE_CONFIRM = 10.0  # seconds to wait for a paste to show in the prompt box before pressing Enter
 IDLE_SETTLE = 1.0    # seconds after Stop/SessionStart before pasting
 RESUME_SETTLE = 1.5  # seconds after a permission decision before pasting a queued message_worker
 DRAFT_RECHECK = 1.0  # seconds between checks while a person has a draft in the pane
@@ -48,6 +49,11 @@ _UNSET = object()    # sentinel: a cached value not computed yet (None is a vali
 CARD_POLL = 15       # seconds between checks of a card run's comments
 PARK_AFTER = 900     # seconds a managed card run waiting on people sits idle before it closes (frees its slot)
 DONE_IDLE = 120      # seconds a Done card's follow-up run sits idle, its question answered, before it closes
+LIVE_TEXT = 800       # characters of each agent's latest words in the live comment
+STATUS_REFRESH = 120  # seconds between live-progress refreshes when nothing changed (to update the "ago")
+# Characters per card comment. 4ga itself takes a 1,000,000-character comment (measured), so this is
+# for reading: a longer agent message is split into numbered parts.
+CARD_PART_MAX = 8000
 IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}   # what attach_image puts on a card
 IMAGE_MAX = 10 * 1024 * 1024
 HELP_DIR = Path(__file__).resolve().parent / "help"
@@ -72,6 +78,8 @@ class Pane:
     last_text: str = ""            # final message of its last turn
     transcript_path: str | None = None  # this session's JSONL, from live hook payloads
     waiting_on: str | None = None  # why a delivery waits for the person: "a draft", "shell mode", "copy mode"
+    lost: tuple | None = None      # a delivery whose paste was dropped (header only): sent again after the turn
+    idle_at: float | None = None   # wall-clock time its last turn ended (for the card's live comment)
     wait_retry: bool = False       # a recheck is scheduled
 
 
@@ -86,10 +94,39 @@ class PermRequest:
     agent_type: str = ""    # the subagent's type/name, e.g. "security-reviewer"
 
 
+def split_message(text: str, limit: int) -> list[str]:
+    """Split text into parts of at most `limit` characters, at a paragraph break if there is one,
+    else a line break, else mid-line. A ``` code block cut by a split is closed at the end of its part
+    and reopened at the start of the next, so each part renders on its own."""
+    parts: list[str] = []
+    fence = ""   # the opening fence line of a code block left open by the previous part
+    while text:
+        room = limit - (len(fence) + 1 if fence else 0) - 4   # space for a reopened fence and a closing ```
+        if len(fence) + len(text) + (1 if fence else 0) <= limit:
+            parts.append((fence + "\n" if fence else "") + text)
+            break
+        cut = text.rfind("\n\n", 0, room)
+        if cut < room // 2:
+            cut = text.rfind("\n", 0, room)
+        if cut < room // 2:
+            cut = room
+        chunk, text = text[:cut].rstrip(), text[cut:].lstrip("\n")
+        body = (fence + "\n" if fence else "") + chunk
+        opened = ""
+        for line in body.splitlines():
+            if line.lstrip().startswith("```"):
+                opened = "" if opened else line.strip()
+        if opened:
+            body += "\n```"
+        parts.append(body)
+        fence = opened
+    return parts
+
+
 class Bridge:
     def __init__(self, cfg: RunConfig, panes: dict[str, str], deliver=None, log=print, screen_idle=None,
                  resume: str | None = None, focus=None, focused=None, popup=None, has_draft=None,
-                 pane_mode=None):
+                 pane_mode=None, capture=None):
         self.cfg = cfg
         self.panes = {role: Pane(role, target) for role, target in panes.items()}
         self.deliver = deliver or self._tmux_deliver
@@ -99,6 +136,7 @@ class Bridge:
         self.popup = popup or self._tmux_popup
         self.has_draft = has_draft or self._draft_file_says
         self.pane_mode = pane_mode or self._tmux_pane_mode
+        self.capture = capture or (lambda pane: tmux.capture(pane.target))
         self._popup_task: asyncio.Task | None = None
         self._popups_unsupported = False   # this tmux rejected display-popup; stop retrying
         # Per-project record (which help popups were shown), kept with the runs, keyed by folder.
@@ -150,6 +188,7 @@ class Bridge:
         self._parked_since: float | None = None
         self._card_checked = False   # looked up the card's column at start
         self._card_said = False      # this turn already posted its closing summary (report_done / can't complete)
+        self._status_key, self._status_at = "", -1e9   # what the status comment last showed, and when
         self.card_followup = False   # resumed for a comment on a Done card; ends when work goes to the worker
         if cfg.card_mode:
             try:
@@ -383,6 +422,12 @@ class Bridge:
         tmux.type_text(pane.target, header + " ")
         tmux.paste(pane.target, body, buffer=f"adv-{role}")
         await asyncio.sleep(PASTE_SETTLE + len(body) / 20000)
+        # A session that's still busy (starting up, or held to one core by --cpu-quota) can drop or lag a
+        # paste; Enter then submits the header alone. Wait until the paste shows in the prompt box.
+        waited = 0.0
+        while waited < PASTE_CONFIRM and not self.paste_visible(pane, body):
+            await asyncio.sleep(0.3)
+            waited += 0.3
         tmux.press(pane.target, "Enter")
         for _ in range(SUBMIT_RETRIES):
             await asyncio.sleep(SUBMIT_RETRY)
@@ -400,6 +445,32 @@ class Bridge:
                 return
             self.log(f"{role}: no submit seen yet, pressing Enter again")
             tmux.press(pane.target, "Enter")
+
+    def paste_visible(self, pane: Pane, body: str) -> bool:
+        """Whether the prompt box shows the pasted body: Claude Code's "[Pasted text …]" placeholder
+        for a long paste, or the body's opening for a short one. True when the screen can't be read."""
+        try:
+            screen = self.capture(pane)
+        except Exception:
+            return True
+        if not screen:
+            return True
+        if "[Pasted text" in screen:
+            return True
+        first = next((l.strip() for l in body.splitlines() if l.strip()), "")[:24]
+        return not first or first in " ".join(screen.split())
+
+    @staticmethod
+    def _body_missing(pending: tuple, prompt: str) -> bool:
+        """A delivery whose header went in without its pasted body (the paste was dropped)."""
+        header, body, _ = pending
+        if not body.strip():
+            return False
+        p = prompt.strip()
+        if "[Pasted text" in p or "<pasted_content" in p:
+            return False
+        start = body.strip()[:80]
+        return start not in prompt and len(p) <= len(header) + 20
 
     @staticmethod
     def _is_notification(prompt: str) -> bool:
@@ -493,6 +564,11 @@ class Bridge:
             if role == WORKER:
                 self.release_hold("the worker started a turn")
             if pane.expecting_submit and self._is_delivery(pane.pending, prompt):
+                if self._body_missing(pane.pending, prompt):
+                    # Only the header went in: send the whole message again once this turn ends.
+                    self.log(f"{role}: the message went in without its content (the paste was dropped); "
+                             "resending it after this turn")
+                    pane.lost = pane.pending
                 if pane.pending[2] != "direct":
                     pane.reason = pane.pending[2]  # a mid-turn message keeps the running turn's reason
                 pane.expecting_submit, pane.pending = False, None
@@ -541,10 +617,19 @@ class Bridge:
                 else:
                     self.log(f"{role}: the mid-turn message never went in; sending it again")
                     pane.direct.insert(0, body)
+            if pane.lost:
+                header, body, lost_reason = pane.lost
+                pane.lost = None
+                pane.queue.appendleft(("Your previous message arrived without its content (the paste was dropped). "
+                                       f"Here it is in full; act on it rather than on the empty one:\n\n{body}",
+                                       lost_reason))
+                # This empty turn's reply mustn't be routed as if it answered the real message.
+                pane.reason = None
             # The session that just ran a turn is the live one; a stub never gets here. This keeps
             # the recorded id pointing at the real session even when a resume forks to a new id.
             self._record_session(role, payload)
             pane.busy = False
+            pane.idle_at = time.time()
             text = last_assistant_text(payload)
             # Only the worker's no-op turns drive the quiet-loop hold, and only when the adversary
             # started the turn; read the transcript for a tool call just in that case.
@@ -579,6 +664,8 @@ class Bridge:
                 return
             if self._blank(text):
                 text = "(the worker ended its turn without a message)"
+            else:
+                self._card_say("Message from Worker to Supervisor", text)
             # A turn the adversary's own reply started, in which the worker did nothing (no tool
             # call), while background work it launched is still out, means it is only waiting on
             # that work. Repeated, the two are only echoing ("still waiting" / "ok"); park it rather
@@ -619,7 +706,15 @@ class Bridge:
             # person, or while the worker is parked or the run is over) goes on the card.
             said, self._card_said = self._card_said, False
             if reason in ("user", "human_comment", "worker_msg", "resume", "init") and not self._blank(text) and not said:
-                self._card_post(f"**Supervisor:**\n\n{text}")
+                self._card_say("Message from Supervisor", text)
+            if reason == "human_comment" and not self.finished and self._worker_idle():
+                # A reply to a person never reaches the worker. If the supervisor wrote the worker's next
+                # step there (common right after a feedback answer), the run would sit still: say so once.
+                self.enqueue(ADVERSARY, "Your reply went on the card for the people; it did NOT reach the worker, "
+                             "which is still idle" + (" (on hold)" if self.held else "") + ". If it should work now "
+                             "— e.g. the answer you were waiting for has come — send it the work with message_worker. "
+                             "If it should keep waiting, call hold. Your reply to this note isn't posted or forwarded.",
+                             "idle_note")
             return  # on hold: the worker stays idle and this reply goes nowhere
         if self._blank(text):
             if reason != "init":
@@ -640,6 +735,7 @@ class Bridge:
             if not self.plan_sent:
                 self.plan_sent = True
                 self.enqueue(WORKER, text, "plan")
+                self._card_say("Message from Supervisor to Worker", text)
             return
         if self.exchanges >= self.cfg.max_exchanges:
             self._cap_reached(text)
@@ -649,6 +745,7 @@ class Bridge:
         # Sent right away, like message_worker: into the worker's running turn if it is busy (Claude
         # Code folds it in), else as its next turn — never parked until the worker goes idle.
         self.panes[WORKER].direct.append(text)
+        self._card_say("Message from Supervisor to Worker", text)
         self._send_direct()
 
     def _cap_reached(self, text: str) -> None:
@@ -969,6 +1066,7 @@ class Bridge:
             self.quiet_rounds = 0  # the adversary gave the worker real work; start the loop count fresh
             self.release_hold("the adversary messaged the worker")
             self.panes[WORKER].direct.append(text)
+            self._card_say("Message from Supervisor to Worker", text)
             self._send_direct()
             note = "The finished run is live again. " if reopened else ""
             if self.panes[WORKER].busy:
@@ -1017,6 +1115,20 @@ class Bridge:
         return {"text": f"Unknown tool {tool}", "error": True}
 
     # ── the card (a run launched with --card) ───────────────────────────
+    def _worker_idle(self) -> bool:
+        w = self.panes[WORKER]
+        return not (w.busy or w.queue or w.direct or w.expecting_submit)
+
+    def _card_say(self, header: str, text: str) -> None:
+        """Post one message of the run's conversation on the card, headed with who it's from and to;
+        a long one goes as several comments, numbered."""
+        if not self.card or self._blank(text):
+            return
+        parts = split_message(text.strip(), CARD_PART_MAX)
+        for i, part in enumerate(parts, 1):
+            label = f"{header} (part {i} of {len(parts)})" if len(parts) > 1 else header
+            self._card_post(f"**{label}:**\n\n{part}")
+
     def _card_post(self, text: str) -> None:
         if not self.card:
             return
@@ -1136,11 +1248,12 @@ class Bridge:
                     self.log(f"report_done: merge refused; sent to the worker to fix: {self._short(str(e))}")
                     self.transcript.add("Merge refused at report_done; sent to the worker", str(e))
                     self.release_hold("the merge needs the worker")
-                    self.panes[WORKER].direct.append(
-                        "The supervisor reported this card done, but your work couldn't be merged into main yet:\n\n"
-                        f"{e}\n\nFix this in your workspace (commit everything; for a conflict, merge the target "
-                        "branch into your card branch, resolve the conflicts keeping both sides' intent, run the "
-                        "tests, and commit the merge). Then end your turn with what you changed.")
+                    fix = ("The supervisor reported this card done, but your work couldn't be merged into main yet:\n\n"
+                           f"{e}\n\nFix this in your workspace (commit everything; for a conflict, merge the target "
+                           "branch into your card branch, resolve the conflicts keeping both sides' intent, run the "
+                           "tests, and commit the merge). Then end your turn with what you changed.")
+                    self.panes[WORKER].direct.append(fix)
+                    self._card_say("Message from the bridge to Worker", fix)
                     self._send_direct()
                     return {"text": f"Not merged, so the card stays open:\n\n{e}\n\nThis was sent to the worker to "
                                     "fix. When it reports back, check the resolution (read the merged files, run "
@@ -1271,6 +1384,10 @@ class Bridge:
                                  f"it comes from the people you work for, so act on it):\n\n{said}")
                     queue[queued] = (body, r)
                 elif person:
+                    if self._worker_idle():
+                        said += ("\n\n(Your reply to this is posted on the card for them; it does not reach the "
+                                 "worker, which is " + ("on hold" if self.held else "idle") + ". To give the worker "
+                                 "work, use message_worker.)")
                     self.enqueue(ADVERSARY, said, "human_comment")
                 else:
                     self.enqueue(ADVERSARY, said + "\n\n(Files only, no comment. Your reply isn't sent to the "
@@ -1283,7 +1400,50 @@ class Bridge:
             self.log(f"card: unexpected error: {e!r}")
         finally:
             self._card_busy = False
+        if self.card and not self.finished:
+            try:
+                await asyncio.to_thread(self._update_status, now)
+            except Exception as e:   # the status is a nicety: never let it disturb the run
+                self.log(f"card: couldn't update the status comment: {e}")
         self._check_park(now)
+
+    def _progress(self) -> tuple[str, str] | None:
+        """The live comment's body, and a key that changes only when it does (times aside): each
+        agent's latest words — and, for one that's working, its current action — the one working first.
+        None while neither is working: the comment is then left as it last stood."""
+        sides = []
+        for role, name in ((ADVERSARY, "Supervisor"), (WORKER, "Worker")):
+            pane = self.panes[role]
+            log = self._worker_log() if role == WORKER else self._role_log(role)
+            text, action, when = latest_progress(log, text_chars=LIVE_TEXT) if log else ("", "", None)
+            if pane.busy:
+                head = f"**{name}** ● working"
+            elif pane.idle_at:
+                head = f"**{name}** · idle since {datetime.fromtimestamp(pane.idle_at):%H:%M}"
+            else:
+                head = f"**{name}** · idle"
+            lines = [head]
+            if text:
+                lines.append("\n".join("> " + l if l.strip() else ">" for l in text.splitlines()))
+            if pane.busy and action:
+                ago = f" ({self._dur(int(time.time() - when))} ago)" if when else ""
+                lines.append(f"Now: {action}{ago}")
+            if text or (pane.busy and action):   # (an agent that hasn't said or done anything yet: nothing to show)
+                sides.append((not pane.busy, "\n\n".join(lines), f"{role}:{pane.busy}:{text}:{action if pane.busy else ''}"))
+        if not any(not idle for idle, _, _ in sides):
+            return None
+        sides.sort(key=lambda x: x[0])   # (stable) whoever is working first
+        return "\n\n---\n\n".join(body for _, body, _ in sides), "|".join(k for _, _, k in sides)
+
+    def _update_status(self, now: float) -> None:
+        progress = self._progress()
+        if progress is None:
+            return
+        body, key = progress
+        if key == self._status_key and now - self._status_at < STATUS_REFRESH:
+            return
+        self._status_key, self._status_at = key, now
+        self.card.set_status(f"**Live** · updated {datetime.now():%H:%M:%S}\n\n{body}")
 
     def _check_park(self, now: float) -> None:
         """A managed run with nothing to do but wait on people closes, freeing its pool slot; the

@@ -182,3 +182,10 @@ def test_git_trusts_a_repo_owned_by_someone_else_with_the_env(tmp_path):
     env.update(git_safe_env([str(repo)], env={}))
     ok = subprocess.run(["git", "-C", str(repo), "status"], capture_output=True, text=True, env=env)
     assert ok.returncode == 0, ok.stderr
+
+
+def test_resume_note_for_a_worker_that_never_started():
+    from adversary.cli import resume_note
+    note = resume_note(False, "", None, fresh_worker=True)
+    assert "fresh session that knows nothing about the task" in note and "complete plan" in note
+    assert "both restored" in resume_note(False, "", None)

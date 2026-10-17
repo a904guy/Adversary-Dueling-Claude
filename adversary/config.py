@@ -7,7 +7,7 @@ import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from adversary import cardmode, mcps
+from adversary import cardmode, limits, mcps
 
 PROMPTS = Path(__file__).parent / "prompts"
 
@@ -57,6 +57,8 @@ class RunConfig:
     git_subdirs: list[str] = field(default_factory=list)   # git repos inside the working folder
     git_subdir_bases: dict = field(default_factory=dict)   # subdir -> its HEAD when the run started
     adversary_mcps: list[str] = field(default_factory=list)   # --adversary-mcp specs; empty = none
+    cpu_quota: str | None = None    # --cpu-quota, e.g. "100%" (one core): the run's systemd slice (see limits)
+    memory_max: str | None = None   # --memory-max, e.g. "3G"
     card: dict | None = None        # the 4ga card this run works ({"id", "url"}); see cardmode
     board_env: str | None = None    # 4ga credentials file for a card run (default ~/.config/adversary/4ga.env)
     workspace: dict | None = None   # a card workspace's repos/branches (see workspace.create)
@@ -281,7 +283,7 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
             f"export ADVERSARY_DRAFT_FILE={shlex.quote(str(draft_file))}\n"
             # Trust the run's repos for git even when another user owns them (see safe_dirs).
             + _git_safe_sh(cfg.safe_dirs()) +
-            f"exec {shlex.join(argv)}\n"
+            f"exec {shlex.join(limits.prefix(cfg) + argv)}\n"
         )
         script.chmod(0o755)
         scripts[role] = script

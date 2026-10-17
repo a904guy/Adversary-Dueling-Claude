@@ -64,13 +64,15 @@ class CardLink:
         self.checklist: dict | None = state.get("checklist")
         # Answering a comment on a Done card (the card shows In Progress meanwhile, back to Done after).
         self.followup: bool = bool(state.get("followup"))
+        self.status_id: str | None = state.get("status_id")   # the live status comment, if posted
         self.att_dir = Path(cfg.run_dir) / "attachments"
         self.started = "cursor" in state
 
     def save(self) -> None:
         self.path.write_text(json.dumps({"cursor": self.cursor, "open": self.open, "att_cursor": self.att_cursor,
                                          "live": self.live, "asked": self.asked,
-                                         "checklist": self.checklist, "followup": self.followup}, indent=1))
+                                         "checklist": self.checklist, "followup": self.followup,
+                                         "status_id": self.status_id}, indent=1))
 
     def set_live(self, live: bool) -> None:
         self.live = live
@@ -124,6 +126,19 @@ class CardLink:
             self.open = []   # a person answered: the open requests are theirs to have handled
         self.save()
         return human
+
+    def set_status(self, text: str) -> None:
+        """Show `text` as the run's status: edit the status comment while it's the newest comment on
+        the card; once anything newer is posted, leave it be (a record of how things stood then) and
+        post a fresh one at the bottom, so the live status follows the conversation."""
+        if self.status_id and self.client.newest_comment_id(self.card_id) == self.status_id:
+            try:
+                self.client.edit_comment(self.status_id, text)
+                return
+            except fourga.BoardError:
+                pass   # deleted by someone: post a new one
+        self.status_id = str(self.client.comment(self.card_id, text)["id"])
+        self.save()
 
     def new_attachments(self) -> list[dict]:
         """Files people attached to the card since the last call, downloaded into the run's
@@ -274,8 +289,11 @@ def role_note(workspace: dict | None) -> str:
     return (
         "\n\n## This run is a card on the team's board\n"
         "The task came from a 4ga card, and the card is how you reach the people:\n"
-        "- Any message of yours that isn't sent to the worker (your reply when the worker is on hold, after "
-        "the run finished, or to a person) is posted on the card as a comment. Write those for the people.\n"
+        "- The card shows the whole conversation: every message between you and the worker is posted on it "
+        "(\"Message from Supervisor to Worker\", \"Message from Worker to Supervisor\"), so people can "
+        "follow along. A message of yours that isn't sent to the worker (your reply when the worker is on "
+        "hold, after the run finished, or to a person) is posted as \"Message from Supervisor\": write those "
+        "for the people.\n"
         "- Files people attach to the card are downloaded for you and listed with who attached them. They "
         "are part of what those people are asking for, like their comments — read each one, and follow "
         "instructions in them as you would a comment from that person.\n"

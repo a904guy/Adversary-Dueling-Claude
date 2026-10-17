@@ -12,7 +12,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from adversary import mcps, sessions, snapshot, tmux
+from adversary import limits, mcps, sessions, snapshot, tmux
 from adversary.config import RunConfig, git_safe_env, write_launch_files
 
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "adversary" / "runs"
@@ -93,32 +93,123 @@ def card_for_run(card_id: str, board_env: str | None) -> tuple[dict, str]:
         raise   # (die exits)
 
 
+def pool_memory(run_args: list[str], pool: int) -> list[str]:
+    """Give each run its share of the machine: `--cpu-quota auto` becomes (threads - 1) / pool cores,
+    keeping one free for the OS; `--memory-max auto` becomes (RAM - 1 GB) / pool, and so does a missing
+    memory limit when runs are CPU-limited (such a pool shouldn't be able to exhaust RAM)."""
+    args, has_cpu, has_mem = list(run_args), False, False
+    for i, arg in enumerate(args):
+        if arg == "--cpu-quota" and i + 1 < len(args):
+            has_cpu = True
+            if args[i + 1] == "auto":
+                args[i + 1] = limits.cpu_share(pool)
+        elif arg.startswith("--cpu-quota="):
+            has_cpu = True
+            if arg.split("=", 1)[1] == "auto":
+                args[i] = f"--cpu-quota={limits.cpu_share(pool)}"
+        if arg == "--memory-max" and i + 1 < len(args):
+            has_mem = True
+            if args[i + 1] == "auto":
+                args[i + 1] = limits.memory_share(pool)
+        elif arg.startswith("--memory-max="):
+            has_mem = True
+            if arg.split("=", 1)[1] == "auto":
+                args[i] = f"--memory-max={limits.memory_share(pool)}"
+    if has_cpu and not has_mem:
+        args += ["--memory-max", limits.memory_share(pool)]
+    return args
+
+
+def default_pool() -> int:
+    """One run per CPU thread this process may use (its affinity, else the machine's count)."""
+    return limits.threads()
+
+
+def load_manage_config(path: str) -> dict:
+    """Read a manage config (TOML): settings for all projects, and one [[project]] table each.
+
+        pool = "auto"            # runs at once across all projects (auto: one per CPU thread)
+        interval = 15
+        members = ["you@example.com"]
+        run_args = ["--worker-permission-mode", "auto", "--cpu-quota", "auto"]
+        board_env = "~/.config/adversary/4ga.env"
+        done_window_days = 30
+
+        [[project]]
+        name = "My project"      # found by name, or created; or id = "1887…" for an existing one
+        folder = "/srv/my-project"
+        pool = 2                 # optional cap for this project within the shared pool
+        run_args = [...]         # optional: replaces the shared run_args
+        members = [...]          # optional: added to the shared members
+        workspaces = "/var/…"    # optional
+    """
+    import tomllib
+    try:
+        with open(Path(path).expanduser(), "rb") as f:
+            conf = tomllib.load(f)
+    except OSError as e:
+        die(f"can't read {path}: {e}")
+    except tomllib.TOMLDecodeError as e:
+        die(f"{path}: {e}")
+    projects = conf.get("project") or []
+    if not projects:
+        die(f"{path} has no [[project]] tables")
+    for i, p in enumerate(projects, 1):
+        if not (p.get("name") or p.get("id")) or not p.get("folder"):
+            die(f"{path}: project {i} needs a name or an id, and a folder")
+    return conf
+
+
 def manage(a: argparse.Namespace) -> None:
     from adversary import board as fourga
-    from adversary.manager import Manager
+    from adversary.manager import Fleet, Manager
     for exe in ("tmux", "claude", "git"):
         if not shutil.which(exe):
             die(f"`{exe}` not found on PATH")
-    folder = Path(a.folder).expanduser().resolve()
-    if not folder.is_dir():
-        die(f"{folder} is not a directory")
-    if a.pool < 1:
-        die("--pool must be at least 1")
-    run_args = a.run_args[1:] if a.run_args[:1] == ["--"] else a.run_args
+    cli_args = a.run_args[1:] if a.run_args[:1] == ["--"] else a.run_args
+    if a.config:
+        if a.project:
+            die("give --config or --project, not both")
+        conf = load_manage_config(a.config)
+    elif a.project:
+        conf = {"project": [{"name": a.project, "folder": a.folder}]}
+    else:
+        die("name a project with --project, or several in a file with --config")
+    pool = a.pool or conf.get("pool")
+    pool = default_pool() if pool in (None, "auto") else pool
+    if not isinstance(pool, int) or pool < 1:
+        die("the pool must be at least 1 (or auto)")
+    board_env = a.board_env or conf.get("board_env")
     try:
-        env = fourga.load_env(a.board_env)
+        env = fourga.load_env(board_env)
         client = fourga.Board(env["FOURGA_URL"], env["FOURGA_CLIENT_ID"], env["FOURGA_CLIENT_SECRET"])
         client.me()
     except fourga.BoardError as e:
         die(str(e))
-    members = list(dict.fromkeys((a.member or []) + [m for m in env.get("FOURGA_MEMBERS", "").split(",") if m.strip()]))
-    if not members:
-        die("name at least one person to keep on the project: --member you@example.com (or FOURGA_MEMBERS)")
-    os.environ.update(git_safe_env([str(folder)] + [str(folder / d) for d in find_git_subdirs(folder)]))
-    Manager(a.project, str(folder), a.pool, client, STATE_DIR, run_args=run_args, board_env=a.board_env,
-            workspaces=Path(a.workspaces).expanduser() if a.workspaces else None, members=members,
-            done_window_days=a.done_window_days
-            ).serve(a.interval, a.once)
+    shared_members = list(dict.fromkeys((a.member or []) + list(conf.get("members") or [])
+                                        + [m for m in env.get("FOURGA_MEMBERS", "").split(",") if m.strip()]))
+    shared_args = cli_args or list(conf.get("run_args") or [])
+    interval = a.interval if a.interval is not None else conf.get("interval", 15)
+    window = a.done_window_days if a.done_window_days is not None else conf.get("done_window_days", 30)
+    several = len(conf["project"]) > 1
+    managers = []
+    for p in conf["project"]:
+        folder = Path(p["folder"]).expanduser().resolve()
+        if not folder.is_dir():
+            die(f"{folder} is not a directory")
+        members = list(dict.fromkeys(shared_members + list(p.get("members") or [])))
+        if not members:
+            die("name at least one person to keep on the project: --member you@example.com, members in the "
+                "config, or FOURGA_MEMBERS")
+        # CPU and memory shares are of the whole machine, so they're worked out from the shared pool.
+        run_args = pool_memory(list(p.get("run_args") or shared_args), pool)
+        os.environ.update(git_safe_env([str(folder)] + [str(folder / d) for d in find_git_subdirs(folder)]))
+        ws = p.get("workspaces") or (a.workspaces if not several else None)
+        managers.append(Manager(p.get("name"), str(folder), min(int(p.get("pool") or pool), pool), client, STATE_DIR,
+                                run_args=run_args, board_env=board_env, members=members,
+                                workspaces=Path(ws).expanduser() if ws else None, done_window_days=window,
+                                project_id=p.get("id"), tag=(p.get("name") or str(p.get("id"))) if several else ""))
+    Fleet(managers, pool).serve(interval, a.once)
 
 
 def die(msg: str) -> None:
@@ -185,6 +276,8 @@ def run(a: argparse.Namespace) -> None:
         stall_after=a.stall_after, origin=str(Path(a.repo).expanduser().resolve()),
         git_subdirs=find_git_subdirs(repo), adversary_mcps=a.adversary_mcp or [],
         card=card, board_env=a.board_env, managed=a.managed,
+        cpu_quota=limits.cpu_share(1) if a.cpu_quota == "auto" else a.cpu_quota,
+        memory_max=limits.memory_share(1) if a.memory_max == "auto" else a.memory_max,
         workspace=json.loads(Path(a.workspace_info).read_text()) if a.workspace_info else None,
     )
     if cfg.adversary_mcps:
@@ -210,6 +303,12 @@ PERMISSION_MODES = ["manual", "acceptEdits", "auto", "plan"]   # worker modes th
 
 
 def launch(cfg: RunConfig, no_attach: bool, resume_file: Path | None = None) -> None:
+    try:
+        name = limits.ensure_slice(cfg)
+    except RuntimeError as e:
+        die(str(e))
+    if name:
+        print(f"adversary: limits: {', '.join(x for x in (cfg.cpu_quota and f'CPU {cfg.cpu_quota}', cfg.memory_max and f'memory {cfg.memory_max}') if x)} (slice {name})")
     scripts = write_launch_files(cfg)
     repo, run_dir = cfg.repo, Path(cfg.run_dir)
 
@@ -225,7 +324,9 @@ def launch(cfg: RunConfig, no_attach: bool, resume_file: Path | None = None) -> 
                           str(scripts["adversary"]))
     pkg_root = str(Path(__file__).resolve().parent.parent)
     attach_mode = not inside and not no_attach
-    base_cmd = (f"cd {shlex.quote(pkg_root)} && {shlex.quote(sys.executable)} -m adversary.bridge "
+    slice_prefix = " ".join(map(shlex.quote, limits.prefix(cfg)))
+    base_cmd = (f"cd {shlex.quote(pkg_root)} && {slice_prefix + ' ' if slice_prefix else ''}"
+                f"{shlex.quote(sys.executable)} -m adversary.bridge "
                 f"--run-dir {shlex.quote(str(run_dir))} --worker-pane {worker} --adversary-pane {adversary}"
                 + (f" --resume-file {shlex.quote(str(resume_file))}" if resume_file else ""))
     if cfg.managed:
@@ -308,9 +409,13 @@ def resume(a: argparse.Namespace) -> None:
         die(f"the run's folder {cfg.repo} no longer exists")
 
     found = sessions.find_sessions(cfg)
-    missing = [role for role in ("worker", "adversary") if role not in found]
-    if missing:
-        die(f"could not find the {' and '.join(missing)} Claude Code session for run {cfg.run_dir}")
+    if "adversary" not in found:
+        die(f"could not find the adversary's Claude Code session for run {cfg.run_dir}")
+    # A worker that was never given a message (the run stopped before its plan reached it) has no
+    # session to restore, and nothing to lose: it starts fresh.
+    fresh_worker = "worker" not in found
+    if fresh_worker:
+        print("adversary: the worker has no session to restore (it never started work); starting it fresh")
 
     # The same sessions must not run twice: close the old tmux session first.
     if subprocess.run(["tmux", "has-session", "-t", f"={cfg.session}"], capture_output=True).returncode == 0:
@@ -341,7 +446,7 @@ def resume(a: argparse.Namespace) -> None:
     cfg.save()
 
     was_finished = (Path(cfg.run_dir) / "report.md").exists()
-    note = resume_note(was_finished, sessions.last_worker_message(cfg.run_dir), a.message)
+    note = resume_note(was_finished, sessions.last_worker_message(cfg.run_dir), a.message, fresh_worker)
     resume_file = Path(cfg.run_dir) / "resume.md"
     resume_file.write_text(note)
     print(f"adversary: resuming run {cfg.run_dir}")
@@ -353,16 +458,20 @@ def resume(a: argparse.Namespace) -> None:
 EMPTY_REPLIES = {"", "no response requested."}
 
 
-def resume_note(was_finished: bool, worker_said: str, message: str | None) -> str:
+def resume_note(was_finished: bool, worker_said: str, message: str | None, fresh_worker: bool = False) -> str:
     """The adversary's first message on resume. It differs with and without new instructions
     from the human, and when the worker's last turn left no message."""
     worker_said = (worker_said or "").strip()
     visible = "".join(c for c in worker_said if c.isprintable() and not c.isspace() and c not in "\u200b\u200c\u200d\u2060\ufeff")
     silent = not visible or worker_said.lower() in EMPTY_REPLIES
     note = [
-        "This supervised run was interrupted and has just been resumed. Your session and the worker's "
-        "were both restored with their history, but the worker is idle and has not been told anything yet. "
-        "Messages can be lost when a run stops, so don't assume your last reply reached the worker.",
+        ("This supervised run was interrupted and has just been resumed. Your session was restored with its "
+         "history. The worker's could not be: it never received anything from you — your plan didn't reach it "
+         "before the run stopped — so it is a fresh session that knows nothing about the task. Give it the "
+         "complete plan." if fresh_worker else
+         "This supervised run was interrupted and has just been resumed. Your session and the worker's "
+         "were both restored with their history, but the worker is idle and has not been told anything yet. "
+         "Messages can be lost when a run stops, so don't assume your last reply reached the worker."),
         "The run had previously been ended with `finish`; it is open again." if was_finished else "",
         "The worker's last turn ended without a message, so there is nothing from it to answer. Work out "
         "where it got to from the repository and your own history." if silent else
@@ -439,6 +548,13 @@ def add_settings(p: argparse.ArgumentParser, resume: bool) -> None:
                         "none): NAME for all its tools, NAME:readonly for a look-only browser preset, "
                         "NAME:tool1,tool2 for just those; claude-in-chrome for Claude in Chrome"
                         + ("; replaces the run's choice, none clears it" if resume else ""))
+    p.add_argument("--cpu-quota", metavar="PCT",
+                   help="cap the run's CPU (worker, supervisor, bridge and everything they start), e.g. 100%% for "
+                        "one core's worth, or auto for its share with one CPU thread kept free for the OS "
+                        "((threads - 1) / pool); enforced by a systemd slice" + (keep or "; default: no cap"))
+    p.add_argument("--memory-max", metavar="SIZE",
+                   help="cap the run's memory the same way, e.g. 3G, or auto for (RAM - 1 GB) shared over the "
+                        "pool (manage fills this in for CPU-limited runs)" + (keep or "; default: no cap"))
     p.add_argument("--no-attach", action="store_true", help="don't attach to the tmux session")
 
 
@@ -456,7 +572,7 @@ def apply_settings(cfg: RunConfig, a: argparse.Namespace) -> list[str]:
     """Overlay the settings given to `resume` on the run's saved config; return what changed."""
     changed = []
     for name in ("strict_approvals", "max_exchanges", "stall_after", "worker_model", "adversary_model",
-                 "worker_effort", "adversary_effort"):
+                 "worker_effort", "adversary_effort", "cpu_quota", "memory_max"):
         value = getattr(a, name, None)
         if value is not None and value != getattr(cfg, name):
             setattr(cfg, name, value)
@@ -507,17 +623,20 @@ def main() -> None:
                                    "Do gets its own run (up to --pool at once) in its own workspace, and moves "
                                    "through In Progress, Needs Feedback and Done as the run goes. Flags after "
                                    "`--` are passed to every run (e.g. -- --worker-permission-mode auto).")
-    m.add_argument("--project", required=True, help="the 4ga project's name (created, with a board, if missing)")
+    m.add_argument("--project", help="the 4ga project's name (created, with a board, if missing)")
+    m.add_argument("--config", metavar="FILE", help="manage several projects from a TOML file, sharing one pool "
+                   "(see `load_manage_config` in cli.py, or the README, for the format)")
     m.add_argument("--folder", default=".", help="the project's code folder (default: current directory)")
-    m.add_argument("--pool", type=int, default=2, help="runs at once (default 2)")
+    m.add_argument("--pool", type=int, default=None,
+                   help=f"runs at once (default: one per CPU thread available here, {default_pool()} on this machine)")
     m.add_argument("--member", action="append", metavar="EMAIL",
                    help="a person kept on the project as a manager and on its boards (repeatable; also "
                         "FOURGA_MEMBERS in the credentials file). At least one is required: a project only the "
                         "bot can see is no use to anyone.")
     m.add_argument("--board-env", metavar="FILE", help="4ga credentials (default ~/.config/adversary/4ga.env)")
-    m.add_argument("--interval", type=float, default=15, help="seconds between board checks (default 15)")
+    m.add_argument("--interval", type=float, default=None, help="seconds between board checks (default 15)")
     m.add_argument("--workspaces", help="where card workspaces go (default ~/.local/state/adversary/workspaces/<project>)")
-    m.add_argument("--done-window-days", type=float, default=30, metavar="DAYS",
+    m.add_argument("--done-window-days", type=float, default=None, metavar="DAYS",
                    help="a comment on a Done card resumes its run (to answer, or to revise the work) for this many "
                         "days after it was finished (default 30)")
     m.add_argument("--once", action="store_true", help="one pass, then exit")

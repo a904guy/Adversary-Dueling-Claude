@@ -290,6 +290,8 @@ def test_after_a_crash_runs_cut_off_in_any_column_are_resumed_and_parked_ones_wa
     m.tick()                                                   # the manager comes back up: nothing is alive
     resumed = {c[2] for c in launcher.calls if c[0] == "resume"}
     assert resumed == {runs[crashed_waiting["id"]].run_dir, runs[crashed_followup["id"]].run_dir}
+    assert fake.column_of(crashed_waiting["id"]) == "In Progress"   # nothing open: it's working again
+    assert fake.column_of(parked["id"]) == "Needs Feedback"
     assert Path(m.runs()[crashed_followup["id"]].workspace["path"]).exists()   # rebuilt for it
 
 
@@ -340,3 +342,74 @@ def test_the_timer_runs_while_a_run_is_live_and_failures_get_needs_attention(fak
     fake.cards[card["id"]]["listId"] = fake.list_named(b["id"], "In Progress")["id"]
     m.tick()
     assert not fake.has_label(card["id"], "Needs attention") and fake.has_label(card["id"], "Active")
+
+
+def test_giving_up_on_a_cut_off_run_hands_it_to_people_once(fake, folder, tmp_path):
+    """Live: a run cut off in Needs Feedback failed to resume 3 times; the manager gave up, but the run
+    still read as cut off, so the next passes tried again and posted the give-up note again."""
+    m, launcher = make(fake, folder, tmp_path, pool=1)
+    m.tick()
+    b = next(iter(fake.boards.values()))
+    card = fake.add_card(fake.list_named(b["id"], "Approved To Do")["id"], "t")
+    m.tick()
+    cfg = m.runs()[card["id"]]
+    cfg.sessions = {"adversary": "a"}
+    cfg.save()
+    _set_state(cfg, live=True, cursor=0)
+    fake.cards[card["id"]]["listId"] = fake.list_named(b["id"], "Needs Feedback")["id"]
+    calls = []
+    m.launcher = lambda args: (calls.append(args), (_ for _ in ()).throw(RuntimeError("no session")))[1]
+    for _ in range(8):
+        m.tick()
+    assert len(calls) == 3                                     # three tries, then it waits for a person
+    notes = [c for c in fake.comments.values() if "couldn't resume" in c["data"]["text"]]
+    assert len(notes) == 1 and fake.has_label(card["id"], "Needs attention")
+    fake.add_comment(card["id"], "Try again please.")          # a person replies: resumed again
+    m.launcher = launcher
+    m.tick()
+    assert launcher.calls[-1][:3] == ["resume", "--run", cfg.run_dir]
+
+
+def test_projects_share_one_pool_and_a_broken_one_doesnt_stop_the_rest(fake, folder, tmp_path):
+    from adversary.manager import Fleet
+    client = fourga.Board(fake.url, CLIENT_ID, SECRET, retries=0)
+    state = tmp_path / "state" / "runs"
+    state.mkdir(parents=True)
+    launcher = Launcher(state)
+    logs = []
+    mk = lambda **kw: Manager(folder=str(folder), client=client, state_dir=state, log=logs.append, launcher=launcher,
+                              alive=lambda s: True, members=["pat@example.com"], **kw)
+    a = mk(project="Alpha", pool=4, workspaces=tmp_path / "ws-a", tag="Alpha")
+    b = mk(project=None, project_id="999", pool=4, tag="by id")          # not visible to the bot
+    fleet = Fleet([a, b], pool=2, log=logs.append)
+    a.tick()                                                             # creates Alpha and its board
+    board = next(iter(fake.boards.values()))
+    for i in range(3):
+        fake.add_card(fake.list_named(board["id"], "Approved To Do")["id"], f"t{i}", position=65535 * (i + 1))
+    for _ in range(2):
+        for m in fleet.managers:
+            try:
+                m.tick()
+            except fourga.BoardError as e:
+                logs.append(str(e))
+    assert len([c for c in launcher.calls if c[0] == "run"]) == 2      # the shared pool of 2, not Alpha's 4
+    assert any("isn't visible to the bot" in l for l in logs)
+    # By id: found once the bot can see it, and named from the board.
+    p = fake.add_project("Beta", creator=BOT)
+    c = mk(project=None, project_id=p["id"], pool=1, workspaces=tmp_path / "ws-c")
+    c.tick()
+    assert c.project_name == "Beta" and any(x["projectId"] == p["id"] for x in fake.boards.values())
+
+
+def test_the_manage_config_file(tmp_path):
+    from adversary.cli import load_manage_config
+    f = tmp_path / "manage.toml"
+    f.write_text('pool = "auto"\nmembers = ["pat@example.com"]\nrun_args = ["--cpu-quota", "auto"]\n\n'
+                 '[[project]]\nname = "Test suite"\nfolder = "/srv/a"\n\n'
+                 '[[project]]\nid = "1887993708561827225"\nfolder = "/srv/b"\npool = 2\n')
+    conf = load_manage_config(str(f))
+    assert [p.get("name") or p.get("id") for p in conf["project"]] == ["Test suite", "1887993708561827225"]
+    assert conf["project"][1]["pool"] == 2 and conf["run_args"] == ["--cpu-quota", "auto"]
+    f.write_text('[[project]]\nfolder = "/srv/a"\n')
+    with pytest.raises(SystemExit):
+        load_manage_config(str(f))                                       # a project needs a name or an id

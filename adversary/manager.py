@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from adversary import board as fourga
-from adversary import cardmode, sessions, workspace
+from adversary import cardmode, limits, sessions, workspace
 from adversary.config import RunConfig
 
 MAX_FAILS = 3          # launch/resume failures on one card before it's handed to people
@@ -50,18 +50,27 @@ def _slug(name: str) -> str:
 
 
 class Manager:
-    def __init__(self, project: str, folder: str, pool: int, client: fourga.Board, state_dir: Path,
+    def __init__(self, project: str | None, folder: str, pool: int, client: fourga.Board, state_dir: Path,
                  run_args: list[str] | None = None, board_env: str | None = None,
                  workspaces: Path | None = None, log=print, launcher=None, alive=None,
-                 members: list[str] | None = None, done_window_days: float = 30):
-        self.project_name = project
+                 members: list[str] | None = None, done_window_days: float = 30,
+                 project_id: str | None = None, tag: str = ""):
+        if not (project or project_id):
+            raise ValueError("a project needs a name or an id")
+        self.project_name = project or ""   # filled in from the board when given by id
+        self.project_id = str(project_id) if project_id else None
+        self.key = _slug(self.project_id or self.project_name)   # names its lock and workspaces folder
         self.folder = str(Path(folder).resolve())
         self.pool = pool
         self.client = client
         self.state_dir = Path(state_dir)
         self.run_args = run_args or []
         self.board_env = board_env
-        self.workspaces = Path(workspaces) if workspaces else self.state_dir.parent / "workspaces" / _slug(project)
+        self.workspaces = Path(workspaces) if workspaces else self.state_dir.parent / "workspaces" / self.key
+        self.tag = tag                 # shown before each log line when several projects share one log
+        self.capacity = None           # set by a Fleet: free slots in the pool all its projects share
+        self.live_count = 0            # this project's live runs, as of its last pass
+        self.last_error = ""
         self.log_fn = log
         self.launcher = launcher or self._adversary   # runs `adversary run|resume …`; returns its output
         self.alive = alive or _tmux_alive
@@ -72,7 +81,7 @@ class Manager:
         self._warned: set[str] = set()
 
     def log(self, msg: str) -> None:
-        self.log_fn(f"{time.strftime('%H:%M:%S')} {msg}")
+        self.log_fn(f"{time.strftime('%H:%M:%S')} " + (f"[{self.tag}] " if self.tag else "") + msg)
 
     # ── the board ───────────────────────────────────────────────────────
     def member_ids(self) -> dict[str, str]:
@@ -91,11 +100,16 @@ class Manager:
         data = self.client.projects()
         inc = data.get("included") or {}
         for p in data.get("items") or []:
-            if fourga.norm(p["name"]) == fourga.norm(self.project_name):
+            if (str(p["id"]) == self.project_id if self.project_id
+                    else fourga.norm(p["name"]) == fourga.norm(self.project_name)):
+                self.project_name = p["name"]
                 boards = [b for b in inc.get("boards") or [] if b["projectId"] == p["id"]]
                 managers = {str(m["userId"]) for m in inc.get("projectManagers") or [] if m["projectId"] == p["id"]}
                 self._ensure_managers(p, managers)
                 return p, boards
+        if self.project_id:   # 4ga picks project ids itself: one given by id can only be found
+            raise fourga.BoardError(f"project {self.project_id} isn't visible to the bot: in 4ga, add it to the "
+                                    "project as a project manager")
         p = self.client.create_project(self.project_name)
         self.log(f"created project {self.project_name!r}")
         self._ensure_managers(p, {str(self.client.me()["id"])})
@@ -192,7 +206,7 @@ class Manager:
             raise RuntimeError((r.stderr or r.stdout).strip()[-1500:] or f"exit {r.returncode}")
         return r.stdout
 
-    def _failed(self, view: CardView, what: str, err: Exception) -> None:
+    def _failed(self, view: CardView, what: str, err: Exception, cfg: RunConfig | None = None) -> None:
         cid = str(view.card["id"])
         now = time.time()
         recent = [t for t in self.fails.get(cid, []) if now - t < FAIL_WINDOW] + [now]
@@ -203,6 +217,16 @@ class Manager:
             self._note(cid, f"**Adversary manager:** couldn't {what} this card after {MAX_FAILS} tries; it needs a "
                             f"person.\n\n```\n{str(err)[-1200:]}\n```")
             self._move(view, fourga.NEEDS_FEEDBACK)
+            if cfg is not None:
+                # Handed to people: no longer "cut off", or the next pass would resume it again (and fail
+                # again) without anyone having done anything. A person's comment resumes it.
+                state = Path(cfg.run_dir) / cardmode.STATE
+                try:
+                    data = json.loads(state.read_text())
+                    data["live"] = False
+                    state.write_text(json.dumps(data, indent=1))
+                except (OSError, ValueError):
+                    pass
             try:
                 self.client.add_card_label(cid, self._label(view.board, fourga.ATTENTION_LABEL, fourga.ATTENTION_COLOR))
             except fourga.BoardError as e:
@@ -270,7 +294,7 @@ class Manager:
         try:
             self.launcher(["resume", "--run", cfg.run_dir, "--kill", "--no-attach"])
         except Exception as e:
-            self._failed(view, "resume the run for", e)
+            self._failed(view, "resume the run for", e, cfg)
             return False
         self.log(f"card {view.card['id']}: resumed run {Path(cfg.run_dir).name} ({why})")
         return True
@@ -282,6 +306,13 @@ class Manager:
             return bool(json.loads((Path(cfg.run_dir) / cardmode.STATE).read_text()).get("live"))
         except (OSError, ValueError):
             return False
+
+    @staticmethod
+    def _open_requests(cfg: RunConfig) -> list:
+        try:
+            return json.loads((Path(cfg.run_dir) / cardmode.STATE).read_text()).get("open") or []
+        except (OSError, ValueError):
+            return []
 
     def _recent(self, cfg: RunConfig) -> bool:
         """The card was finished (its report written) within the follow-up window."""
@@ -301,7 +332,7 @@ class Manager:
         try:
             info = workspace.create(self.folder, cfg.workspace["path"], cid)
         except Exception as e:
-            self._failed(view, "rebuild the workspace for", e)
+            self._failed(view, "rebuild the workspace for", e, cfg)
             return False
         cfg.workspace = info
         cfg.save()
@@ -389,11 +420,18 @@ class Manager:
                 workspace.remove(cfg.workspace)
                 for extra in (f"card-{cid}.json", f"card-{cid}.task.md"):
                     (self.workspaces / extra).unlink(missing_ok=True)
+                try:
+                    limits.remove_slice(cfg)
+                except OSError as e:
+                    self.log(f"card {cid}: couldn't remove its slice: {e}")
                 cfg.workspace["removed"] = True
                 cfg.save()
                 self.log(f"card {cid}: done; removed its workspace")
         self.sync_status(boards, live, runs)
+        self.live_count = len(live)
         free = self.pool - len(live)
+        if self.capacity is not None:
+            free = min(free, self.capacity())   # the pool is shared with other projects
         if free <= 0:
             return
         # Closed runs whose cards still need them come first: In Progress (crashed or closed), then
@@ -438,6 +476,8 @@ class Manager:
                 break
             if action == "resume" and cfg is not None:
                 ok = self.resume(view, cfg, f"card in {view.column}" + (", cut off" if self._cut_off(cfg) else ""))
+                if ok and view.column == fourga.norm(fourga.NEEDS_FEEDBACK) and not self._open_requests(cfg):
+                    self._move(view, fourga.IN_PROGRESS)   # nothing left to ask: it's working again
             elif action == "followup" and cfg is not None:
                 ok = self.followup(view, cfg)
             elif action == "claim":
@@ -450,28 +490,59 @@ class Manager:
                 ok = self.start(view) is not None
             if ok:
                 free -= 1
+                self.live_count += 1
                 self._mark_active(view)
 
-    def serve(self, interval: float = 15, once: bool = False) -> None:
-        lock_path = self.state_dir.parent / f"manager-{_slug(self.project_name)}.lock"
+    def lock(self):
+        """Hold this project's lock (one manager per project), or exit if another manager has it."""
+        lock_path = self.state_dir.parent / f"manager-{self.key}.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         lock = open(lock_path, "w")
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            raise SystemExit(f"adversary manage: another manager is already running for {self.project_name!r} "
-                             f"(lock {lock_path})")
-        me = self.client.me()
-        self.member_ids()   # fail now, not mid-loop, on an email with no 4ga account
-        self.log(f"managing {self.project_name!r} as {me.get('name') or me['id']} · pool {self.pool} · folder "
-                 f"{self.folder} · workspaces {self.workspaces} · members {', '.join(self.members)}")
-        while True:
+            raise SystemExit(f"adversary manage: another manager is already running for "
+                             f"{self.project_id or self.project_name!r} (lock {lock_path})")
+        return lock
+
+    def serve(self, interval: float = 15, once: bool = False) -> None:
+        Fleet([self], self.pool, log=self.log_fn).serve(interval, once)
+
+
+class Fleet:
+    """Several projects' managers in one process, sharing one pool of runs: each pass, every project
+    may start runs only while the pool as a whole has room (and within its own cap)."""
+
+    def __init__(self, managers: list[Manager], pool: int, log=print):
+        self.managers, self.pool, self.log_fn = managers, pool, log
+        for m in managers:
+            m.capacity = self.free
+
+    def free(self) -> int:
+        return self.pool - sum(m.live_count for m in self.managers)
+
+    def serve(self, interval: float = 15, once: bool = False) -> None:
+        locks = [m.lock() for m in self.managers]   # noqa: F841 (held for the life of the process)
+        me = self.managers[0].client.me()
+        for m in self.managers:
             try:
-                self.tick()
+                m.member_ids()   # fail now, not mid-loop, on an email with no 4ga account
             except fourga.BoardError as e:
-                self.log(f"board: {e}")
-            except Exception as e:   # keep managing; a run or the board can fail transiently
-                self.log(f"error: {e!r}")
+                raise SystemExit(f"adversary manage: {e}")
+            m.log(f"managing {m.project_id or m.project_name!r} as {me.get('name') or me['id']} · its cap "
+                  f"{m.pool} · folder {m.folder} · workspaces {m.workspaces} · members {', '.join(m.members)}")
+        if len(self.managers) > 1:
+            self.log_fn(f"{time.strftime('%H:%M:%S')} pool {self.pool} shared by {len(self.managers)} projects")
+        while True:
+            for m in self.managers:
+                try:
+                    m.tick()
+                    m.last_error = ""
+                except Exception as e:   # keep managing; a run or the board can fail transiently
+                    msg = f"board: {e}" if isinstance(e, fourga.BoardError) else f"error: {e!r}"
+                    if msg != m.last_error:   # a project that's stuck says so once, not every pass
+                        m.log(msg)
+                        m.last_error = msg
             if once:
                 return
             time.sleep(interval)

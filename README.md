@@ -126,10 +126,34 @@ Each run writes to `~/.local/state/adversary/runs/<timestamp>/`:
 `adversary manage` watches a [4ga Boards](https://github.com/RARgames/4gaBoards) project and keeps up to `--pool` runs working its cards. Runs started by hand (`adversary run`, `adversary resume`) are unchanged: everything below applies only to runs the manager launches.
 
 ```sh
-adversary manage --project "AnySite" --folder /mnt/projects/AnySite --pool 3 -- --worker-permission-mode auto
+adversary manage --project "AnySite" --folder /mnt/projects/AnySite -- --worker-permission-mode auto --cpu-quota auto
 ```
 
-Flags after `--` go to every run it starts.
+Flags after `--` go to every run it starts. `--pool` (runs at once) defaults to the number of CPU threads available, so with `--cpu-quota 100%` (one core's worth per run, see below) a full pool fills the machine without any run taking more than its share.
+
+**CPU and memory limits.** `--cpu-quota 100%` and `--memory-max 3G` (on `run`, `resume`, or after `manage --`) put a run in its own systemd slice, `adversary-run_<id>.slice`. Its worker, supervisor and bridge each join the slice as they start (`systemd-run --scope`), so everything they launch (Bash commands, MCP servers, test runners) is held to the run's limits by the kernel. The tmux server is shared, so the processes join the slice themselves; `tmux attach` works as before. `--cpu-quota auto` gives a run its share of the CPU with one thread kept free for the OS: (threads − 1) ÷ the pool size, so 4 runs on a 4-thread machine get 75% each (3 cores in all), or threads − 1 for a single `adversary run`. `--memory-max auto` gives a run its share of the machine: (RAM − 1 GB) ÷ the pool size, or RAM − 1 GB for a single `adversary run`. `manage` fills that in by itself for runs given `--cpu-quota` without a memory limit. The slice is a unit under `/run`: gone at reboot, written again on resume. Running as root it's a system unit; otherwise a user unit, which needs cgroup delegation for CPU limits.
+
+**Several projects at once.** `adversary manage --config FILE` runs every project in a TOML file from one process, sharing one pool, so CPU and memory shares (`auto`) are worked out for the machine as a whole:
+
+```toml
+pool = "auto"                      # runs at once across all projects (auto = CPU threads)
+interval = 15
+members = ["you@example.com"]      # kept on every project
+run_args = ["--worker-permission-mode", "auto", "--cpu-quota", "auto"]
+
+[[project]]
+name = "Website"                   # found by name, or created with its board
+folder = "/srv/website"
+
+[[project]]
+id = "1887993708561827225"         # an existing project, by its 4ga id (the bot must be a project manager)
+folder = "/mnt/projects/AnySite"
+pool = 2                           # optional: this project's cap within the shared pool
+# run_args = [...]                 # optional: replaces the shared run_args
+# members = [...]                  # optional: added to the shared members
+```
+
+Each project keeps its own lock, so a project can't be managed by two managers at once. A project that fails (for example, an id the bot can't see) logs it once and doesn't hold up the others. Command-line flags (`--pool`, `--member`, `--interval`, flags after `--`) override the file.
 
 **Credentials.** Create a dedicated bot user in 4ga, give it access to the project, and create an API client while logged in as it (Settings → API). Comments only record a user, so the bot's own comments are told from people's by its user id. Put the credentials in `~/.config/adversary/4ga.env`, readable only by you (`chmod 600`), or pass `--board-env FILE`; `FOURGA_*` environment variables override the file:
 
@@ -147,7 +171,15 @@ FOURGA_CLIENT_SECRET=...
 
 **A card's life.**
 1. **Claimed.** While the pool has room, the top card in Approved To Do moves to In Progress (the manager reads it back to check it stayed). It gets a workspace and a detached run. The run's task is the card's title, description and comments so far.
-2. **Worked.** Anything the supervisor says that isn't sent to the worker (to a person, while the worker is on hold, after the run finished) is posted on the card. People's comments are relayed to the supervisor every 15 seconds, like typing to it.
+2. **Worked.** The card shows the whole conversation. Every message between the agents is posted on it, headed with its direction:
+   - **Message from Supervisor to Worker:** the plan, replies and `message_worker` messages.
+   - **Message from Worker to Supervisor:** each of the worker's turn-ends.
+   - **Message from Supervisor:** what it says to people (to a person, while the worker is on hold, after the run finished).
+   - **Message from the bridge to Worker:** what the bridge sends itself, like a merge conflict to fix.
+
+   A message over 8,000 characters is split into numbered parts, at paragraph or line breaks; a code block cut by a split is closed and reopened. 4ga itself takes comments of a million characters, so the split is for reading. Permission requests aren't posted.
+
+   People's comments are relayed to the supervisor every 15 seconds, like typing to it.
    - **Attachments.** Files people attach are downloaded into the run's `attachments/` folder, which both agents may read (images too). Files already on the card go to the supervisor with its first message, or with the resume message on a resumed run.
    - A file attached later arrives in the same message as the comments found with it, or on its own.
    - The bot's own attachments aren't relayed, and anything over 50 MB is skipped with a note.
