@@ -1,0 +1,29 @@
+# Run `adversary manage` for every project in a config file, at boot, and bring it back if it dies.
+#
+#   sudo cp adversary-manage.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now adversary-manage
+#   journalctl -u adversary-manage -f        # the manager's log
+#
+# The config is /root/.config/adversary/manage.toml (see "Several projects at once" in the README).
+# After a reboot the manager resumes every card run that was cut off. Restarting or stopping this
+# unit leaves the runs alone: KillMode=process stops only the manager, not the tmux sessions it
+# started. (For one project without a config file, see adversary-manage@.service.)
+
+[Unit]
+Description=adversary manager (every project in /root/.config/adversary/manage.toml)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/root/.local/bin
+ExecStart=/root/.local/bin/adversary manage --config /root/.config/adversary/manage.toml
+Restart=always
+RestartSec=10
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

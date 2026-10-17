@@ -163,6 +163,8 @@ def load_manage_config(path: str) -> dict:
 def manage(a: argparse.Namespace) -> None:
     from adversary import board as fourga
     from adversary.manager import Fleet, Manager
+    # The log goes to a pipe or journal as often as a terminal: write each line as it happens.
+    sys.stdout.reconfigure(line_buffering=True)
     for exe in ("tmux", "claude", "git"):
         if not shutil.which(exe):
             die(f"`{exe}` not found on PATH")
