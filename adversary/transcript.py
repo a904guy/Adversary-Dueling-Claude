@@ -6,6 +6,35 @@ from datetime import datetime
 from pathlib import Path
 
 
+_BLOCK = 1 << 20   # bytes read at a time when walking a log backwards
+
+
+def _lines_backwards(path):
+    """A JSONL file's non-blank lines, last first, read in blocks from the end. Session logs reach
+    hundreds of MB on a long run; reading one whole (and splitting it) took GBs and got the bridge
+    killed by the OOM killer, while these callers usually need only the last few entries."""
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        pos, rest = f.tell(), b""
+        while pos > 0:
+            step = min(_BLOCK, pos)
+            pos -= step
+            f.seek(pos)
+            parts = (f.read(step) + rest).split(b"\n")
+            rest = parts[0]   # may continue into the previous block
+            for line in reversed(parts[1:]):
+                if line.strip():
+                    yield line.decode("utf-8", "replace")
+        if rest.strip():
+            yield rest.decode("utf-8", "replace")
+
+
+def _lines(path):
+    """A JSONL file's lines, first to last, one at a time (never the whole file in memory)."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        yield from f
+
+
 def last_assistant_text(payload: dict) -> str:
     """The agent's final message for the turn, from the Stop hook payload."""
     if payload.get("last_assistant_message"):
@@ -13,7 +42,7 @@ def last_assistant_text(payload: dict) -> str:
     path = payload.get("transcript_path")
     if not path or not Path(path).exists():
         return ""
-    for line in reversed(Path(path).read_text().splitlines()):
+    for line in _lines_backwards(path):
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
@@ -40,7 +69,7 @@ def turn_had_tool_use(payload: dict) -> bool:
     path = payload.get("transcript_path")
     if not path or not Path(path).exists():
         return True
-    for line in reversed(Path(path).read_text().splitlines()):
+    for line in _lines_backwards(path):
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
@@ -107,26 +136,35 @@ def token_usage(path) -> dict:
     if not path.exists():
         return out
     seen: set[str] = set()
-    for line in path.read_text().splitlines():
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        msg = entry.get("message") or {}
-        usage = msg.get("usage")
-        if not isinstance(usage, dict):
-            continue
-        mid = msg.get("id")
-        if isinstance(mid, str):
-            if mid in seen:
+    try:
+        for line in _lines(path):
+            if '"usage"' not in line:
                 continue
-            seen.add(mid)
-        inp = sum(usage.get(k) or 0 for k in
-                  ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
-        out["in"] += inp
-        out["out"] += usage.get("output_tokens") or 0
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            _add_usage(entry, seen, out)
+    except OSError:
+        pass
     out["total"] = out["in"] + out["out"]
     return out
+
+
+def _add_usage(entry: dict, seen: set, out: dict) -> None:
+    """Add one log entry's usage to `out`, once per message id."""
+    msg = entry.get("message") or {}
+    usage = msg.get("usage")
+    if not isinstance(usage, dict):
+        return
+    mid = msg.get("id")
+    if isinstance(mid, str):
+        if mid in seen:
+            return
+        seen.add(mid)
+    out["in"] += sum(usage.get(k) or 0 for k in
+                     ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    out["out"] += usage.get("output_tokens") or 0
 
 
 def recent_activity(path, count: int, input_chars: int = 300, result_chars: int = 800,
@@ -149,7 +187,7 @@ def recent_activity(path, count: int, input_chars: int = 300, result_chars: int 
         return ""
     results: dict[str, str] = {}
     items: list[str] = []
-    for line in reversed(path.read_text().splitlines()):
+    for line in _lines_backwards(path):
         if len(items) >= count:
             break
         try:
@@ -216,16 +254,15 @@ def subagent_finished(path) -> bool:
     (stop_reason end_turn). Anything else — a tool call awaiting its result, a result awaiting the
     next reply — means it is still running. An unreadable log counts as not finished."""
     try:
-        lines = [l for l in Path(path).read_text().splitlines() if l.strip()]
+        for line in _lines_backwards(path):
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg = entry.get("message") or {}
+            return entry.get("type") == "assistant" and msg.get("stop_reason") == "end_turn"
     except OSError:
         return False
-    for line in reversed(lines):
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        msg = entry.get("message") or {}
-        return entry.get("type") == "assistant" and msg.get("stop_reason") == "end_turn"
     return False
 
 
@@ -253,22 +290,26 @@ def background_running(worker_log, since: float = 0.0) -> list[str]:
     that session ended never reports back, and would otherwise look outstanding forever.
     """
     worker_log = Path(worker_log)
+    # One streaming pass: the notifications that came back, and the background launches.
+    notified: set[str] = set()
+    launches: list[dict] = []
     try:
-        text = worker_log.read_text()
+        for line in _lines(worker_log):
+            if "<tool-use-id>" in line:
+                notified.update(_NOTIFIED.findall(line))
+            if '"run_in_background"' not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            when = _entry_time(entry)
+            if entry.get("type") == "assistant" and (when is None or when >= since):
+                launches.append(entry)
     except OSError:
         return []
-    notified = set(_NOTIFIED.findall(text))
     out: list[str] = []
-    for line in text.splitlines():
-        if '"run_in_background"' not in line:
-            continue
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        when = _entry_time(entry)
-        if entry.get("type") != "assistant" or (when is not None and when < since):
-            continue
+    for entry in launches:
         for b in (entry.get("message") or {}).get("content") or []:
             if (isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id") not in notified
                     and (b.get("input") or {}).get("run_in_background")):

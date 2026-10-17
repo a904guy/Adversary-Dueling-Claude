@@ -1,4 +1,6 @@
 import json
+
+import pytest
 from pathlib import Path
 
 from adversary.transcript import find_subagent_log, recent_activity, subagent_logs, token_usage
@@ -132,3 +134,20 @@ def test_background_running_counts_unfinished_background_subagents_and_teammates
     tm = _worker_with_subagent(tmp_path / "tm", "ag3", "general", [("resp", "hi")],
                                requestShape=None, teamName="crew", name="dd-X")
     assert background_running(tm) == ["dd-X (ag3)"]                 # a teammate still working
+
+
+@pytest.mark.parametrize("block", [5, 64, 1 << 20])
+def test_logs_are_read_backwards_in_blocks_without_loading_them_whole(tmp_path, monkeypatch, block):
+    """A 45-hour run's worker log reached 532 MB; reading it whole and splitting it took ~2.5 GB and
+    the OOM killer took the bridge down. Reading backwards in blocks must give the same lines,
+    whatever the block size relative to the lines."""
+    from adversary import transcript
+    monkeypatch.setattr(transcript, "_BLOCK", block)
+    log = tmp_path / "s.jsonl"
+    entries = [{"type": "user", "message": {"content": "go"}}] + [
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": f"reply {i} " + "x" * (i * 7)}]}}
+        for i in range(30)]
+    log.write_text("\n".join(json.dumps(e) for e in entries) + "\n\n")
+    assert [json.loads(l) for l in transcript._lines_backwards(log)] == list(reversed(entries))
+    assert transcript.last_assistant_text({"transcript_path": str(log)}).startswith("reply 29 ")
+    assert "reply 29" in transcript.recent_activity(log, 2) and "reply 27" not in transcript.recent_activity(log, 2)
