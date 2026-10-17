@@ -166,8 +166,7 @@ FOURGA_CLIENT_SECRET=...
 **The board.** The manager finds the project by name. If there's none, it creates one, then a board. It re-reads the project's boards on every pass, so boards people add later are picked up within one pass.
 - **The bot joins every board as an editor.** As a project manager it can see every board but can't change one it isn't a member of.
 - **A new board gets the six columns:** **Upcoming**, **Suggested**, **Approved To Do**, **In Progress**, **Needs Feedback** and **Done**. A new board is one with no cards and either no columns, or only the Done column 4ga's "Empty" template starts it with; that Done becomes the manager's Done.
-- **A board that has Approved To Do** gets any of the other columns it's missing.
-- **A board with columns of its own and no Approved To Do** is left alone. Upcoming is for people to think out loud in; the manager never touches it. Creating a project needs the bot to be an admin, or project creation turned on for everyone; otherwise create the project yourself and add the bot as a project manager.
+- **A board with columns of its own** gets whichever of Suggested, Approved To Do, In Progress, Needs Feedback and Done it's missing, each placed just before the next of them it has (so a Done it already has stays last). Its own columns stay where they are; the manager never moves or uses them. Upcoming is for people to think out loud in; the manager never touches it. Creating a project needs the bot to be an admin, or project creation turned on for everyone; otherwise create the project yourself and add the bot as a project manager.
 
 **A card's life.**
 1. **Claimed.** While the pool has room, the top card in Approved To Do moves to In Progress (the manager reads it back to check it stayed). It gets a workspace and a detached run. The run's task is the card's title, description and comments so far.

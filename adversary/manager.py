@@ -78,7 +78,6 @@ class Manager:
         self.done_window = done_window_days * 86400   # how long after Done a comment still resumes the card
         self._member_ids: dict[str, str] | None = None
         self.fails: dict[str, list[float]] = {}
-        self._warned: set[str] = set()
 
     def log(self, msg: str) -> None:
         self.log_fn(f"{time.strftime('%H:%M:%S')} " + (f"[{self.tag}] " if self.tag else "") + msg)
@@ -151,21 +150,32 @@ class Manager:
                 self._add_columns(b, lists)
                 full = self.client.board(b["id"])
                 lists = fourga.lists_by_name(full)
-            if fourga.norm(fourga.APPROVED) not in lists:
-                if b["id"] not in self._warned:
-                    self._warned.add(b["id"])
-                    self.log(f"board {b['name']!r} has its own columns and no {fourga.APPROVED!r}, so it isn't worked")
-                continue
-            top = max((l.get("position") or 0 for l in lists.values()), default=0)
-            for name in fourga.ACTIVE:
-                if fourga.norm(name) not in lists:
-                    top += fourga.GAP
-                    self.client.create_list(b["id"], name, top)
-                    self.log(f"board {b['name']!r}: added the missing {name!r} column")
-                    full = self.client.board(b["id"])
-                    lists = fourga.lists_by_name(full)
+            if any(fourga.norm(n) not in lists for n in fourga.ACTIVE):
+                self._fill_columns(b, lists)
+                full = self.client.board(b["id"])
             out.append(full)
         return out
+
+    def _fill_columns(self, board: dict, lists: dict) -> None:
+        """Add the manager's columns a board is missing, each just before the next of them it has
+        (Done last), leaving the board's own columns, Upcoming among them, where they are."""
+        taken = sorted(l.get("position") or 0 for l in lists.values())
+        have = {n: lists[fourga.norm(n)].get("position") or 0 for n in fourga.ACTIVE if fourga.norm(n) in lists}
+        added = []
+        for i, name in enumerate(fourga.ACTIVE):
+            if name in have:
+                continue
+            later = [have[n] for n in fourga.ACTIVE[i + 1:] if n in have]
+            if later:
+                nxt = min(later)
+                pos = (max((p for p in taken if p < nxt), default=0) + nxt) / 2
+            else:
+                pos = max(taken, default=0) + fourga.GAP
+            self.client.create_list(board["id"], name, pos)
+            have[name] = pos
+            taken = sorted(taken + [pos])
+            added.append(name)
+        self.log(f"board {board['name']!r}: added the missing columns {', '.join(added)}")
 
     def _add_columns(self, board: dict, lists: dict) -> None:
         """Give a new board the manager's columns, in order, keeping a Done it already has."""

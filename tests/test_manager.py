@@ -239,6 +239,27 @@ def test_comments_on_long_done_cards_are_left_alone(fake, folder, tmp_path):
     assert launcher.calls == []
 
 
+def board_columns(fake, board):
+    return [l["name"] for l in sorted((l for l in fake.lists.values() if l["boardId"] == board["id"]),
+                                      key=lambda l: l["position"])]
+
+
+def test_a_board_with_columns_of_its_own_gets_the_missing_ones_around_them(fake, folder, tmp_path):
+    m, launcher = make(fake, folder, tmp_path, pool=1)
+    m.tick()
+    p = next(iter(fake.projects.values()))
+    theirs = fake.add_board(p["id"], "Development", lists=["Upcoming", "Doing", "Done"])
+    fake.add_card(fake.list_named(theirs["id"], "Upcoming")["id"], "an idea")
+    m.tick()
+    assert board_columns(fake, theirs) == ["Upcoming", "Doing", "Suggested", "Approved To Do", "In Progress",
+                                           "Needs Feedback", "Done"]
+    card = fake.add_card(fake.list_named(theirs["id"], "Approved To Do")["id"], "work on it")
+    m.tick()
+    assert fake.column_of(card["id"]) == "In Progress" and launcher.calls
+    m.tick()
+    assert len(board_columns(fake, theirs)) == 7                        # nothing added twice
+
+
 def test_a_board_someone_makes_gets_the_columns_and_the_bot_joins_it(fake, folder, tmp_path):
     m, launcher = make(fake, folder, tmp_path, pool=1)
     m.tick()
@@ -252,7 +273,8 @@ def test_a_board_someone_makes_gets_the_columns_and_the_bot_joins_it(fake, folde
                                        key=lambda l: l["position"])]
     assert names == ["Upcoming", "Suggested", "Approved To Do", "In Progress", "Needs Feedback", "common.done"]
     assert {"boardId": new["id"], "userId": BOT, "role": "editor"} in fake.memberships
-    assert [l["name"] for l in fake.lists.values() if l["boardId"] == theirs["id"]] == ["Ideas", "Doing"]
+    assert board_columns(fake, theirs) == ["Ideas", "Doing", "Suggested", "Approved To Do", "In Progress",
+                                           "Needs Feedback", "Done"]
     card = fake.add_card(fake.list_named(new["id"], "Approved To Do")["id"], "work on the new board")
     m.tick()
     assert fake.column_of(card["id"]) == "In Progress" and launcher.calls
