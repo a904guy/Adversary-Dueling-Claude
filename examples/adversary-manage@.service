@@ -1,0 +1,33 @@
+# Run `adversary manage` for a 4ga project at boot, and bring it back if it dies.
+#
+# One instance per project; the instance name is the project's name:
+#   sudo cp adversary-manage@.service /etc/systemd/system/
+#   sudo systemctl edit adversary-manage@AnySite      # set ADVERSARY_FOLDER, and anything else below
+#   sudo systemctl enable --now adversary-manage@AnySite
+#   journalctl -u adversary-manage@AnySite -f         # the manager's log
+#
+# After a reboot the manager resumes every card run that was cut off (see "Surviving restarts" in the
+# README). Restarting or stopping this unit leaves the runs alone: KillMode=process stops only the
+# manager, not the tmux sessions it started.
+
+[Unit]
+Description=adversary manager for the 4ga project %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/root/.local/bin
+Environment=ADVERSARY_FOLDER=/mnt/projects/%i
+Environment=ADVERSARY_POOL=3
+# Flags passed to every run, after `--`.
+Environment="ADVERSARY_RUN_ARGS=--worker-permission-mode auto"
+ExecStart=/bin/sh -c 'exec adversary manage --project "%i" --folder "$ADVERSARY_FOLDER" --pool "$ADVERSARY_POOL" -- $ADVERSARY_RUN_ARGS'
+Restart=always
+RestartSec=10
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

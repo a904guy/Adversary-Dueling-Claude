@@ -25,7 +25,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from adversary import sessions, snapshot, tmux
+from adversary import board as fourga
+from adversary import cardmode, sessions, snapshot, tmux, workspace
 from adversary.config import RunConfig, draft_path, git_safe_env
 from adversary.transcript import (Transcript, background_running, find_subagent_log, last_assistant_text, recent_activity,
                                    subagent_finished, subagent_logs, token_usage, turn_had_tool_use, write_report)
@@ -44,6 +45,11 @@ QUIET_HOLD_AT = 2    # consecutive no-op worker turns (after an adversary reply)
 HOLD_CHECK_AFTER = 600   # seconds a hold on background work lasts before the supervisor is asked to check
 HOLD_CHECK_MAX = 3600    # each unanswered check-in doubles the wait, up to this
 _UNSET = object()    # sentinel: a cached value not computed yet (None is a valid result)
+CARD_POLL = 15       # seconds between checks of a card run's comments
+PARK_AFTER = 900     # seconds a managed card run waiting on people sits idle before it closes (frees its slot)
+DONE_IDLE = 120      # seconds a Done card's follow-up run sits idle, its question answered, before it closes
+IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}   # what attach_image puts on a card
+IMAGE_MAX = 10 * 1024 * 1024
 HELP_DIR = Path(__file__).resolve().parent / "help"
 # One-time help popups: (key, title, pane it relates to). Each is shown once per project.
 POPUPS = {"intro": ("how this works", ADVERSARY), "worker_tip": ("the worker pane", WORKER)}
@@ -135,6 +141,21 @@ class Bridge:
         self.plan_sent = False                  # the worker has been given its first instructions
         self._resumed_at = 0.0                   # monotonic time of the last permission decision
         self._flush_tasks: set[asyncio.Task] = set()
+        self.request_stop = None   # set by serve(): ends the run (a managed card run closes itself)
+        # A card run talks to its 4ga card (see cardmode). Without working credentials it still runs,
+        # but nothing reaches the card; the log says why.
+        self.card: cardmode.CardLink | None = None
+        self._card_busy = False
+        self._card_next = 0.0
+        self._parked_since: float | None = None
+        self._card_checked = False   # looked up the card's column at start
+        self._card_said = False      # this turn already posted its closing summary (report_done / can't complete)
+        self.card_followup = False   # resumed for a comment on a Done card; ends when work goes to the worker
+        if cfg.card_mode:
+            try:
+                self.card = cardmode.CardLink(cfg)
+            except fourga.BoardError as e:
+                self.log(f"card {cfg.card.get('id')}: can't reach the board, so nothing will be posted to it: {e}")
 
         if resume is None:
             # The worker is NOT given the task directly: the adversary gets it, studies the
@@ -249,6 +270,8 @@ class Bridge:
             run = lambda *a: subprocess.run(["git", *a], cwd=repo, capture_output=True, text=True).stdout.strip()
             return (f"git status --short:\n{run('status', '--short') or '(clean)'}\n\n"
                     f"git diff --stat {self.cfg.base_sha[:12]}:\n{run('diff', '--stat', self.cfg.base_sha) or '(none)'}")
+        if not self.cfg.snapshot_dir:
+            return "(no baseline recorded for this run)"
         return snapshot.format_changes(snapshot.changes(repo, self.cfg.snapshot_dir))
 
     @staticmethod
@@ -352,6 +375,7 @@ class Bridge:
             "worker_msg": "The worker agent ended its turn with this message (pasted below):",
             "perm": "Permission request from the worker (pasted below). Decide it with your tools:",
             "direct": "Message from your supervisor, sent while you were working (pasted below). Follow it as if I wrote it:",
+            "human_comment": "A person commented on the card (pasted below). It comes from the people you work for; act on it:",
         }.get(kind, "Message from the adversary bridge (pasted below):")
 
     async def _tmux_deliver(self, role: str, header: str, body: str) -> None:
@@ -414,6 +438,23 @@ class Bridge:
         return one if len(one) <= n else one[: n - 1] + "…"
 
     # ── hook events ─────────────────────────────────────────────────────
+    @staticmethod
+    def _in_log(path: str | None, body: str) -> bool:
+        """Whether a session log holds `body` (its opening, as written in the JSONL) near its end."""
+        if not path:
+            return False
+        probe = body.strip()[:120]
+        if not probe:
+            return True
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 2_000_000))
+                tail = f.read().decode(errors="replace")
+        except OSError:
+            return False
+        return probe in tail or json.dumps(probe)[1:-1] in tail
+
     def _record_session(self, role: str, payload: dict) -> None:
         """Remember `role`'s Claude Code session id, for `adversary resume`."""
         sid = payload.get("session_id")
@@ -488,6 +529,18 @@ class Bridge:
                 # or something else the person started. Their turn; ours is sent again.
                 self.log(f"{role}: the bridge's message wasn't submitted as a prompt; resending it after this turn")
                 self._requeue_pending(pane, quiet=True)
+            elif pane.expecting_submit and pane.pending and pane.pending[2] == "direct":
+                # A message typed in mid-turn whose submit never showed: some Claude Code versions fold
+                # it into the running turn without a UserPromptSubmit. Waiting on that would hold back
+                # every later message for this pane, so settle it now from the session log: in it,
+                # it was delivered; not in it, it's sent again as the next message.
+                body = pane.pending[1]
+                pane.expecting_submit, pane.pending = False, None
+                if self._in_log(payload.get("transcript_path") or pane.transcript_path, body):
+                    self.log(f"{role}: the mid-turn message went in with the turn (no submit event); delivered")
+                else:
+                    self.log(f"{role}: the mid-turn message never went in; sending it again")
+                    pane.direct.insert(0, body)
             # The session that just ran a turn is the live one; a stub never gets here. This keeps
             # the recorded id pointing at the real session even when a resume forks to a new id.
             self._record_session(role, payload)
@@ -562,6 +615,11 @@ class Bridge:
                                   f"#{req.id} auto-denied (no decision)")
             return
         if reason not in ("worker_msg", "resume", "init") or self.finished or self.held:
+            # Not forwarded to the worker. On a card run, what the supervisor said for people (to a
+            # person, or while the worker is parked or the run is over) goes on the card.
+            said, self._card_said = self._card_said, False
+            if reason in ("user", "human_comment", "worker_msg", "resume", "init") and not self._blank(text) and not said:
+                self._card_post(f"**Supervisor:**\n\n{text}")
             return  # on hold: the worker stays idle and this reply goes nowhere
         if self._blank(text):
             if reason != "init":
@@ -869,7 +927,13 @@ class Bridge:
         self._send_direct()
 
     # ── MCP tool calls from the adversary ───────────────────────────────
-    def on_mcp(self, tool: str, args: dict) -> dict:
+    def on_mcp(self, tool: str, args: dict, role: str = ADVERSARY) -> dict:
+        if tool in ("request_feedback", "report_done", "suggest_task", "attach_image", "tick_checklist",
+                    "add_checklist_item") \
+                or (tool == "finish" and self.card):
+            return self._card_tool(tool, args, role)
+        if role != ADVERSARY:
+            return {"text": f"{tool} is the supervisor's tool.", "error": True}
         if tool in ("approve_tool", "deny_tool"):
             try:
                 req = self.perms.get(int(args.get("request_id")))
@@ -895,6 +959,7 @@ class Bridge:
             text = (args.get("message") or "").strip()
             if not text:
                 return {"text": "message is empty.", "error": True}
+            self._card_working()
             reopened = bool(self.finished)
             if reopened:
                 self.reopen("the adversary sent the worker new work with message_worker")
@@ -950,6 +1015,317 @@ class Bridge:
                             "If the human later gives you new work, call message_worker: that picks the "
                             "run back up and starts the worker again."}
         return {"text": f"Unknown tool {tool}", "error": True}
+
+    # ── the card (a run launched with --card) ───────────────────────────
+    def _card_post(self, text: str) -> None:
+        if not self.card:
+            return
+        try:
+            self.card.post(text)
+        except fourga.BoardError as e:
+            self.log(f"couldn't post to the card: {e}")
+
+    def _card_tool(self, tool: str, args: dict, role: str) -> dict:
+        if not self.card:
+            return {"text": "This run isn't tied to a reachable card" + (" (see the bridge log)" if self.cfg.card else "")
+                            + ", so there's no board to report to.", "error": True}
+        if role != ADVERSARY and tool != "request_feedback":
+            return {"text": f"{tool} is the supervisor's tool.", "error": True}
+        try:
+            if tool == "request_feedback":
+                question = (args.get("question") or "").strip()
+                if not question:
+                    return {"text": "question is empty.", "error": True}
+                who = "Supervisor" if role == ADVERSARY else "Worker"
+                self.card.request_feedback(who, question)
+                self.log(f"{role} asked for feedback on the card: {self._short(question)}")
+                self.transcript.add(f"{who} asked for feedback on the card", question)
+                if role != ADVERSARY:
+                    self.enqueue(ADVERSARY, "The worker asked the people on the card for feedback (the card is now in "
+                                 f"Needs Feedback):\n\n> {question}\n\nTheir answer will come to you as a comment. "
+                                 "Your reply to this note isn't forwarded to the worker.", "feedback_note")
+                return {"text": "Posted on the card, which is now in Needs Feedback. The answer comes back as a comment "
+                                "from a person. Carry on with whatever doesn't depend on it" +
+                                ("; if nothing is left, call hold." if role == ADVERSARY else ".")}
+            if tool == "suggest_task":
+                title = (args.get("title") or "").strip()
+                if not title:
+                    return {"text": "title is empty.", "error": True}
+                tasks = args.get("tasks") or []
+                tasks = [str(t) for t in tasks] if isinstance(tasks, list) else []
+                new = self.card.suggest(title, args.get("description") or "", tasks)
+                self.transcript.add("Suggested a card", f"{title}\n\n{args.get('description') or ''}"
+                                    + "".join(f"\n- [ ] {t}" for t in tasks))
+                return {"text": f"Filed in Suggested as card {new['id']}" + (f" with {len(tasks)} checklist items"
+                                                                              if tasks else "") + "."}
+            if tool == "tick_checklist":
+                item = str(args.get("item") or "").strip()
+                if not item:
+                    return {"text": "item is empty: give its number or its name.", "error": True}
+                done = args.get("done", True) is not False
+                try:
+                    name = self.card.tick(item, done)
+                except LookupError as e:
+                    return {"text": str(e), "error": True}
+                self.transcript.add(f"Checklist item {'ticked' if done else 'unticked'}", name)
+                return {"text": f"{'Ticked' if done else 'Unticked'}: {name}"}
+            if tool == "add_checklist_item":
+                name = " ".join(str(args.get("name") or "").split())
+                if not name:
+                    return {"text": "name is empty.", "error": True}
+                self.card.add_item(name)
+                self.transcript.add("Checklist item added", name)
+                return {"text": f"Added to the checklist: {name}"}
+            if tool == "attach_image":
+                path = Path(str(args.get("path") or "")).expanduser()
+                if not path.is_absolute():
+                    path = Path(self.cfg.repo) / path
+                if path.suffix.lower() not in IMAGE_TYPES:
+                    return {"text": f"attach_image takes an image ({', '.join(sorted(IMAGE_TYPES))}).", "error": True}
+                if not path.is_file():
+                    return {"text": f"No file at {path}.", "error": True}
+                if path.stat().st_size > IMAGE_MAX:
+                    return {"text": f"{path.name} is over {IMAGE_MAX >> 20} MB.", "error": True}
+                self.card.attach_image(path, bool(args.get("cover")))
+                self.transcript.add("Attached an image to the card", str(path))
+                return {"text": f"Attached {path.name}" + (" as the card's cover." if args.get("cover") else ".")}
+            if tool == "finish":
+                if args.get("outcome") == "complete":
+                    return {"text": "On a card run, finish with report_done(summary): it merges the work, posts your "
+                                    "summary and moves the card to Done.", "error": True}
+                summary = args.get("summary", "")
+                self.card.post(f"**Supervisor: this can't be completed as it stands.**\n\n{summary}")
+                self._card_said = True
+                self.card.open.append({"who": "Supervisor", "question": "cannot complete"})
+                self.card.save()
+                self.card.move(fourga.NEEDS_FEEDBACK)
+                path = self.finish("CANNOT_COMPLETE", summary)
+                return {"text": f"Run finished (CANNOT_COMPLETE); the card is in Needs Feedback with your summary. "
+                                f"Report: {path}. A person's reply comes back to you as a comment."}
+            # report_done
+            open_items = self.card.unticked()
+            leave = (args.get("leave_unticked") or "").strip()
+            if open_items and not leave:
+                return {"text": "Not done yet: these checklist items are unticked:\n" + "\n".join(
+                    f"- {n}" for n in open_items) + "\nTick each one you've verified with tick_checklist. If one "
+                    "genuinely shouldn't be done, call report_done again with leave_unticked saying why.",
+                    "error": True}
+            if self.card.open:
+                asks = "\n".join(f"- {o['who']}: {self._short(o['question'], 200)}" for o in self.card.open)
+                return {"text": "Not done yet: these feedback requests have no answer from a person on the card:\n"
+                                f"{asks}\nWait for the reply (call hold if there's nothing else to do).", "error": True}
+            diff = self._diff_text()   # before merging: the merge brings in other cards' work too
+            merged: list[str] = []
+            commits: list[str] = []
+            if self.cfg.workspace:
+                commits = workspace.commits(self.cfg.workspace)
+                try:
+                    merged = workspace.merge(self.cfg.workspace)
+                except workspace.MergeError as e:
+                    if e.needs_person:
+                        # Nothing the worker can fix from its workspace: someone has to act on the real repo.
+                        self.log(f"report_done: merge needs a person: {self._short(str(e))}")
+                        self.card.label(fourga.ATTENTION_LABEL, fourga.ATTENTION_COLOR)
+                        self.card.request_feedback("Supervisor", "The work is finished and verified, but it can't be "
+                                                   f"merged without someone:\n\n{e}\n\nReply here once it's sorted "
+                                                   "and I'll merge it.")
+                        return {"text": f"Not merged — this needs a person, not the worker:\n\n{e}\n\nThe card is in "
+                                        "Needs Feedback with that explained and marked Needs attention. Call hold; "
+                                        "when someone replies, call report_done again.", "error": True}
+                    # The worker knows the code and the branch, so the fix goes straight to it.
+                    self.log(f"report_done: merge refused; sent to the worker to fix: {self._short(str(e))}")
+                    self.transcript.add("Merge refused at report_done; sent to the worker", str(e))
+                    self.release_hold("the merge needs the worker")
+                    self.panes[WORKER].direct.append(
+                        "The supervisor reported this card done, but your work couldn't be merged into main yet:\n\n"
+                        f"{e}\n\nFix this in your workspace (commit everything; for a conflict, merge the target "
+                        "branch into your card branch, resolve the conflicts keeping both sides' intent, run the "
+                        "tests, and commit the merge). Then end your turn with what you changed.")
+                    self._send_direct()
+                    return {"text": f"Not merged, so the card stays open:\n\n{e}\n\nThis was sent to the worker to "
+                                    "fix. When it reports back, check the resolution (read the merged files, run "
+                                    "the tests), then call report_done again.", "error": True}
+            summary = (args.get("summary") or "").strip()
+            if open_items and leave:
+                summary += ("\n\n**Left unticked:** " + ", ".join(open_items) + f" — {leave}")
+            self.card.followup = False
+            self.card.post(self._done_comment(summary, merged, commits, diff))
+            self._card_said = True   # the turn's closing words would only repeat the Done comment
+            self.card.move(fourga.DONE)
+            try:
+                self.card.label(fourga.ATTENTION_LABEL, fourga.ATTENTION_COLOR, on=False)
+            except fourga.BoardError:
+                pass
+            path = self.finish("COMPLETE", summary)
+            if self.cfg.managed and self.request_stop:
+                self.card.set_live(False)
+                asyncio.get_running_loop().call_later(5, self.request_stop)
+            return {"text": f"The card is Done: summary posted{', work merged' if merged else ''}. Report: {path}. "
+                            + ("This run closes in a moment." if self.cfg.managed else "End your turn.")}
+        except fourga.BoardError as e:
+            self.log(f"{tool}: the board refused: {e}")
+            return {"text": f"The board refused that ({e}). Try again shortly; if it keeps failing, say so in "
+                            "your reply.", "error": True}
+
+    def _done_comment(self, summary: str, merged: list[str], commits: list[str], diff: str | None) -> str:
+        tok = self._session_tokens()["total"] + self._prior_tokens
+        facts = [f"ran {self._dur(self._runtime_total())}"]
+        if tok:
+            facts.append(f"{tok:,} tokens written")
+        if self.card and self.card.asked:
+            facts.append(f"{self.card.asked} feedback request{'s' if self.card.asked != 1 else ''}")
+        if diff:
+            facts.append(f"diff {diff}")
+        body = f"**Done.**\n\n{summary}"
+        if merged:
+            body += "\n\n**Merged:**\n" + "\n".join(f"- {m}" for m in merged)
+        if commits:
+            shown = commits[-15:]
+            body += ("\n\n**Commits:**\n" + ("- …\n" if len(commits) > len(shown) else "")
+                     + "\n".join(f"- {c}" for c in shown))
+        return body + "\n\n" + " · ".join(facts)
+
+    async def card_tick(self, now: float | None = None) -> None:
+        """Relay people's new comments to the supervisor, and park a managed run that has sat idle
+        waiting on people. Runs each serve tick; reaches the board at most every CARD_POLL seconds."""
+        if not self.card or self._card_busy:
+            return
+        now = time.monotonic() if now is None else now
+        if now < self._card_next:
+            return
+        self._card_next = now + CARD_POLL
+        self._card_busy = True
+        try:
+            if not self.card.started:
+                await asyncio.to_thread(self.card.start)
+            if not self._card_checked:
+                self._card_checked = True
+                if self.is_resume and (self.card.followup or
+                                       await asyncio.to_thread(self.card.column) == fourga.norm(fourga.DONE)):
+                    # Resumed for a comment on a finished card (or cut off while answering one): a question
+                    # is answered on the card, and the worker stays parked unless the supervisor gives it
+                    # work (see _card_working). The card shows In Progress while an agent is on it.
+                    self.card_followup = True
+                    self.held = "the card is Done; answering a follow-up comment"
+                    self.card.followup = True
+                    self.card.save()
+                    await asyncio.to_thread(self.card.move, fourga.IN_PROGRESS)
+                    self.log("follow-up on a Done card: card in In Progress while answering; the worker waits")
+            was_open = bool(self.card.open)
+            fresh, files = [], []
+            # Each on its own: a failure in one must not lose what the other already marked as seen.
+            try:
+                fresh = await asyncio.to_thread(self.card.new_human_comments)
+            except fourga.BoardError as e:
+                self.log(f"card: couldn't read comments: {e}")
+            try:
+                files = await asyncio.to_thread(self.card.new_attachments)
+            except fourga.BoardError as e:
+                self.log(f"card: couldn't read attachments: {e}")
+            changes: list[str] = []
+            try:
+                changes = await asyncio.to_thread(self.card.checklist_changes)
+            except fourga.BoardError as e:
+                self.log(f"card: couldn't read the checklist: {e}")
+            parts = []
+            for c in fresh:
+                who = (c.get("data") or {}).get("userName") or "someone"
+                text = fourga.comment_text(c)
+                self.log(f"card comment from {who}: {self._short(text)}")
+                self.transcript.add(f"Card comment from {who}", text)
+                parts.append(f"{who}:\n\n{text}")
+            if files:
+                self.log(f"card: {len(files)} file(s) attached: {', '.join(a['name'] for a in files)}")
+                self.transcript.add("Files attached to the card", cardmode.attachments_text(files))
+                parts.append(cardmode.attachments_text(files))
+            if changes:
+                self.log(f"card: checklist changed: {'; '.join(changes)}")
+                self.transcript.add("Card checklist changed", "\n".join(changes))
+                parts.append("The card's checklist was changed (it's part of the requirements):\n"
+                             + "\n".join(f"- {c}" for c in changes))
+            person = bool(fresh or changes)   # comments and checklist edits come from people
+            if person:
+                self._human_spoke()
+                self.human_prompts_count += max(1, len(fresh))
+            if parts:
+                self._parked_since = None
+                said = "\n\n---\n\n".join(parts)
+                queue = self.panes[ADVERSARY].queue
+                queued = next((i for i, (_, r) in enumerate(queue) if r in ("resume", "init")), None)
+                if queued is not None:
+                    # Not delivered yet (the run is just starting): fold it into the first message, so the
+                    # supervisor starts with it rather than reading "no new instructions" and acting on that.
+                    body, r = queue[queued]
+                    if not person:
+                        body += "\n\n" + said   # only files: the card's, part of the task
+                    elif self.card_followup and "already reported Done" not in body:
+                        body += ("\n\nThis card was already reported Done, and a person has commented on it since; "
+                                 "that is why the run was resumed. Your reply this turn is posted on the card as "
+                                 "your answer — it does NOT go to the worker, which stays idle. If they asked a "
+                                 "question, answer it (check the code or your history first). If they want changes "
+                                 "or a revision, give the worker the work with message_worker (the card moves back "
+                                 "to In Progress), verify it as usual, and call report_done again to merge it. "
+                                 f"Their comment (it comes from the people you work for):\n\n{said}")
+                    else:
+                        body += ("\n\nA person has since commented on the card (this is why the run was resumed; "
+                                 f"it comes from the people you work for, so act on it):\n\n{said}")
+                    queue[queued] = (body, r)
+                elif person:
+                    self.enqueue(ADVERSARY, said, "human_comment")
+                else:
+                    self.enqueue(ADVERSARY, said + "\n\n(Files only, no comment. Your reply isn't sent to the "
+                                 "worker; use message_worker if it needs them.)", "human_comment")
+            if fresh and was_open:
+                await asyncio.to_thread(self.card.move, fourga.IN_PROGRESS)
+        except fourga.BoardError as e:
+            self.log(f"card: {e}")
+        except Exception as e:   # never let the board take the relay down
+            self.log(f"card: unexpected error: {e!r}")
+        finally:
+            self._card_busy = False
+        self._check_park(now)
+
+    def _check_park(self, now: float) -> None:
+        """A managed run with nothing to do but wait on people closes, freeing its pool slot; the
+        manager resumes it when someone comments on the card. That's one waiting on feedback (an open
+        request, or it couldn't complete) idle for PARK_AFTER, or a Done card's follow-up whose
+        question has been answered, idle for DONE_IDLE."""
+        if not (self.cfg.managed and self.card and self.request_stop):
+            return
+        idle = all(not p.busy and not p.queue and not p.direct for p in self.panes.values()) and not self.perms
+        wait = PARK_AFTER if self.card.open else DONE_IDLE if self.card_followup else None
+        if not (idle and wait is not None):
+            self._parked_since = None
+            return
+        if self._parked_since is None:
+            self._parked_since = now
+        elif now - self._parked_since >= wait:
+            if self.card_followup and not self.card.open:
+                # Only a question, now answered: the card goes back to Done.
+                try:
+                    self.card.move(fourga.DONE)
+                except fourga.BoardError as e:
+                    self.log(f"couldn't move the card back to Done: {e}")
+                self.card.followup = False
+            self.log("closing: " + ("waiting on people with nothing to do" if self.card.open else
+                                    "the follow-up on the Done card is answered") +
+                     "; the manager resumes the run when someone comments on the card")
+            self.transcript.add("Parked", "Closed while idle; resumed on the card's next comment.")
+            self.card.set_live(False)   # closed on purpose: nothing to pick back up until someone comments
+            self.request_stop()
+
+    def _card_working(self) -> None:
+        """Work is going to the worker on a Done card's follow-up: the card is back In Progress."""
+        if not self.card_followup or not self.card:
+            return
+        self.card_followup = False
+        self.card.followup = False   # real work now: it ends with report_done, like any card
+        self.card.save()
+        try:
+            self.card.move(fourga.IN_PROGRESS)
+            self.log("follow-up became work: the card stays In Progress until report_done")
+        except fourga.BoardError as e:
+            self.log(f"couldn't move the card back to In Progress: {e}")
 
     def _role_log(self, role: str) -> Path | None:
         """A role's session JSONL: its live hook path, else the recorded-id fallback."""
@@ -1473,7 +1849,7 @@ class Bridge:
             if msg.get("type") == "hook":
                 reply = {"output": await self.on_hook(msg["role"], msg["event"], msg.get("payload", {}))}
             elif msg.get("type") == "mcp":
-                reply = self.on_mcp(msg.get("tool", ""), msg.get("args", {}))
+                reply = self.on_mcp(msg.get("tool", ""), msg.get("args", {}), msg.get("role") or ADVERSARY)
             else:
                 reply = {}
             writer.write((json.dumps(reply) + "\n").encode())
@@ -1482,6 +1858,11 @@ class Bridge:
             self.log(f"connection error: {e}")
         finally:
             writer.close()
+
+
+def _cursor_on(screen: str, option: str) -> bool:
+    """Whether a Claude Code menu's cursor (❯) is on the line holding `option`."""
+    return any(option in line and "❯" in line for line in screen.splitlines())
 
 
 async def _startup_watch(bridge: Bridge) -> None:
@@ -1499,11 +1880,21 @@ async def _startup_watch(bridge: Bridge) -> None:
                 if marker in screen and (role, label) not in accepted:
                     accepted.add((role, label))
                     bridge.log(f"{role}: accepting startup dialog ({label})")
-                    tmux.press(pane.target, "Down")
-                    await asyncio.sleep(0.2)
+                    # Claude Code versions order these options differently ("No, exit" first in some,
+                    # "Yes" first with the cursor on it in others): move down only when the cursor (❯)
+                    # isn't already on the yes line, or Enter would pick "No, exit" and end the session.
+                    if not _cursor_on(screen, marker):
+                        tmux.press(pane.target, "Down")
+                        await asyncio.sleep(0.2)
                     tmux.press(pane.target, "Enter")
         if not waiting:
             return
+    # Still not up after two minutes: something on screen the bridge doesn't know how to answer. A
+    # managed run closes, so its pool slot isn't held by a stuck session; the manager retries it.
+    stuck = [role for role, pane in bridge.panes.items() if not pane.started]
+    if stuck and bridge.cfg.managed and bridge.request_stop:
+        bridge.log(f"{' and '.join(stuck)} never came up (a startup dialog?); closing the run so the manager can retry")
+        bridge.request_stop()
 
 
 async def _keyboard(bridge: Bridge, stop: asyncio.Event) -> None:
@@ -1596,6 +1987,11 @@ async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file
     bridge = Bridge(cfg, {WORKER: worker_pane, ADVERSARY: adversary_pane}, resume=resume)
     if os.path.exists(cfg.sock):
         os.remove(cfg.sock)
+    if bridge.card:
+        bridge.card.set_live(True)   # until it closes on purpose; a crash or reboot leaves it set
+        # Before the socket exists, so before the agents start (they wait for it): a resume caused by
+        # a comment gets that comment into its first message, and a Done card's follow-up is known.
+        await bridge.card_tick()
     server = await asyncio.start_unix_server(bridge.handle_conn, path=cfg.sock)
     bridge.log(f"bridge up · run dir {run_dir}")
     bridge.log("keys: p pause/resume relay · s status + stats · q end the run (shows the stats, then closes everything)")
@@ -1611,6 +2007,8 @@ async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file
         except (ValueError, RuntimeError, NotImplementedError):
             pass
     watch = asyncio.create_task(_startup_watch(bridge))
+    bridge.request_stop = stop.set
+    card_task: asyncio.Task | None = None   # the running card_tick, kept referenced
     last_status = ""
     try:
         async with server:
@@ -1623,6 +2021,9 @@ async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file
                 bridge.check_stall()
                 bridge.check_hold()
                 bridge.check_popups()
+                if bridge.card and not bridge._card_busy:
+                    # In the background: a slow board mustn't hold up the relay's own checks.
+                    card_task = asyncio.create_task(bridge.card_tick())
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=1)
                 except TimeoutError:

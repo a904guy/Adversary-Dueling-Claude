@@ -121,6 +121,74 @@ Each run writes to `~/.local/state/adversary/runs/<timestamp>/`:
 - `stats.txt`: the end-of-run stats block, written at close and reprinted in the launching terminal
 - the generated settings, MCP config and launch scripts
 
+## Managing a pool from a 4ga board
+
+`adversary manage` watches a [4ga Boards](https://github.com/RARgames/4gaBoards) project and keeps up to `--pool` runs working its cards. Runs started by hand (`adversary run`, `adversary resume`) are unchanged: everything below applies only to runs the manager launches.
+
+```sh
+adversary manage --project "AnySite" --folder /mnt/projects/AnySite --pool 3 -- --worker-permission-mode auto
+```
+
+Flags after `--` go to every run it starts.
+
+**Credentials.** Create a dedicated bot user in 4ga, give it access to the project, and create an API client while logged in as it (Settings → API). Comments only record a user, so the bot's own comments are told from people's by its user id. Put the credentials in `~/.config/adversary/4ga.env`, readable only by you (`chmod 600`), or pass `--board-env FILE`; `FOURGA_*` environment variables override the file:
+
+```
+FOURGA_URL=https://kabana.example.com
+FOURGA_CLIENT_ID=...
+FOURGA_CLIENT_SECRET=...
+```
+
+**The board.** The manager finds the project by name. If there's none, it creates one, then a board. It re-reads the project's boards on every pass, so boards people add later are picked up within one pass.
+- **The bot joins every board as an editor.** As a project manager it can see every board but can't change one it isn't a member of.
+- **A new board gets the six columns:** **Upcoming**, **Suggested**, **Approved To Do**, **In Progress**, **Needs Feedback** and **Done**. A new board is one with no cards and either no columns, or only the Done column 4ga's "Empty" template starts it with; that Done becomes the manager's Done.
+- **A board that has Approved To Do** gets any of the other columns it's missing.
+- **A board with columns of its own and no Approved To Do** is left alone. Upcoming is for people to think out loud in; the manager never touches it. Creating a project needs the bot to be an admin, or project creation turned on for everyone; otherwise create the project yourself and add the bot as a project manager.
+
+**A card's life.**
+1. **Claimed.** While the pool has room, the top card in Approved To Do moves to In Progress (the manager reads it back to check it stayed). It gets a workspace and a detached run. The run's task is the card's title, description and comments so far.
+2. **Worked.** Anything the supervisor says that isn't sent to the worker (to a person, while the worker is on hold, after the run finished) is posted on the card. People's comments are relayed to the supervisor every 15 seconds, like typing to it.
+   - **Attachments.** Files people attach are downloaded into the run's `attachments/` folder, which both agents may read (images too). Files already on the card go to the supervisor with its first message, or with the resume message on a resumed run.
+   - A file attached later arrives in the same message as the comments found with it, or on its own.
+   - The bot's own attachments aren't relayed, and anything over 50 MB is skipped with a note.
+3. **Needs Feedback.** The supervisor and the worker both have `request_feedback(question)`. It posts the question and moves the card to Needs Feedback. A person's reply closes the request (any comment counts as the answer to every open request; the supervisor is told to ask again if it doesn't) and moves the card back to In Progress. A run with nothing to do but wait closes after 15 minutes, freeing its slot, and the manager resumes it when someone replies.
+4. **Done.** The supervisor's `report_done(summary)` is the only way to finish. It's refused while a feedback request has no answer. It merges the card's branches into main, posts the summary (with the merge results and diff) and moves the card to Done. The run then closes, and the manager removes the workspace. `finish(cannot_complete)` moves the card to Needs Feedback with the supervisor's reasons.
+5. **Suggested.** The supervisor's `suggest_task(title, description, tasks)` files follow-up work in Suggested, for people to approve.
+6. **Follow-ups on Done.** A comment on a Done card, within 30 days of it being finished (`--done-window-days`), resumes its run with its full context: the plan, the answers people gave, what was verified.
+   - The workspace is rebuilt at the same path from current `main`, so both sessions pick up where they were. Follow-ups wait behind new work.
+   - The supervisor's reply goes on the card; the worker isn't woken by a question.
+   - If the comment asks for changes, the supervisor gives the worker the work, the card moves back to In Progress, and `report_done` merges the revision.
+   - An answered follow-up closes after 2 idle minutes. A card whose sessions are gone gets a fresh run with its comments in the task.
+
+**Workspaces: several cards on one project at once.** Each card works in its own workspace (by default under `~/.local/state/adversary/workspaces/<project>/card-<id>`):
+- Every git repo in the project folder becomes a worktree on the branch `adversary/card-<id>`, so the cards' code changes stay apart. This covers the folder itself, or repos inside it a level or two down.
+- Everything else is a symlink to the real file or folder, shared by all cards: scratch folders, `.claude` settings, and inside each repo its ignored files (`.env`, `.venv`, `node_modules`, data). A fresh worktree lacks those, and the app wouldn't run without them. The links are listed in the repo's `info/exclude`, so `git add -A` can't commit them.
+- At `report_done`, main's newer commits are first merged into the card branch, then main fast-forwards. Uncommitted work, a conflict, or a main checkout that can't fast-forward is refused. The problem goes straight to the worker to fix, and the supervisor checks the fix and calls `report_done` again. Main is the branch each repo's own checkout is on.
+- The isolation is code-only. Ignored data (SQLite files, `data/`, `.venv`) is linked, so cards running side by side share one database and one environment.
+- A run whose session doesn't come up within two minutes (stuck on a startup dialog the bridge can't answer) closes itself, so it doesn't hold a pool slot; the manager retries it.
+
+**Restarts and failures.** The manager keeps no state of its own: each run's config records its card, so a restarted manager picks up where it left off. One manager runs per project; a lock enforces it.
+- A run that closes while its card is still In Progress is resumed.
+- A run whose card is moved back to Upcoming or Suggested, or deleted, is stopped.
+- A card that fails to start or resume 3 times in 30 minutes moves to Needs Feedback with the error.
+
+**What the board shows.**
+- **Active** (green label): on each card with a run attached, kept in step on every pass, so it corrects itself within one pass after a crash. It's for display only: resuming goes by `card.json` (below), which doesn't depend on the board being reachable when a run closes.
+- **The card timer:** runs while the card's run is live and pauses when it's parked, done or cut off, so it adds up the time agents spent on the card. Only cards the manager runs are touched; people's own timers are left alone.
+- **Needs attention** (red label): on a card that needs a person to act before it can move on. That's either one the manager gave up on (3 failed starts or resumes in 30 minutes), or finished work that can't be merged without someone, because the main checkout is on another branch or has local changes in the way. The label comes off when the card's run starts again or the card is done.
+- **Suggested by agent** (purple label): on cards the supervisor files with `suggest_task`. Those are the only cards an agent writes a description and checklist on; people's descriptions and checklists are never touched.
+- **Done comment:** the summary, what was merged, the card's commits, and how long it ran, the tokens written, how many feedback requests it made, and the diff.
+- **Cover image:** for visible work (a page, a UI), a supervisor with a browser tool (`--adversary-mcp chrome-devtools`) screenshots the result and attaches it as the card's cover with `attach_image`.
+
+**Surviving restarts.** Each card run records in its `card.json` that it's live, and clears that only when it closes on purpose: parked waiting on people, reported done, or a follow-up answered. On startup, and on every pass after, a card whose run isn't running is picked back up:
+- **In Progress:** resumed, or started fresh if its sessions were never recorded.
+- **Needs Feedback:** resumed if it was cut off while live (it may have been working on what didn't depend on the answer). If it was parked, it waits for a reply.
+- **Done (within the follow-up window):** resumed if it was cut off mid-follow-up, or when someone comments.
+
+Resumes come before new work in the pool. To start the manager at boot and restart it if it dies, use `examples/adversary-manage@.service`, one instance per project. Its `KillMode=process` makes restarting the manager leave the runs' tmux sessions alone.
+
+**Runs side by side.** Run ids carry a random `-####` after the start time, so runs started in the same second don't share a run directory, socket or tmux session. Session recovery (`resume`) never takes a session another run has recorded.
+
 ## Without git
 
 The working folder (the current directory, or `--repo`) can be any folder. If it isn't a git repo with at least one commit, the folder is copied to `snapshot/files/` in the run directory before the worker starts, along with a SHA-256 manifest of every file.
@@ -164,10 +232,14 @@ In a git repo, `changed_files` reports `git status` and `git diff --stat` agains
 
 ```
 adversary/
-  cli.py          adversary run: run directory, snapshot, tmux layout
+  cli.py          adversary run / resume / manage: run directory, snapshot, tmux layout
+  manager.py      adversary manage: the pool, claiming and resuming cards
+  board.py        the 4ga Boards API client
+  cardmode.py     a card run's side of the board: comments, columns, card prompts
+  workspace.py    per-card workspaces (worktrees + links) and the merge into main
   bridge.py       socket server, relay logic, permission routing, caps, status
   hook.py         hook command used by both sessions
-  mcp_server.py   approve_tool / deny_tool / message_worker / hold / read_worker / list_agents / changed_files / finish
+  mcp_server.py   approve_tool / deny_tool / message_worker / hold / read_worker / list_agents / changed_files / finish (+ request_feedback / report_done / suggest_task on card runs)
   help/           text of the one-time popups (intro, worker-pane tip)
   draftmod/       Claude Code mod reporting whether a prompt box holds an unsent draft
   config.py       run config, per-run settings, MCP config and launch scripts

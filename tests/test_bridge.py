@@ -1500,3 +1500,65 @@ async def test_supervisor_reply_reaches_a_busy_worker_mid_turn(repo, tmp_path):
     await stop(b, ADVERSARY, "Also add a test for the empty case.")
     assert (WORKER, "Also add a test for the empty case.") in sent      # delivered while the worker works
     assert not b.panes[WORKER].queue
+
+
+NEW_TRUST = " Quick safety check\n ❯ No, exit\n   Yes, I trust this folder\n"
+OLD_TRUST = " Quick safety check\n ❯ 1. Yes, I trust this folder\n   2. No, exit\n"
+
+
+@pytest.mark.parametrize("screen,keys", [(NEW_TRUST, ["Down", "Enter"]), (OLD_TRUST, ["Enter"])])
+async def test_trust_dialog_is_accepted_whichever_option_comes_first(repo, tmp_path, monkeypatch, screen, keys):
+    """Claude Code 2.1.15x lists "Yes, I trust" first with the cursor on it; newer versions put
+    "No, exit" first. Down+Enter on the older layout picks "No, exit" and the session quits."""
+    b, _ = make(repo, tmp_path)
+    pressed = {}
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(bridge_mod.tmux, "capture", lambda target: screen)
+    monkeypatch.setattr(bridge_mod.tmux, "press", lambda target, key: pressed.setdefault(target, []).append(key))
+    monkeypatch.setattr(bridge_mod.asyncio, "sleep", lambda s: real_sleep(0))
+
+    async def come_up():
+        while not pressed.get("%1") or not pressed.get("%2"):
+            await real_sleep(0)
+        for p in b.panes.values():
+            p.started = True
+
+    await asyncio.gather(bridge_mod._startup_watch(b), come_up())
+    assert pressed == {"%1": keys, "%2": keys}
+
+
+async def test_managed_run_that_never_comes_up_closes(repo, tmp_path, monkeypatch):
+    b, _ = make(repo, tmp_path, managed=True)
+    stops = []
+    b.request_stop = lambda: stops.append(1)
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(bridge_mod.tmux, "capture", lambda target: "something unexpected")
+    monkeypatch.setattr(bridge_mod.asyncio, "sleep", lambda s: real_sleep(0))
+    await bridge_mod._startup_watch(b)
+    assert stops == [1]
+
+
+@pytest.mark.parametrize("absorbed", [True, False])
+async def test_a_mid_turn_message_whose_submit_never_shows_does_not_block_the_worker(repo, tmp_path, absorbed):
+    """Seen live on Claude Code 2.1.153: a message typed in mid-turn was folded into the running turn
+    without a UserPromptSubmit, the bridge kept waiting for one, and every later message to the worker
+    (a merge conflict to fix) was held back for good."""
+    b, sent = make(repo, tmp_path)
+    await start(b)
+    b.panes[WORKER].busy = True
+    b.on_mcp("message_worker", {"message": "Ignore the task-list reminder."})
+    await settle()
+    assert b.panes[WORKER].expecting_submit                    # typed in; no submit seen
+    log = tmp_path / "worker.jsonl"
+    said = "Ignore the task-list reminder." if absorbed else "something else"
+    log.write_text(json.dumps({"type": "user", "message": {"role": "user", "content": said}}) + "\n")
+    await b.on_hook(WORKER, "Stop", {"last_assistant_message": "done", "transcript_path": str(log)})
+    await settle()
+    after = len(sent)
+    if absorbed:
+        assert not b.panes[WORKER].expecting_submit            # settled: nothing is held back any more
+        b.on_mcp("message_worker", {"message": "Fix the merge conflict."})
+        await settle()
+        assert [t for r, t in sent[after:] if r == WORKER] == ["Fix the merge conflict."]
+    else:
+        assert [t for r, t in sent[after - 1:] if r == WORKER][-1] == "Ignore the task-list reminder."   # resent

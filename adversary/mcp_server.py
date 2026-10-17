@@ -136,6 +136,109 @@ TOOLS = [
     },
 ]
 
+# On a card run (ADVERSARY_CARD=1) the supervisor also gets these; the worker's own copy of this
+# server (ADVERSARY_ROLE=worker) offers request_feedback alone.
+CARD_TOOLS = [
+    {
+        "name": "request_feedback",
+        "description": (
+            "Ask the people on the card for a decision or something you can't work out yourself (a product "
+            "choice, credentials, access). Posts your question on the card and moves it to Needs Feedback; "
+            "their reply comes back to you. The card can't be reported done while a request is unanswered. "
+            "Keep working on whatever doesn't depend on the answer."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"question": {"type": "string", "description": "What you need, with the context a "
+                                        "person needs to answer it without reading the code."}},
+            "required": ["question"],
+        },
+    },
+    {
+        "name": "report_done",
+        "description": (
+            "Finish the card: call it only after you have verified every requirement yourself, as for "
+            "finish(complete). Merges the card's branches into their targets, posts your summary on the "
+            "card and moves it to Done. Refused while a feedback request is unanswered, or when the work "
+            "isn't committed or doesn't merge cleanly — the reply says what to fix."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "description": "What was done and verified, for the people reading "
+                            "the card."},
+                "leave_unticked": {"type": "string", "description": "Only if a checklist item genuinely shouldn't "
+                                   "be done: why. Without it, report_done is refused while items are unticked."},
+            },
+            "required": ["summary"],
+        },
+    },
+    {
+        "name": "suggest_task",
+        "description": "File follow-up work you noticed, outside this card's scope, as a new card in the "
+                       "Suggested column for people to approve, labelled as suggested by an agent.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "A short card title."},
+                "description": {"type": "string", "description": "What and why, enough to act on."},
+                "tasks": {"type": "array", "items": {"type": "string"},
+                          "description": "Optional checklist of steps for the card."},
+            },
+            "required": ["title", "description"],
+        },
+    },
+    {
+        "name": "tick_checklist",
+        "description": (
+            "Tick an item on the card's checklist once you have verified it yourself (not on the worker's word), "
+            "so the card shows progress. done=false unticks it. The checklist is the people's: this is the only "
+            "change you may make to it."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item": {"type": "string", "description": "The item's number (1 = first) or its exact name."},
+                "done": {"type": "boolean", "description": "Default true; false unticks."},
+            },
+            "required": ["item"],
+        },
+    },
+    {
+        "name": "add_checklist_item",
+        "description": (
+            "Add an item to the end of the card's checklist. On a card without one, lay out your plan's main "
+            "steps as you hand off; on any card, add a step you discover. You can't rename or remove items."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "The step, short (one line)."}},
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "attach_image",
+        "description": (
+            "Attach an image to the card, e.g. a screenshot of the finished result. With cover=true it becomes "
+            "the card's cover, so the board shows what was built. PNG, JPEG, GIF or WebP, up to 10 MB."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "The image file (absolute, or relative to the repo)."},
+                "cover": {"type": "boolean", "description": "Make it the card's cover image. Default false."},
+            },
+            "required": ["path"],
+        },
+    },
+]
+
+
+def tools() -> list[dict]:
+    if os.environ.get("ADVERSARY_ROLE") == "worker":
+        return [t for t in CARD_TOOLS if t["name"] == "request_feedback"]
+    return TOOLS + (CARD_TOOLS if os.environ.get("ADVERSARY_CARD") else [])
+
 
 def handle(msg: dict) -> dict | None:
     method = msg.get("method")
@@ -146,13 +249,14 @@ def handle(msg: dict) -> dict | None:
             "serverInfo": {"name": "adversary", "version": "0.1.0"},
         }
     if method == "tools/list":
-        return {"tools": TOOLS}
+        return {"tools": tools()}
     if method == "tools/call":
         params = msg.get("params", {})
         try:
             reply = request(
                 os.environ["ADVERSARY_SOCK"],
-                {"type": "mcp", "tool": params.get("name"), "args": params.get("arguments", {})},
+                {"type": "mcp", "tool": params.get("name"), "args": params.get("arguments", {}),
+                 "role": os.environ.get("ADVERSARY_ROLE") or "adversary"},
             )
             text, is_error = reply.get("text", ""), bool(reply.get("error"))
         except (OSError, KeyError) as e:

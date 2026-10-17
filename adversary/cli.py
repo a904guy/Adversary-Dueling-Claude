@@ -1,7 +1,9 @@
 """`adversary run "<task>"` and `adversary resume`: launch worker, adversary and bridge in tmux."""
 
 import argparse
+import json
 import os
+import random
 import shlex
 import shutil
 import socket
@@ -51,7 +53,7 @@ def backfill_subdir_bases(cfg: RunConfig) -> None:
     """Give inner repos with no recorded start (a run from before they were recorded, or a repo
     found since) the last commit before the run began, read from the run folder's name."""
     try:
-        started = datetime.strptime(Path(cfg.run_dir).name, "%Y%m%d-%H%M%S")
+        started = sessions.run_started(cfg.run_dir)
     except ValueError:
         return
     os.environ.update(git_safe_env(cfg.safe_dirs()[1:]))
@@ -66,6 +68,59 @@ def backfill_subdir_bases(cfg: RunConfig) -> None:
             cfg.git_subdir_bases[d] = sha
 
 
+def new_run_id() -> str:
+    """The start time plus a random -####: a pool can start several runs in the same second, and
+    the id names the run dir, its socket and its tmux session."""
+    while True:
+        ts = f"{datetime.now():%Y%m%d-%H%M%S}-{random.randrange(10000):04d}"
+        if not (STATE_DIR / ts).exists():
+            return ts
+
+
+def card_for_run(card_id: str, board_env: str | None) -> tuple[dict, str]:
+    """The card a run works ({"id", "url"}) and a task made from it, checking the board is reachable."""
+    from adversary import board as fourga
+    from adversary import cardmode
+    try:
+        client = fourga.Board.from_env(board_env)
+        card = client.card(card_id)
+        comments = client.comments(card_id)
+        url = fourga.card_url(client.url, card_id)
+        return {"id": str(card["id"]), "url": url}, cardmode.task_text(card, comments, str(client.me()["id"]), url,
+                                                                       client.checklist(card_id))
+    except fourga.BoardError as e:
+        die(f"--card {card_id}: {e}")
+        raise   # (die exits)
+
+
+def manage(a: argparse.Namespace) -> None:
+    from adversary import board as fourga
+    from adversary.manager import Manager
+    for exe in ("tmux", "claude", "git"):
+        if not shutil.which(exe):
+            die(f"`{exe}` not found on PATH")
+    folder = Path(a.folder).expanduser().resolve()
+    if not folder.is_dir():
+        die(f"{folder} is not a directory")
+    if a.pool < 1:
+        die("--pool must be at least 1")
+    run_args = a.run_args[1:] if a.run_args[:1] == ["--"] else a.run_args
+    try:
+        env = fourga.load_env(a.board_env)
+        client = fourga.Board(env["FOURGA_URL"], env["FOURGA_CLIENT_ID"], env["FOURGA_CLIENT_SECRET"])
+        client.me()
+    except fourga.BoardError as e:
+        die(str(e))
+    members = list(dict.fromkeys((a.member or []) + [m for m in env.get("FOURGA_MEMBERS", "").split(",") if m.strip()]))
+    if not members:
+        die("name at least one person to keep on the project: --member you@example.com (or FOURGA_MEMBERS)")
+    os.environ.update(git_safe_env([str(folder)] + [str(folder / d) for d in find_git_subdirs(folder)]))
+    Manager(a.project, str(folder), a.pool, client, STATE_DIR, run_args=run_args, board_env=a.board_env,
+            workspaces=Path(a.workspaces).expanduser() if a.workspaces else None, members=members,
+            done_window_days=a.done_window_days
+            ).serve(a.interval, a.once)
+
+
 def die(msg: str) -> None:
     print(f"adversary: {msg}", file=sys.stderr)
     sys.exit(1)
@@ -76,6 +131,12 @@ def run(a: argparse.Namespace) -> None:
         if not shutil.which(exe):
             die(f"`{exe}` not found on PATH")
     task = Path(a.task_file).read_text() if a.task_file else a.task
+    card = None
+    if a.card and not a.managed:
+        die("--card is for runs `adversary manage` launches")
+    if a.card:
+        card, card_task = card_for_run(a.card, a.board_env)
+        task = task or card_task
     if not task or not task.strip():
         die("no task given")
 
@@ -92,7 +153,7 @@ def run(a: argparse.Namespace) -> None:
     if base_sha and git(repo, "status", "--porcelain"):
         print("adversary: warning: working tree has uncommitted changes; the review diff includes them.")
 
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    ts = new_run_id()
     if a.worktree:
         if not base_sha:
             die("--worktree needs a git repository with at least one commit")
@@ -123,6 +184,8 @@ def run(a: argparse.Namespace) -> None:
         verify_cmds=a.verify_cmd or [], session=f"adversary-{ts}", strict_approvals=a.strict_approvals,
         stall_after=a.stall_after, origin=str(Path(a.repo).expanduser().resolve()),
         git_subdirs=find_git_subdirs(repo), adversary_mcps=a.adversary_mcp or [],
+        card=card, board_env=a.board_env, managed=a.managed,
+        workspace=json.loads(Path(a.workspace_info).read_text()) if a.workspace_info else None,
     )
     if cfg.adversary_mcps:
         print(f"adversary: MCP servers for the supervisor: {mcp_summary(cfg)}")
@@ -165,7 +228,11 @@ def launch(cfg: RunConfig, no_attach: bool, resume_file: Path | None = None) -> 
     base_cmd = (f"cd {shlex.quote(pkg_root)} && {shlex.quote(sys.executable)} -m adversary.bridge "
                 f"--run-dir {shlex.quote(str(run_dir))} --worker-pane {worker} --adversary-pane {adversary}"
                 + (f" --resume-file {shlex.quote(str(resume_file))}" if resume_file else ""))
-    if attach_mode:
+    if cfg.managed:
+        # Launched by the manager: nobody reads the pane, and the tmux session ending is how the
+        # manager knows the run closed, so don't hold it open.
+        tail = ""
+    elif attach_mode:
         # The launcher reprints the stats in this terminal after tmux exits, so a clean close lets
         # the pane (and window, and session) close straight away; only hold it open to show a crash.
         tail = '; s=$?; [ "$s" -eq 0 ] || { echo; echo "bridge exited with status $s — press Enter to close"; read _; }'
@@ -421,20 +488,47 @@ def main() -> None:
     r.add_argument("--task-file", help="read the task from a file")
     r.add_argument("--repo", default=".", help="folder to work in (default: current directory)")
     r.add_argument("--worktree", action="store_true", help="run in a fresh git worktree on branch adversary/<ts>")
+    # Set by `adversary manage` when it launches a card's run; a run started by hand has no card.
+    r.add_argument("--card", help=argparse.SUPPRESS)
+    r.add_argument("--board-env", help=argparse.SUPPRESS)
+    r.add_argument("--workspace-info", help=argparse.SUPPRESS)   # set by the manager: the card's workspace
+    r.add_argument("--managed", action="store_true", help=argparse.SUPPRESS)   # launched by the manager
     add_settings(r, resume=False)
     s = sub.add_parser("resume", help="resume the last run in this folder (or a given run)",
                        description="Resume a run. Every setting flag is optional: anything not given keeps "
                                    "what the run used, and a given one is saved for later resumes too.")
     s.add_argument("message", nargs="?", help="optional new instructions, passed to the adversary")
     s.add_argument("--repo", default=".", help="folder whose last run to resume (default: current directory)")
-    s.add_argument("--run", help="a specific run: its directory or timestamp (e.g. 20261001-143802)")
+    s.add_argument("--run", help="a specific run: its directory or id (e.g. 20261001-143802-0421)")
     s.add_argument("--kill", action="store_true", help="close the run's tmux session if it is still open")
     add_settings(s, resume=True)
+    m = sub.add_parser("manage", help="keep a pool of runs working a 4ga project's cards",
+                       description="Watch a 4ga project and run adversary on its cards: each card in Approved To "
+                                   "Do gets its own run (up to --pool at once) in its own workspace, and moves "
+                                   "through In Progress, Needs Feedback and Done as the run goes. Flags after "
+                                   "`--` are passed to every run (e.g. -- --worker-permission-mode auto).")
+    m.add_argument("--project", required=True, help="the 4ga project's name (created, with a board, if missing)")
+    m.add_argument("--folder", default=".", help="the project's code folder (default: current directory)")
+    m.add_argument("--pool", type=int, default=2, help="runs at once (default 2)")
+    m.add_argument("--member", action="append", metavar="EMAIL",
+                   help="a person kept on the project as a manager and on its boards (repeatable; also "
+                        "FOURGA_MEMBERS in the credentials file). At least one is required: a project only the "
+                        "bot can see is no use to anyone.")
+    m.add_argument("--board-env", metavar="FILE", help="4ga credentials (default ~/.config/adversary/4ga.env)")
+    m.add_argument("--interval", type=float, default=15, help="seconds between board checks (default 15)")
+    m.add_argument("--workspaces", help="where card workspaces go (default ~/.local/state/adversary/workspaces/<project>)")
+    m.add_argument("--done-window-days", type=float, default=30, metavar="DAYS",
+                   help="a comment on a Done card resumes its run (to answer, or to revise the work) for this many "
+                        "days after it was finished (default 30)")
+    m.add_argument("--once", action="store_true", help="one pass, then exit")
+    m.add_argument("run_args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.cmd == "run":
         run(a)
     elif a.cmd == "resume":
         resume(a)
+    elif a.cmd == "manage":
+        manage(a)
 
 
 if __name__ == "__main__":

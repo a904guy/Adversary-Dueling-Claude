@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from pathlib import Path
 
@@ -117,3 +118,22 @@ def test_resume_note_with_instructions_and_worker_message():
     assert "<worker_message>\nTests pass.\n</worker_message>" in note
     assert "> Add a --json flag." in note and "human's new instructions" in note
     assert "no new instructions" not in note and "open again" in note
+
+
+def test_find_sessions_never_takes_another_runs_session(tmp_path, monkeypatch):
+    """Two runs started together in one folder (a manager's pool): the plan-header worker of the
+    other run matches on time and header alone, but it's recorded by that run, so it's not ours."""
+    monkeypatch.setattr(sessions, "CLAUDE_PROJECTS", tmp_path / "projects")
+    repo = tmp_path / "my.repo"
+    repo.mkdir()
+    mine = make_run(tmp_path / "runs", "20261001-143802-0001", repo, task="Card 1: build A.")
+    other = make_run(tmp_path / "runs", "20261001-143802-0002", repo, task="Card 2: build B.")
+    folder = tmp_path / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(repo))
+    start = sessions.run_started(mine.run_dir).astimezone().isoformat()
+    write_session(folder, "their-worker", start, "Your supervisor's plan for this task (pasted below). Do B.")
+    write_session(folder, "my-worker", start, "Your supervisor's plan for this task (pasted below). Do A.")
+    write_session(folder, "my-adv", start, "Your supervision brief (pasted below). <task>\nCard 1: build A.\n</task>")
+    other.sessions = {"worker": "their-worker", "adversary": "their-adv"}
+    other.save()
+    os.utime(folder / "their-worker.jsonl", (2e9, 2e9))   # newest: the scan would prefer it
+    assert sessions.find_sessions(mine) == {"worker": "my-worker", "adversary": "my-adv"}

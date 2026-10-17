@@ -29,8 +29,9 @@ def session_log(cfg: RunConfig, role: str) -> Path | None:
 
 
 def run_started(run_dir: str) -> datetime:
-    """Run dirs are named after their local start time, e.g. 20261001-143802."""
-    return datetime.strptime(Path(run_dir).name, "%Y%m%d-%H%M%S").astimezone()
+    """Run dirs are named after their local start time, e.g. 20261001-143802, with a random
+    -#### after it on newer runs so two started in the same second don't collide."""
+    return datetime.strptime(Path(run_dir).name[:15], "%Y%m%d-%H%M%S").astimezone()
 
 
 def _first_prompt(path: Path) -> tuple[datetime, str] | None:
@@ -61,8 +62,8 @@ def find_sessions(cfg: RunConfig) -> dict[str, str]:
     (metadata lines only), and the bridge may have recorded that stub, so resuming it would
     open an empty session and the pane would die. A stub or missing id is dropped and found
     again from Claude Code's session logs for the folder — each agent's first prompt starts
-    with a known header and contains the task, within a few minutes of the run starting. For
-    older runs that recorded nothing, this is the only source.
+    with a known header and contains the task, within a few minutes of the run starting, and
+    no other run has recorded it. For older runs that recorded nothing, this is the only source.
     """
     folder = CLAUDE_PROJECTS / re.sub(r"[^A-Za-z0-9]", "-", cfg.repo)
     found = {role: sid for role, sid in cfg.sessions.items()
@@ -71,11 +72,17 @@ def find_sessions(cfg: RunConfig) -> dict[str, str]:
         return found
     start = run_started(cfg.run_dir)
     window = (start - timedelta(seconds=30), start + timedelta(minutes=10))
+    # Several runs can share a folder and start together (a manager's pool), so a session another
+    # run has already recorded is never this one's, however well its time and header match.
+    taken = {sid for other in runs(Path(cfg.run_dir).parent) if other.run_dir != cfg.run_dir
+             for sid in other.sessions.values() if sid}
     task_hint = cfg.task.strip()[:200]
     best: dict[str, tuple[float, str]] = {}   # role -> (mtime, stem); the most recently written wins
     for path in folder.glob("*.jsonl"):
         mtime = path.stat().st_mtime
         if datetime.fromtimestamp(mtime, timezone.utc) < window[0]:
+            continue
+        if path.stem in taken:
             continue
         first = _first_prompt(path)
         if not first or not (window[0] <= first[0] <= window[1]):

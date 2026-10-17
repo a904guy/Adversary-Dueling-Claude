@@ -7,7 +7,7 @@ import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from adversary import mcps
+from adversary import cardmode, mcps
 
 PROMPTS = Path(__file__).parent / "prompts"
 
@@ -26,6 +26,11 @@ VERIFY_BASH = [
     "make test", "make check", "make lint",
     "ls", "wc", "diff",
 ]
+
+
+# The supervisor's extra tools on a card run (the worker gets request_feedback alone).
+CARD_TOOLS = ["request_feedback", "report_done", "suggest_task", "attach_image", "tick_checklist",
+              "add_checklist_item"]
 
 
 @dataclass
@@ -52,6 +57,16 @@ class RunConfig:
     git_subdirs: list[str] = field(default_factory=list)   # git repos inside the working folder
     git_subdir_bases: dict = field(default_factory=dict)   # subdir -> its HEAD when the run started
     adversary_mcps: list[str] = field(default_factory=list)   # --adversary-mcp specs; empty = none
+    card: dict | None = None        # the 4ga card this run works ({"id", "url"}); see cardmode
+    board_env: str | None = None    # 4ga credentials file for a card run (default ~/.config/adversary/4ga.env)
+    workspace: dict | None = None   # a card workspace's repos/branches (see workspace.create)
+    managed: bool = False           # launched by `adversary manage`: close by itself when the card is done
+
+    @property
+    def card_mode(self) -> bool:
+        """A run the manager launched for a card: only then do the card tools, prompts and comment
+        relay exist. Every other run works exactly as without a board."""
+        return bool(self.card and self.managed)
 
     def adversary_bash(self) -> list[str]:
         cmds = list(VERIFY_BASH)
@@ -70,7 +85,9 @@ class RunConfig:
         """The repos git must trust despite their owner: the working folder and each git repo
         inside it. On a server where the agents run as root over files another user owns, git
         refuses them as "dubious ownership" (no log, no status) until they're safe.directory."""
-        return [self.repo] + [str(Path(self.repo) / d) for d in self.git_subdirs]
+        dirs = [self.repo] + [str(Path(self.repo) / d) for d in self.git_subdirs]
+        # A card workspace's worktrees belong to the real repos, which report_done merges into.
+        return dirs + [r["source"] for r in (self.workspace or {}).get("repos", []) if r.get("source")]
 
     def save(self) -> Path:
         path = Path(self.run_dir) / "config.json"
@@ -150,7 +167,16 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
     base_events = ["SessionStart", "UserPromptSubmit", "Stop"]
 
     worker_events = base_events + ([] if cfg.skip_permissions else ["PermissionRequest"])
-    (run / "worker-settings.json").write_text(json.dumps(_hooks(cfg, "worker", worker_events), indent=2))
+    worker_settings = _hooks(cfg, "worker", worker_events)
+    if cfg.card_mode:
+        # The worker's request_feedback reaches the bridge through its own copy of the bridge's MCP
+        # server, which offers it nothing else; the call itself needs no approval.
+        worker_settings["permissions"] = {"allow": ["mcp__adversary__request_feedback"]}
+        (run / "worker-mcp.json").write_text(json.dumps({"mcpServers": {"adversary": {
+            "command": sys.executable, "args": ["-m", "adversary.mcp_server"],
+            "env": {"ADVERSARY_SOCK": cfg.sock, "ADVERSARY_ROLE": "worker", "PYTHONPATH": pkg_root}}}}, indent=2))
+        (run / "worker-role.md").write_text(cardmode.worker_note(cfg.workspace))
+    (run / "worker-settings.json").write_text(json.dumps(worker_settings, indent=2))
     # Its launch skips the settings where your .mcp.json answers are saved; pass them on so it
     # doesn't stop at the "New MCP servers found" dialog every launch.
     (run / "adversary-settings.json").write_text(json.dumps(
@@ -164,7 +190,8 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
             "adversary": {
                 "command": sys.executable,
                 "args": ["-m", "adversary.mcp_server"],
-                "env": {"ADVERSARY_SOCK": cfg.sock, "PYTHONPATH": pkg_root},
+                "env": {"ADVERSARY_SOCK": cfg.sock, "PYTHONPATH": pkg_root,
+                        **({"ADVERSARY_CARD": "1"} if cfg.card_mode else {})},
             },
         }
     }, indent=2))
@@ -178,6 +205,8 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
             "errors — not to do the work or change anything outside the repo. A browser server that drives a "
             "shared, logged-in browser profile may already be in use by the worker (or fail as busy); prefer "
             "an isolated/headless one when there is a choice.\n")
+    if cfg.card_mode:
+        role += cardmode.role_note(cfg.workspace)
     (run / "adversary-role.md").write_text(role)
 
     worker = ["claude", "--settings", str(run / "worker-settings.json"), "--disallowedTools", "AskUserQuestion"]
@@ -192,6 +221,12 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
         worker += ["--model", cfg.worker_model]
     if cfg.worker_effort:
         worker += ["--effort", cfg.worker_effort]
+    if cfg.card_mode:
+        # Files people attach to the card are downloaded here; both sides may read them.
+        (run / "attachments").mkdir(exist_ok=True)
+        worker += ["--mcp-config", str(run / "worker-mcp.json"),
+                   "--append-system-prompt-file", str(run / "worker-role.md"),
+                   "--add-dir", str(run / "attachments")]
 
     # Read-only inspection plus web research (WebFetch/WebSearch) so the supervisor can study
     # references the task points at — a GitHub repo, docs, an API — and plan from them itself,
@@ -200,6 +235,8 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
                "mcp__adversary__approve_tool", "mcp__adversary__deny_tool",
                "mcp__adversary__finish", "mcp__adversary__changed_files", "mcp__adversary__message_worker",
                "mcp__adversary__hold", "mcp__adversary__read_worker", "mcp__adversary__list_agents"]
+    if cfg.card_mode:
+        allowed += [f"mcp__adversary__{t}" for t in CARD_TOOLS]
     allowed += mcp.allow
     allowed += [f"Bash({c}:*)" for c in cfg.adversary_bash()]
     adversary = [
@@ -216,6 +253,8 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
     ]
     if mcp.chrome:
         adversary.append("--chrome")
+    if cfg.card_mode:
+        adversary += ["--add-dir", str(run / "attachments")]
     if cfg.snapshot_dir:
         adversary += ["--add-dir", cfg.snapshot_dir]
     if cfg.adversary_model:
