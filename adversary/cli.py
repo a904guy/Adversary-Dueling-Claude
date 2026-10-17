@@ -47,6 +47,25 @@ def find_git_subdirs(root: Path, max_depth: int = 2) -> list[str]:
     return found
 
 
+def backfill_subdir_bases(cfg: RunConfig) -> None:
+    """Give inner repos with no recorded start (a run from before they were recorded, or a repo
+    found since) the last commit before the run began, read from the run folder's name."""
+    try:
+        started = datetime.strptime(Path(cfg.run_dir).name, "%Y%m%d-%H%M%S")
+    except ValueError:
+        return
+    os.environ.update(git_safe_env(cfg.safe_dirs()[1:]))
+    for d in cfg.git_subdirs:
+        if d in cfg.git_subdir_bases:
+            continue
+        try:
+            sha = git(Path(cfg.repo) / d, "rev-list", "-1", f"--before={started.isoformat()}", "HEAD")
+        except subprocess.CalledProcessError:
+            continue
+        if sha:   # empty: the repo's history began during the run, so the snapshot covers it
+            cfg.git_subdir_bases[d] = sha
+
+
 def die(msg: str) -> None:
     print(f"adversary: {msg}", file=sys.stderr)
     sys.exit(1)
@@ -107,6 +126,14 @@ def run(a: argparse.Namespace) -> None:
     )
     if cfg.adversary_mcps:
         print(f"adversary: MCP servers for the supervisor: {mcp_summary(cfg)}")
+    # Where each inner repo starts, so the closing diff counts its changes with git (respecting
+    # its .gitignore) rather than from the folder snapshot.
+    os.environ.update(git_safe_env(cfg.safe_dirs()[1:]))
+    for d in cfg.git_subdirs:
+        try:
+            cfg.git_subdir_bases[d] = git(repo / d, "rev-parse", "HEAD")
+        except subprocess.CalledProcessError:
+            pass   # no commits yet: the snapshot covers it
     if cfg.git_subdirs:
         print(f"adversary: git repos inside the folder (the supervisor can inspect these with "
               f"`git -C <subdir> log/status/diff`): {', '.join(cfg.git_subdirs)}")
@@ -235,6 +262,7 @@ def resume(a: argparse.Namespace) -> None:
     # recorded, and repos may have been added since. write_launch_files then regenerates the
     # adversary's allowlist with the `git -C <subdir>` rules.
     cfg.git_subdirs = find_git_subdirs(Path(cfg.repo))
+    backfill_subdir_bases(cfg)
     # Settings given on the command line replace the saved ones; the rest keep what the run used.
     changed = apply_settings(cfg, a)
     if changed:

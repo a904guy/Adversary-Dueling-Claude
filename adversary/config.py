@@ -50,6 +50,7 @@ class RunConfig:
     origin: str | None = None   # folder the run was started from (differs from repo with --worktree)
     sessions: dict = field(default_factory=dict)   # role -> Claude Code session ID, for resuming
     git_subdirs: list[str] = field(default_factory=list)   # git repos inside the working folder
+    git_subdir_bases: dict = field(default_factory=dict)   # subdir -> its HEAD when the run started
     adversary_mcps: list[str] = field(default_factory=list)   # --adversary-mcp specs; empty = none
 
     def adversary_bash(self) -> list[str]:

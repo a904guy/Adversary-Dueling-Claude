@@ -4,6 +4,7 @@ The copy lets the adversary `diff -ru <snapshot> .` and doubles as a backup; the
 answers "what changed?" even when copying was skipped for size.
 """
 
+import difflib
 import hashlib
 import json
 import os
@@ -73,6 +74,42 @@ def changes(root: str, dest: str) -> dict:
         "modified": sorted(p for p in now.keys() & before.keys() if now[p] != before[p]),
         "deleted": sorted(set(before) - set(now)),
     }
+
+
+def text_lines(path: Path) -> list[bytes] | None:
+    """A text file's lines, or None for a binary, oversized or unreadable one."""
+    try:
+        if path.stat().st_size > MAX_FILE:
+            return None
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if b"\0" in data[:8192]:
+        return None
+    return data.splitlines()
+
+
+def line_stats(root: str, dest: str, paths: dict) -> tuple[int, int]:
+    """(lines added, lines removed) across `paths` (a changes() result, or part of one): new
+    files count in full, deleted ones by their copy, modified ones by a diff against it. Binary
+    files, and files whose copy was skipped for size, add nothing."""
+    root_p, files = Path(root), Path(dest) / "files"
+    ins = dels = 0
+    for p in paths.get("added", []):
+        ins += len(text_lines(root_p / p) or [])
+    for p in paths.get("deleted", []):
+        dels += len(text_lines(files / p) or [])
+    for p in paths.get("modified", []):
+        old, new = text_lines(files / p), text_lines(root_p / p)
+        if old is None or new is None:
+            continue
+        diff = difflib.diff_bytes(difflib.unified_diff, old, new, n=0, lineterm=b"")
+        for line in list(diff)[2:]:   # past the ---/+++ header
+            if line.startswith(b"+"):
+                ins += 1
+            elif line.startswith(b"-"):
+                dels += 1
+    return ins, dels
 
 
 def format_changes(c: dict) -> str:

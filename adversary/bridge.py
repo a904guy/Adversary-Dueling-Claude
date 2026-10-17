@@ -20,7 +20,7 @@ import termios
 import time
 import tty
 import unicodedata
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -1126,41 +1126,76 @@ class Bridge:
             self._tok_cache = out
         return self._tok_cache
 
-    def _diff_shortstat(self) -> tuple[int, int, int] | None:
-        """(files changed, insertions, deletions) since the run started, or None if unknown.
-        Memoised for one shutdown render."""
+    def _diff_shortstat(self) -> list[tuple[str, int, int, int, str]] | None:
+        """What changed since the run started, as (area, files, insertions, deletions, note) per
+        area, or None if unknown. Memoised for one shutdown render."""
         if self._diff_cache is not _UNSET:
             return self._diff_cache
-        self._diff_cache = self._compute_diff_shortstat()
+        try:
+            self._diff_cache = self._compute_diff_shortstat()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            self._diff_cache = None
         return self._diff_cache
 
-    def _compute_diff_shortstat(self) -> tuple[int, int, int] | None:
-        try:
-            if self.cfg.base_sha:
-                git = lambda *a: subprocess.run(["git", *a], cwd=self.cfg.repo,
-                                                capture_output=True, text=True).stdout
-                out = git("diff", "--shortstat", self.cfg.base_sha)
-                f = re.search(r"(\d+) files? changed", out)
-                a = re.search(r"(\d+) insertion", out)
-                d = re.search(r"(\d+) deletion", out)
-                # git diff ignores untracked files, so count them from status (new files a worker
-                # created but didn't commit are most of the point of the number).
-                untracked = sum(1 for line in git("status", "--porcelain").splitlines()
-                                if line.startswith("??"))
-                return (untracked + (int(f.group(1)) if f else 0),
-                        int(a.group(1)) if a else 0, int(d.group(1)) if d else 0)
-            if self.cfg.snapshot_dir:
-                c = snapshot.changes(self.cfg.repo, self.cfg.snapshot_dir)
-                return (sum(len(v) for v in c.values()), 0, 0)
-        except (OSError, ValueError, subprocess.SubprocessError):
+    @staticmethod
+    def _git_stats(cwd: str, base: str) -> tuple[int, int, int]:
+        """(files, insertions, deletions) in a git repo since `base`, committed or not. git diff
+        leaves out untracked files, which are most of what a worker adds, so they're counted from
+        `ls-files --others` (ignored files stay out) with their lines as insertions."""
+        git = lambda *a: subprocess.run(["git", *a], cwd=cwd, capture_output=True, text=True).stdout
+        out = git("diff", "--shortstat", base)
+        f, a, d = (re.search(rf"(\d+) {w}", out) for w in ("files? changed", "insertion", "deletion"))
+        untracked = git("ls-files", "--others", "--exclude-standard").splitlines()
+        added = sum(len(snapshot.text_lines(Path(cwd) / p) or []) for p in untracked)
+        return ((int(f.group(1)) if f else 0) + len(untracked),
+                (int(a.group(1)) if a else 0) + added, int(d.group(1)) if d else 0)
+
+    def _compute_diff_shortstat(self) -> list[tuple[str, int, int, int, str]] | None:
+        cfg = self.cfg
+        if cfg.base_sha:
+            return [("", *self._git_stats(cfg.repo, cfg.base_sha), "")]
+        if not cfg.snapshot_dir:
             return None
-        return None
+        # A folder without git: each inner repo whose start was recorded is counted with git, and
+        # everything else (other inner repos, loose files) from the snapshot.
+        changes = snapshot.changes(cfg.repo, cfg.snapshot_dir)
+        areas = []
+        rest = dict(changes)
+        for sub in cfg.git_subdirs:
+            mine = {k: [p for p in v if p.startswith(sub + "/")] for k, v in rest.items()}
+            base = cfg.git_subdir_bases.get(sub)
+            if base:
+                areas.append((sub, *self._git_stats(str(Path(cfg.repo) / sub), base), ""))
+            elif any(mine.values()):
+                areas.append((sub, sum(map(len, mine.values())),
+                              *snapshot.line_stats(cfg.repo, cfg.snapshot_dir, mine), "incl. ignored files"))
+            rest = {k: [p for p in v if not p.startswith(sub + "/")] for k, v in rest.items()}
+        n = sum(map(len, rest.values()))
+        if n or not areas:
+            tops = Counter(p.split("/")[0] + ("/" if "/" in p else "") for v in rest.values() for p in v)
+            note = ", ".join(f"{t} {c:,}" for t, c in tops.most_common(3)) if areas and n else ""
+            areas.append(("rest of folder" if areas else "", n,
+                          *snapshot.line_stats(cfg.repo, cfg.snapshot_dir, rest), note))
+        return areas
+
+    @staticmethod
+    def _diff_fmt(files: int, ins: int, dels: int) -> str:
+        return f"{files:,} file{'' if files == 1 else 's'}, +{ins:,} −{dels:,}"
 
     def _diff_text(self) -> str | None:
-        d = self._diff_shortstat()
-        if d is None:
+        areas = self._diff_shortstat()
+        if not areas:
             return None
-        return f"{d[0]} file{'' if d[0] == 1 else 's'}, +{d[1]} −{d[2]}"
+        return self._diff_fmt(*(sum(a[i] for a in areas) for i in (1, 2, 3)))
+
+    def _diff_breakdown(self) -> list[str]:
+        """One line per area when the change spans more than one (inner repos, the rest)."""
+        areas = self._diff_shortstat() or []
+        if len(areas) < 2:
+            return []
+        w = max(len(a[0]) for a in areas)
+        return [f"{name:<{w}}  {self._diff_fmt(f, i, d)}" + (f"  ({note})" if note else "")
+                for name, f, i, d, note in areas]
 
     def _metric_rows(self) -> list[tuple[str, int, int]]:
         """Each run metric as (label, this-session value, lifetime total). Session is the delta
@@ -1221,6 +1256,7 @@ class Bridge:
         diff = self._diff_text()
         if diff:
             lines.append(f"  diff vs start: {diff}")
+            lines += [f"    {line}" for line in self._diff_breakdown()]
             lines.append(bar)
         return lines
 
@@ -1264,7 +1300,7 @@ class Bridge:
                                                   f"total {tok['total']:,}{run}")
         diff = self._diff_text()
         if diff:
-            d["Diff vs start"] = diff
+            d["Diff vs start"] = diff + "".join(f"; {' '.join(b.split())}" for b in self._diff_breakdown())
         d["Run dir"] = f"`{self.cfg.run_dir}`"
         return d
 
