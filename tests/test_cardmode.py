@@ -379,7 +379,7 @@ async def test_suggested_cards_get_their_own_description_checklist_and_label(fak
     new = next(c for c in fake.cards.values() if c["name"] == "Add a dark mode")
     assert fake.column_of(new["id"]) == "Suggested" and "Users asked twice." in new["description"]
     assert [t["name"] for t in fake.tasks if t["cardId"] == new["id"]] == ["Pick colours", "Add the toggle"]
-    assert fake.has_label(new["id"], "Suggested by agent")
+    assert fake.has_label(new["id"], "Suggested by Agent")
     assert card["description"] is None and not [t for t in fake.tasks if t["cardId"] == card["id"]]   # theirs: untouched
 
 

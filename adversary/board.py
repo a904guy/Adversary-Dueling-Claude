@@ -38,8 +38,10 @@ ACTIVE_LABEL, ACTIVE_COLOR = "Active", "#2e7d32"
 # On a card that needs a person to act before it can move on (the manager gave up on it, or its work
 # can't be merged without someone).
 ATTENTION_LABEL, ATTENTION_COLOR = "Needs attention", "#c62828"
-# On cards the supervisor files in Suggested, so they aren't mistaken for people's own.
-SUGGESTED_LABEL, SUGGESTED_COLOR = "Suggested by agent", "#6a1b9a"
+# Where a card came from: the supervisor files its own in Suggested, and any other card that reaches
+# Approved To Do was put there by a person, so the manager labels it when it sees it there.
+SUGGESTED_LABEL, SUGGESTED_COLOR = "Suggested by Agent", "#6a1b9a"
+HUMAN_LABEL, HUMAN_COLOR = "Suggested by Human", "#1565c0"
 
 
 class BoardError(Exception):
@@ -174,15 +176,22 @@ class Board:
     def label_id(self, board_id: str, name: str, color: str, board: dict | None = None) -> str:
         """The board's label called `name`, created (in `color`) if it has none."""
         board = board or self.board(board_id)
-        for lbl in (board.get("included") or {}).get("labels") or []:
-            if norm(lbl.get("name") or "") == norm(name):
-                return lbl["id"]
+        if lbl := find_label(board, name):
+            if lbl.get("name") != name:   # spelt differently (an older name): bring it in line
+                try:
+                    lbl["name"] = self.rename_label(lbl["id"], name)["name"]
+                except BoardError:
+                    pass
+            return lbl["id"]
         lbl = self.create_label(board_id, name, color)
         board.setdefault("included", {}).setdefault("labels", []).append(lbl)
         return lbl["id"]
 
     def create_label(self, board_id: str, name: str, color: str) -> dict:
         return self.call("POST", f"/api/boards/{board_id}/labels", {"name": name, "color": color})["item"]
+
+    def rename_label(self, label_id: str, name: str) -> dict:
+        return self.call("PATCH", f"/api/labels/{label_id}", {"name": name})["item"]
 
     def add_card_label(self, card_id: str, label_id: str) -> None:
         try:
@@ -320,6 +329,12 @@ class Board:
 
 def comment_text(c: dict) -> str:
     return ((c.get("data") or {}).get("text") or "").strip()
+
+
+def find_label(board: dict, name: str) -> dict | None:
+    """The board's label called `name` (compared like column names), or None."""
+    return next((l for l in (board.get("included") or {}).get("labels") or []
+                 if norm(l.get("name") or "") == norm(name)), None)
 
 
 def lists_by_name(board: dict) -> dict[str, dict]:

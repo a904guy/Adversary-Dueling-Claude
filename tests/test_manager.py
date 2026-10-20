@@ -89,6 +89,26 @@ def test_creates_project_board_and_columns_then_claims_up_to_the_pool(fake, fold
     assert any("picked this up" in c["data"]["text"] for c in fake.comments.values() if c["userId"] == BOT)
 
 
+def test_approved_cards_without_the_agent_label_are_marked_as_from_a_human(fake, folder, tmp_path):
+    m, launcher = make(fake, folder, tmp_path, pool=1)
+    m.tick()
+    b = next(iter(fake.boards.values()))
+    old = {"id": fake.nid(), "boardId": b["id"], "name": "Suggested by agent", "color": "#6a1b9a"}
+    fake.labels[old["id"]] = old                               # from before "Agent" was capitalised
+    approved = fake.list_named(b["id"], "Approved To Do")["id"]
+    mine, waiting, theirs = (fake.add_card(approved, n, position=65535 * (i + 1))
+                             for i, n in enumerate(["mine", "waiting", "agent's"]))
+    fake.card_labels.append({"cardId": theirs["id"], "labelId": old["id"]})
+    idea = fake.add_card(fake.list_named(b["id"], "Upcoming")["id"], "just an idea")
+    m.tick()
+    assert fake.column_of(mine["id"]) == "In Progress" and fake.column_of(waiting["id"]) == "Approved To Do"
+    assert fake.has_label(mine["id"], "Suggested by Human") and fake.has_label(waiting["id"], "Suggested by Human")
+    assert not fake.has_label(theirs["id"], "Suggested by Human") and old["name"] == "Suggested by Agent"
+    assert not fake.has_label(idea["id"], "Suggested by Human")   # only once it's approved
+    m.tick()
+    assert sum(cl["cardId"] == waiting["id"] for cl in fake.card_labels) == 1
+
+
 def test_full_pool_waits(fake, folder, tmp_path):
     m, launcher = make(fake, folder, tmp_path, pool=1)
     m.tick()
@@ -325,14 +345,14 @@ def test_cards_with_a_live_run_carry_the_active_label(fake, folder, tmp_path):
     one, two = fake.add_card(approved, "one"), fake.add_card(approved, "two")
     m.tick()
     assert fake.has_label(one["id"], "Active") and fake.has_label(two["id"], "Active")   # right away
-    (lbl,) = fake.labels.values()
+    (lbl,) = (l for l in fake.labels.values() if l["name"] == "Active")
     assert lbl["color"] == "#2e7d32"
     runs = m.runs()
     m.alive = lambda s: s == runs[one["id"]].session          # two's run died (or finished)
     fake.cards[two["id"]]["listId"] = fake.list_named(b["id"], "Done")["id"]
     m.tick()
     assert fake.has_label(one["id"], "Active") and not fake.has_label(two["id"], "Active")
-    assert len(fake.labels) == 1                                # one label per board, reused
+    assert sum(l["name"] == "Active" for l in fake.labels.values()) == 1   # one per board, reused
 
 
 def test_the_timer_runs_while_a_run_is_live_and_failures_get_needs_attention(fake, folder, tmp_path):

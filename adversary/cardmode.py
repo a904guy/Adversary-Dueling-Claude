@@ -235,7 +235,7 @@ class CardLink:
 
     def suggest(self, title: str, description: str, tasks: list[str] | None = None) -> dict:
         """A card in Suggested, filled in by the agent (its own card, unlike people's): description,
-        an optional checklist, and the "Suggested by agent" label."""
+        an optional checklist, and the "Suggested by Agent" label."""
         card = self.client.card(self.card_id)
         board = self.client.board(card["boardId"])
         lst = fourga.lists_by_name(board).get(fourga.norm(fourga.SUGGESTED))

@@ -386,6 +386,26 @@ class Manager:
             except fourga.BoardError as e:
                 self.log(f"board {full['item'].get('name')!r}: couldn't update its labels or timers: {e}")
 
+    def label_approved(self, boards: list[dict]) -> None:
+        """Mark where each card in Approved To Do came from: one without the "Suggested by Agent"
+        label was put there by a person, so it gets "Suggested by Human". Done whenever the manager
+        sees it there, not only when it's claimed, so cards waiting on the pool are marked too."""
+        for full in boards:
+            try:
+                inc = full.get("included") or {}
+                lst = fourga.lists_by_name(full).get(fourga.norm(fourga.APPROVED))
+                agent = fourga.find_label(full, fourga.SUGGESTED_LABEL)
+                if agent:   # renames a label from before "Agent" was capitalised
+                    self._label(full, fourga.SUGGESTED_LABEL, fourga.SUGGESTED_COLOR)
+                human = fourga.find_label(full, fourga.HUMAN_LABEL)
+                origin = {l["id"] for l in (agent, human) if l}
+                marked = {str(cl["cardId"]) for cl in inc.get("cardLabels") or [] if cl["labelId"] in origin}
+                for card in inc.get("cards") or []:
+                    if lst and card.get("listId") == lst["id"] and str(card["id"]) not in marked:
+                        self.client.add_card_label(card["id"], self._label(full, fourga.HUMAN_LABEL, fourga.HUMAN_COLOR))
+            except fourga.BoardError as e:
+                self.log(f"board {full['item'].get('name')!r}: couldn't label its approved cards: {e}")
+
     def _sync_timer(self, card: dict, running: bool) -> None:
         timer = card.get("timer") or {"startedAt": None, "total": 0}
         started, total = timer.get("startedAt"), float(timer.get("total") or 0)
@@ -438,6 +458,7 @@ class Manager:
                 cfg.save()
                 self.log(f"card {cid}: done; removed its workspace")
         self.sync_status(boards, live, runs)
+        self.label_approved(boards)
         self.live_count = len(live)
         free = self.pool - len(live)
         if self.capacity is not None:

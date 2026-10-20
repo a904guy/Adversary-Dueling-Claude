@@ -263,6 +263,11 @@ class Fake4ga:
             lbl = {"id": self.nid(), "boardId": r.group(1), "name": body["name"], "color": body["color"]}
             self.labels[lbl["id"]] = lbl
             return 200, {"item": lbl}
+        if method == "PATCH" and (r := m(r"/api/labels/(\d+)")):
+            if r.group(1) not in self.labels:
+                return 404, {"code": "E_NOT_FOUND"}
+            self.labels[r.group(1)].update({k: body[k] for k in ("name", "color") if k in body})
+            return 200, {"item": self.labels[r.group(1)]}
         if method == "POST" and (r := m(r"/api/cards/(\d+)/labels")):
             cl = {"cardId": r.group(1), "labelId": body["labelId"]}
             if cl in self.card_labels:
