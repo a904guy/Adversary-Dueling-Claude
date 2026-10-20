@@ -38,7 +38,8 @@ def make(repo, tmp_path, **kw):
                     base_sha=sha, **kw)
     sent, screen_idle, focused = [], set(), []   # targets of panes that look idle on screen
     popups, has_focus, drafts = [], set(), set()  # popups shown; roles whose pane has focus / a draft
-    modes = {}                                     # role -> "shell mode" / "copy mode"
+    modes = {}                                     # role -> "shell mode" / "copy mode" / "a dialog"
+    dismissed = []                                 # roles whose dialog was closed with Esc
 
     async def popup(pane, title, text):
         popups.append((pane.role, title, text))
@@ -51,8 +52,8 @@ def make(repo, tmp_path, **kw):
     b = Bridge(cfg, {WORKER: "%1", ADVERSARY: "%2"}, deliver=deliver, log=lambda m: None,
                screen_idle=lambda pane: pane.target in screen_idle, focus=lambda pane: focused.append(pane.role),
                focused=lambda pane: pane.role in has_focus, popup=popup, has_draft=lambda pane: pane.role in drafts,
-               pane_mode=lambda pane: modes.get(pane.role))
-    b.test_drafts, b.test_modes = drafts, modes
+               pane_mode=lambda pane: modes.get(pane.role), dismiss=lambda pane: dismissed.append(pane.role) or True)
+    b.test_drafts, b.test_modes, b.test_dismissed = drafts, modes, dismissed
     b.project_file = tmp_path / "projects" / "repo.json"
     b.test_popups, b.test_has_focus = popups, has_focus
     b.test_screen_idle = screen_idle
@@ -1586,3 +1587,101 @@ def test_paste_is_confirmed_on_screen_before_enter(repo, tmp_path):
     assert b.paste_visible(pane, "You are supervising a worker on this task.")
     b.capture = lambda p: "❯ Message from your supervisor: Run the tests"
     assert b.paste_visible(pane, "Run the tests")
+
+
+AUTO_MODE_SETUP = """✻ Churned for 7m 42s · done 3:02 AM
+❯ /auto-mode-setup
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Teach auto mode about your environment?
+  Claude Code reads this project, your recent Claude sessions, and optionally your shell history and other
+  repositories. Claude analyzes this data and customizes auto mode to make better decisions.
+    How you use Claude here     Mixed
+  ❯ Also scan shell history     true
+    Also scan your other repos  false
+    Continue
+  ←/→ to change · Enter to continue · Esc to cancel
+"""
+PROMPT = """✻ Churned for 7m 42s · done 3:02 AM
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Go ahead with phase 2.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · 1 feedback draft
+"""
+
+
+def test_a_dialog_over_the_prompt_is_recognised():
+    assert bridge_mod.dialog_open(AUTO_MODE_SETUP)
+    assert not bridge_mod.dialog_open(PROMPT)
+    # the hint only counts at the bottom, where the dialog's footer is, not in scrollback
+    assert not bridge_mod.dialog_open("  Enter to continue · Esc to cancel\n" + PROMPT)
+
+
+async def test_a_delivery_lost_to_a_dialog_is_sent_again(repo, tmp_path):
+    """productbuilder.io, 03:05: Claude Code opened /auto-mode-setup in the worker's pane, the
+    supervisor's messages were typed into it, no submit ever came, and every later message was held
+    behind the one the bridge was still waiting on. The card sat for ten hours."""
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "Phase 1 done.")
+    await submit(b, ADVERSARY, sent)
+    await stop(b, ADVERSARY, "Go ahead with phase 2.")
+    w = b.panes[WORKER]
+    assert sent[-1] == (WORKER, "Go ahead with phase 2.") and w.expecting_submit   # typed; no submit
+    b.on_mcp("message_worker", {"message": "Also push."})
+    await settle()
+    assert (WORKER, "Also push.") not in sent                  # held behind the lost one
+    b.test_screen_idle.add("%1")                               # nothing running in the pane
+    b.check_undelivered(now=w.pending_at + 5)
+    assert w.expecting_submit                                  # too soon to call it lost
+    b.check_undelivered(now=w.pending_at + bridge_mod.UNDELIVERED_AFTER)
+    await settle()
+    assert sent[-1] == (WORKER, "Go ahead with phase 2.") and w.expecting_submit   # sent again
+    await submit(b, WORKER, sent)
+    assert w.reason == "adversary_msg"
+    await settle()
+    assert sent[-1] == (WORKER, "Also push.")                  # and the held one follows
+
+
+async def test_a_lost_delivery_that_is_in_the_session_log_is_not_sent_twice(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "Phase 1 done.")
+    await submit(b, ADVERSARY, sent)
+    await stop(b, ADVERSARY, "Go ahead with phase 2.")
+    w = b.panes[WORKER]
+    log = tmp_path / "worker.jsonl"
+    log.write_text(json.dumps({"type": "user", "message": {"role": "user", "content": "Go ahead with phase 2."}}) + "\n")
+    w.transcript_path = str(log)
+    b.test_screen_idle.add("%1")
+    n = len(sent)
+    b.check_undelivered(now=w.pending_at + bridge_mod.UNDELIVERED_AFTER)
+    await settle()
+    assert len(sent) == n and not w.expecting_submit
+
+
+async def test_a_dialog_nobody_closes_is_dismissed(repo, tmp_path, monkeypatch):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    b.test_modes[ADVERSARY] = "a dialog"
+    await stop(b, WORKER, "done")
+    await asyncio.sleep(0.01)
+    a = b.panes[ADVERSARY]
+    assert not any(r == ADVERSARY and t == "done" for r, t in sent)
+    assert "(a dialog)" in b.status() and not b.test_dismissed
+    a.waiting_since -= bridge_mod.DIALOG_DISMISS
+    b.test_modes[ADVERSARY] = "a dialog"
+    await asyncio.sleep(0.01)
+    assert b.test_dismissed == [ADVERSARY]
+    del b.test_modes[ADVERSARY]                                # Esc closed it
+    await asyncio.sleep(0.01)
+    await settle()
+    assert sent[-1] == (ADVERSARY, "done")
+
+
+def test_both_agents_have_claude_codes_own_dialogs_switched_off(repo, tmp_path):
+    from adversary.config import write_launch_files
+    b, _ = make(repo, tmp_path)
+    write_launch_files(b.cfg)
+    for role in (WORKER, ADVERSARY):
+        s = json.loads((tmp_path / "run" / f"{role}-settings.json").read_text())
+        assert s["skillOverrides"]["auto-mode-setup"] == "off"

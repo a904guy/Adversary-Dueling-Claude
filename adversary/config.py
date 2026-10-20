@@ -157,6 +157,12 @@ def _write_private(path: Path, text: str) -> None:
     os.chmod(path, 0o600)   # an existing file keeps its old mode through O_CREAT
 
 
+# Settings for both agents that keep Claude Code from opening dialogs by itself: one that takes the
+# keyboard swallows whatever the bridge types next. /auto-mode-setup's "Teach auto mode about your
+# environment?" opened in a card's worker and held up the run for ten hours.
+QUIET_UI = {"skillOverrides": {"auto-mode-setup": "off"}}
+
+
 def draft_path(cfg: RunConfig, role: str) -> Path:
     """Where the draft mod in `role`'s session reports whether its prompt box holds a draft."""
     return Path(cfg.run_dir) / f"draft-{role}.json"
@@ -169,7 +175,7 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
     base_events = ["SessionStart", "UserPromptSubmit", "Stop"]
 
     worker_events = base_events + ([] if cfg.skip_permissions else ["PermissionRequest"])
-    worker_settings = _hooks(cfg, "worker", worker_events)
+    worker_settings = {**_hooks(cfg, "worker", worker_events), **QUIET_UI}
     if cfg.card_mode:
         # The worker's request_feedback reaches the bridge through its own copy of the bridge's MCP
         # server, which offers it nothing else; the call itself needs no approval.
@@ -182,7 +188,7 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
     # Its launch skips the settings where your .mcp.json answers are saved; pass them on so it
     # doesn't stop at the "New MCP servers found" dialog every launch.
     (run / "adversary-settings.json").write_text(json.dumps(
-        {**_hooks(cfg, "adversary", base_events), **mcps.approvals(cfg.repo)}, indent=2))
+        {**_hooks(cfg, "adversary", base_events), **QUIET_UI, **mcps.approvals(cfg.repo)}, indent=2))
     # The supervisor's MCP servers: the bridge's own, plus the worker's browsers read-only (or the
     # ones named with --adversary-mcp). Its launch doesn't load the user's servers, so they're
     # handed over here.

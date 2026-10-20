@@ -40,6 +40,11 @@ IDLE_SETTLE = 1.0    # seconds after Stop/SessionStart before pasting
 RESUME_SETTLE = 1.5  # seconds after a permission decision before pasting a queued message_worker
 DRAFT_RECHECK = 1.0  # seconds between checks while a person has a draft in the pane
 DELIVERY_RETRY = 5.0  # seconds before retrying a delivery tmux refused
+UNDELIVERED_AFTER = 30.0  # seconds a paste may go unsubmitted, with nothing running, before it's sent again
+DIALOG_DISMISS = 60.0     # seconds a dialog may cover the prompt of an unwatched pane before Esc closes it
+# Footer hints of a Claude Code dialog or menu that owns the keyboard (the prompt box's own footer
+# says "esc to interrupt", lower case). Typed text goes into the dialog, not the prompt.
+DIALOG_HINT = re.compile(r"\bEsc to (?:cancel|go back|close|exit)\b|\bEnter to (?:continue|confirm|select)\b")
 QUIT_GRACE = 10.0    # seconds the agents get to exit on SIGTERM before SIGKILL
 MAX_PERM_REMINDERS = 2
 QUIET_HOLD_AT = 2    # consecutive no-op worker turns (after an adversary reply) before an auto-hold
@@ -73,11 +78,13 @@ class Pane:
     last_reason: object = None     # why the previous turn ran
     expecting_submit: bool = False  # we pasted; the next UserPromptSubmit should be ours
     pending: tuple | None = None   # (header, body, reason) of that paste, until its submit is seen
+    pending_at: float = 0.0        # monotonic time of that paste
     human_prompts: list = field(default_factory=list)  # typed by the human since last relay
     direct: list = field(default_factory=list)  # message_worker texts waiting to be typed in mid-turn
     last_text: str = ""            # final message of its last turn
     transcript_path: str | None = None  # this session's JSONL, from live hook payloads
-    waiting_on: str | None = None  # why a delivery waits for the person: "a draft", "shell mode", "copy mode"
+    waiting_on: str | None = None  # why a delivery waits: "a draft", "shell mode", "copy mode", "a dialog"
+    waiting_since: float = 0.0     # monotonic time that wait began
     lost: tuple | None = None      # a delivery whose paste was dropped (header only): sent again after the turn
     idle_at: float | None = None   # wall-clock time its last turn ended (for the card's live comment)
     wait_retry: bool = False       # a recheck is scheduled
@@ -126,7 +133,7 @@ def split_message(text: str, limit: int) -> list[str]:
 class Bridge:
     def __init__(self, cfg: RunConfig, panes: dict[str, str], deliver=None, log=print, screen_idle=None,
                  resume: str | None = None, focus=None, focused=None, popup=None, has_draft=None,
-                 pane_mode=None, capture=None):
+                 pane_mode=None, capture=None, dismiss=None):
         self.cfg = cfg
         self.panes = {role: Pane(role, target) for role, target in panes.items()}
         self.deliver = deliver or self._tmux_deliver
@@ -137,6 +144,7 @@ class Bridge:
         self.has_draft = has_draft or self._draft_file_says
         self.pane_mode = pane_mode or self._tmux_pane_mode
         self.capture = capture or (lambda pane: tmux.capture(pane.target))
+        self.dismiss = dismiss or self._tmux_dismiss
         self._popup_task: asyncio.Task | None = None
         self._popups_unsupported = False   # this tmux rejected display-popup; stop retrying
         # Per-project record (which help popups were shown), kept with the runs, keyed by folder.
@@ -390,6 +398,7 @@ class Bridge:
         # The turn takes `reason` only once its UserPromptSubmit shows this text went in as a
         # prompt: a paste that ran as a shell command, or never went in, routes nothing.
         pane.busy, pane.expecting_submit, pane.pending = True, True, (header, body, reason)
+        pane.pending_at = time.monotonic()
         self.log(f"→ {role}: {self._short(body)}")
         try:
             await self.deliver(role, header, body)
@@ -829,6 +838,7 @@ class Bridge:
             return
         header = self.header(WORKER, "direct")
         pane.expecting_submit, pane.pending = True, (header, body, "direct")  # its submit fires right away
+        pane.pending_at = time.monotonic()
         self.log(f"→ worker (mid-turn): {self._short(body)}")
         task = asyncio.get_running_loop().create_task(self._deliver_direct(pane, header, body))
         self._flush_tasks.add(task)
@@ -877,7 +887,10 @@ class Bridge:
                 return "copy mode"
         except subprocess.CalledProcessError:
             return None
-        for line in reversed(tmux.capture(pane.target).splitlines()):
+        screen = tmux.capture(pane.target)
+        if dialog_open(screen):
+            return "a dialog"
+        for line in reversed(screen.splitlines()):
             if line.startswith("❯"):
                 return None
             if line.startswith(("!\u00a0", "! ")):
@@ -885,9 +898,10 @@ class Bridge:
         return None
 
     def _waiting_on_person(self, pane: Pane) -> bool:
-        """True while typing into the pane would land in something of the person's: a message
-        half written, shell mode or copy mode. Nothing is typed until that's done.
-        Rechecked every DRAFT_RECHECK seconds."""
+        """True while typing into the pane would land somewhere other than an empty prompt: a
+        message half written, shell mode, copy mode, or a dialog over the prompt. Nothing is
+        typed until that's done. A dialog nobody is watching (Claude Code opens some by itself)
+        is closed with Esc after DIALOG_DISMISS seconds. Rechecked every DRAFT_RECHECK seconds."""
         why = "a draft" if self.has_draft(pane) else self.pane_mode(pane)
         if why is None:
             if pane.waiting_on:
@@ -895,14 +909,67 @@ class Bridge:
                 pane.waiting_on = None
             return False
         if pane.waiting_on != why:
-            pane.waiting_on = why
+            pane.waiting_on, pane.waiting_since = why, time.monotonic()
             self.log({"a draft": f"{pane.role}: you have a message drafted there; waiting until it's sent or cleared",
                       "shell mode": f"{pane.role}: the prompt is in shell mode (!); waiting until it's back to normal",
-                      "copy mode": f"{pane.role}: the pane is in copy mode; waiting until you leave it"}[why])
+                      "copy mode": f"{pane.role}: the pane is in copy mode; waiting until you leave it",
+                      "a dialog": f"{pane.role}: a dialog covers the prompt; waiting until it's closed"}[why])
+        elif why == "a dialog" and time.monotonic() - pane.waiting_since >= DIALOG_DISMISS:
+            pane.waiting_since = time.monotonic()   # one Esc per DIALOG_DISMISS
+            if self.dismiss(pane):
+                self.log(f"{pane.role}: a dialog has covered the prompt for {DIALOG_DISMISS:.0f}s with nobody "
+                         "watching; closed it with Esc")
         if not pane.wait_retry:
             pane.wait_retry = True
             asyncio.get_running_loop().call_later(DRAFT_RECHECK, self._recheck_wait, pane.role)
         return True
+
+    def _tmux_dismiss(self, pane: Pane) -> bool:
+        """Press Esc in a pane nobody is attached to; False (left alone) when someone is."""
+        try:
+            if tmux.tmux("display", "-p", "-t", pane.target, "#{session_attached}") not in ("", "0"):
+                return False
+            tmux.press(pane.target, "Escape")
+        except subprocess.CalledProcessError:
+            return False
+        return True
+
+    def check_undelivered(self, now: float | None = None) -> None:
+        """Called every second. A paste whose submit never came, with no turn running, was lost:
+        typed into a dialog that had taken the keyboard, say. Left alone, the pane waits for that
+        submit forever and every later message to it is held back. After UNDELIVERED_AFTER
+        seconds it's settled from the session log: delivered if it's there, sent again if not."""
+        now = time.monotonic() if now is None else now
+        for pane in self.panes.values():
+            if (not pane.expecting_submit or not pane.pending or now - pane.pending_at < UNDELIVERED_AFTER
+                    or not self.screen_idle(pane)):
+                continue
+            header, body, reason = pane.pending
+            report = self._draft_report(pane)
+            if report and report.get("draft") and str(report.get("head", "")).startswith(header[:40]):
+                # Still in the prompt box, unsubmitted: Enter, not a second copy.
+                pane.pending_at = now
+                self.log(f"{pane.role}: the bridge's message is still unsent in the prompt box; pressing Enter")
+                self._press_enter(pane)
+                continue
+            if self._in_log(pane.transcript_path, body):
+                self.log(f"{pane.role}: the message went in without a submit event; delivered")
+                pane.expecting_submit, pane.pending = False, None
+                continue
+            self.log(f"{pane.role}: the bridge's message never went in ({UNDELIVERED_AFTER:.0f}s, no submit, "
+                     f"nothing running); sending it again: {self._short(body)}")
+            self._requeue_pending(pane, quiet=True)
+            pane.busy = False   # nothing's running: the message goes in as a new prompt
+            if reason == "direct":
+                self._send_direct()
+            else:   # first; mid-turn messages held behind it follow once it's submitted
+                self.schedule_flush(pane.role, delay=0)
+
+    def _press_enter(self, pane: Pane) -> None:
+        try:
+            tmux.press(pane.target, "Enter")
+        except subprocess.CalledProcessError:
+            pass
 
     def _recheck_wait(self, role: str) -> None:
         self.panes[role].wait_retry = False
@@ -2020,6 +2087,13 @@ class Bridge:
             writer.close()
 
 
+def dialog_open(screen: str) -> bool:
+    """Whether a Claude Code dialog or menu covers the prompt box: its key hints ("Enter to
+    continue · Esc to cancel") on one of the last few lines, where the prompt's footer would be."""
+    lines = [l for l in screen.splitlines() if l.strip()][-4:]
+    return any(DIALOG_HINT.search(l) for l in lines)
+
+
 def _cursor_on(screen: str, option: str) -> bool:
     """Whether a Claude Code menu's cursor (❯) is on the line holding `option`."""
     return any(option in line and "❯" in line for line in screen.splitlines())
@@ -2179,6 +2253,7 @@ async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file
                     bridge.log(status)
                     last_status = status
                 bridge.check_stall()
+                bridge.check_undelivered()
                 bridge.check_hold()
                 bridge.check_popups()
                 if bridge.card and not bridge._card_busy:
