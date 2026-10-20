@@ -81,3 +81,14 @@ def test_a_finished_runs_slice_is_removed(tmp_path, monkeypatch):
     limits.remove_slice(cfg, directory=units, reload=False)
     assert not (units / name).exists()
     limits.remove_slice(cfg, directory=units, reload=False)      # already gone: fine
+
+
+def test_oom_kills_are_read_from_the_runs_slice(tmp_path):
+    cfg = cfg_for(tmp_path, memory_max="3G")
+    assert limits.oom_kills(cfg, root=tmp_path) is None            # no cgroup for it
+    d = tmp_path / "adversary.slice" / limits.slice_name(cfg)
+    d.mkdir(parents=True)
+    (d / "memory.events").write_text("low 0\nhigh 0\nmax 52560\noom 3\noom_kill 1\noom_group_kill 0\n")
+    assert limits.oom_kills(cfg, root=tmp_path) == 1
+    cfg.memory_max = None
+    assert limits.oom_kills(cfg, root=tmp_path) is None            # unlimited run

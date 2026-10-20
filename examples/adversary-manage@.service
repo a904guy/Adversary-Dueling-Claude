@@ -23,7 +23,7 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin:/root/.local/bin
 Environment=ADVERSARY_FOLDER=/mnt/projects/%i
 Environment=ADVERSARY_POOL=3
 # Flags passed to every run, after `--`.
-Environment="ADVERSARY_RUN_ARGS=--worker-permission-mode auto"
+Environment="ADVERSARY_RUN_ARGS=--cpu-quota auto"
 ExecStart=/bin/sh -c 'exec adversary manage --project "%i" --folder "$ADVERSARY_FOLDER" --pool "$ADVERSARY_POOL" -- $ADVERSARY_RUN_ARGS'
 Restart=always
 RestartSec=10

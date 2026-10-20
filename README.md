@@ -46,14 +46,15 @@ That is all that's required. It works in the current directory. Every flag below
 | Flag | Effect |
 |---|---|
 | `--repo PATH` | Work in `PATH` instead of the current directory. |
-| *(default)* | Every worker permission prompt goes to the adversary, which must call `approve_tool` or `deny_tool`. The worker sees the deny reason. |
+| *(default)* | The worker runs in Claude Code's auto mode: its classifier approves what's safe, and every prompt that remains goes to the adversary, which must call `approve_tool` or `deny_tool`. The worker sees the deny reason. |
+| `--worker-permission-mode manual` | Every worker permission prompt goes to the adversary. |
 | `--skip-permissions` | The worker runs with `--dangerously-skip-permissions`, so there is no approval traffic. |
 | `--worker-permission-mode acceptEdits` | Edits are auto-approved and only the remaining prompts (for example Bash) go to the adversary. This is cheaper, because each prompt costs a full adversary turn. |
 | `--strict-approvals` | Ignore user-level settings for the worker, so no personal allow rule lets a tool call skip the adversary. |
 | `--worktree` | Work in a fresh `git worktree` on branch `adversary/<timestamp>` (git repos only). |
 | `--max-exchanges N` | Loop guard: after this many round trips between the agents without me (default 30), the worker is put on hold. The count restarts whenever I type to either side and on resume, and the run is never ended by it. Permission requests don't count. |
-| `--stall-after SECONDS` | Log a stall when both agents sit idle this long while the run is unfinished (default 120, `0` turns it off). |
-| `--worker-model`, `--adversary-model` | Pick the model for each side. |
+| `--stall-after SECONDS` | Treat it as a stall when both agents sit idle this long while the run is unfinished (default 120, `0` turns it off): it's logged and the supervisor is woken to get the run moving. |
+| `--worker-model`, `--adversary-model` | Pick the model for each side. The worker defaults to `opus` (the latest Opus), whatever the account's default is; the adversary uses the account's default. |
 | `--worker-effort LEVEL`, `--adversary-effort LEVEL` | Effort level for each side (`low`, `medium`, `high`, `xhigh`, `max`; passed as `claude --effort`). Defaults: worker `high`, adversary `xhigh`. Also accepted by `adversary resume` to change them; otherwise a resume keeps the run's levels. |
 | `--adversary-mcp SPEC` | Give the supervisor an MCP server by name (repeatable; by default it gets the worker's browser servers read-only: every Chrome DevTools server, and Claude in Chrome when it's on by default). `NAME` is the server's key under `mcpServers` in your MCP config — the name `claude mcp list` shows — and gives all its tools; `NAME:readonly` a look-don't-touch preset for browser servers (Chrome DevTools, Claude in Chrome: navigate, snapshot, screenshot, console/network — no clicking, typing or running script); `NAME:tool1,tool2` exact tools. `claude-in-chrome` turns on Claude in Chrome. On resume it replaces the run's choice; `none` clears it. |
 | `--verify-cmd "just test"` | Extra command prefix the adversary may run (repeatable). |
@@ -109,6 +110,13 @@ If the adversary doesn't hold and instead keeps replying to a worker that does n
 
 A hold on background work has a **check-in deadline**: background tasks can hang, or finish without the notification that wakes the worker, and the run would sit parked forever. If the worker isn't back within 10 minutes, the bridge sends the supervisor a check-in — how long it's been, what is still running (or that nothing is), and anything kept back — and the supervisor decides whether to keep waiting (`hold` again) or get the worker moving (`message_worker`). Unanswered, it asks again at double the interval, up to an hour. The supervisor can set its own interval with `hold(check_after_minutes=N)` (0 turns it off); a hold that waits on you rather than on background work has no check-in unless it asks for one. Messages a subagent sends back to the worker ("Another Claude session sent a message…") are treated as background notifications, not as me typing, so they don't reset the loop guard.
 
+**The run repairs itself where it can.**
+
+- **An agent that exits** (the kernel killed it for running out of the run's memory, a crash, `/exit`) is started again in a new pane with its conversation, after 5 seconds, doubling with each restart. The supervisor is told what happened, and when it was killed for memory, it's asked to have the worker keep memory use down. An agent that exits five times within an hour is left down; a managed run closes then, so the manager can start it fresh.
+- **A stall** (both agents idle with the run unfinished, nothing on its way) wakes the supervisor to check the worker and give it its next step, up to three times until the worker moves again. A side whose turn ended without a Stop event (an Esc interrupt) is treated as idle. A card that's waiting on people isn't woken; it parks.
+- **A message that never went in** (no submit, nothing running, after 30 seconds) is settled from the session log: delivered if it's there, sent again if not.
+- **A dialog over the prompt** holds deliveries back, like a draft. In a pane nobody is attached to it's closed with Esc after a minute. Both agents run with Claude Code's `/auto-mode-setup` prompt switched off (`skillOverrides`), since it opens by itself and takes the keyboard.
+
 **`finish` isn't final.** When the adversary marks a run complete and I come back later with a new task or a follow-up, I just tell the adversary in its pane; its `message_worker` call picks the finished run back up and starts the worker again (the report already on disk stays as the record of that round). I can also restart the worker by typing straight into its pane. This is lighter than `adversary resume`, which is for picking a run up in a fresh tmux session after the window is gone.
 
 Each run writes to `~/.local/state/adversary/runs/<timestamp>/`:
@@ -126,7 +134,7 @@ Each run writes to `~/.local/state/adversary/runs/<timestamp>/`:
 `adversary manage` watches a [4ga Boards](https://github.com/RARgames/4gaBoards) project and keeps up to `--pool` runs working its cards. Runs started by hand (`adversary run`, `adversary resume`) are unchanged: everything below applies only to runs the manager launches.
 
 ```sh
-adversary manage --project "AnySite" --folder /mnt/projects/AnySite -- --worker-permission-mode auto --cpu-quota auto
+adversary manage --project "AnySite" --folder /mnt/projects/AnySite -- --cpu-quota auto
 ```
 
 Flags after `--` go to every run it starts. `--pool` (runs at once) defaults to the number of CPU threads available, so with `--cpu-quota 100%` (one core's worth per run, see below) a full pool fills the machine without any run taking more than its share.
@@ -139,7 +147,7 @@ Flags after `--` go to every run it starts. `--pool` (runs at once) defaults to 
 pool = "auto"                      # runs at once across all projects (auto = CPU threads)
 interval = 15
 members = ["you@example.com"]      # kept on every project
-run_args = ["--worker-permission-mode", "auto", "--cpu-quota", "auto"]
+run_args = ["--cpu-quota", "auto"]
 
 [[project]]
 name = "Website"                   # found by name, or created with its board

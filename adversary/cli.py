@@ -131,7 +131,7 @@ def load_manage_config(path: str) -> dict:
         pool = "auto"            # runs at once across all projects (auto: one per CPU thread)
         interval = 15
         members = ["you@example.com"]
-        run_args = ["--worker-permission-mode", "auto", "--cpu-quota", "auto"]
+        run_args = ["--cpu-quota", "auto"]
         board_env = "~/.config/adversary/4ga.env"
         done_window_days = 30
 
@@ -355,10 +355,8 @@ def launch(cfg: RunConfig, no_attach: bool, resume_file: Path | None = None) -> 
               "the bridge pane may grow if you resize the terminal")
     # Label panes with a user option: Claude Code rewrites the pane title (OSC escapes), so
     # #{pane_title} would show its process title instead of the role.
-    for pane, label in ((worker, "WORKER · does the task"),
-                        (adversary, "ADVERSARY · reviews & approves (read-only)"),
-                        (bridge, "BRIDGE · p pause/resume · s status · q quit")):
-        tmux.tmux("set-option", "-p", "-t", pane, "@adversary_label", label)
+    for pane, role in ((worker, "worker"), (adversary, "adversary"), (bridge, "bridge")):
+        tmux.tmux("set-option", "-p", "-t", pane, "@adversary_label", tmux.PANE_LABELS[role])
     tmux.tmux("set-option", "-w", "-t", worker, "pane-border-status", "top")
     tmux.tmux("set-option", "-w", "-t", worker, "pane-border-format",
               "#{?pane_active,#[reverse],} #{@adversary_label} #[default]")
@@ -525,7 +523,7 @@ def add_settings(p: argparse.ArgumentParser, resume: bool) -> None:
                        help="run the worker with --dangerously-skip-permissions (no approval traffic)")
     perms.add_argument("--worker-permission-mode", choices=PERMISSION_MODES,
                        help="worker permission mode; prompts that remain go to the adversary"
-                            + (keep or " (default: manual)"))
+                            + (keep or " (default: auto)"))
     p.add_argument("--strict-approvals", action=argparse.BooleanOptionalAction, default=d(False),
                    help="ignore user-level settings for the worker so no user allow rule bypasses the adversary" + keep)
     p.add_argument("--max-exchanges", type=int, default=d(30),
@@ -534,8 +532,8 @@ def add_settings(p: argparse.ArgumentParser, resume: bool) -> None:
     p.add_argument("--stall-after", type=int, default=d(120), metavar="SECONDS",
                    help="log a stall when both agents sit idle this long with the run unfinished"
                         + (keep or " (default 120)") + "; 0 = off")
-    p.add_argument("--worker-model", help="model for the worker" + keep)
-    p.add_argument("--adversary-model", help="model for the adversary" + keep)
+    p.add_argument("--worker-model", help="model for the worker" + (keep or " (default: opus, the latest Opus)"))
+    p.add_argument("--adversary-model", help="model for the adversary" + (keep or " (default: the account's own default)"))
     p.add_argument("--worker-effort", choices=EFFORTS, default=d("high"),
                    help="effort level for the worker (claude --effort)" + (keep or "; default: high"))
     p.add_argument("--adversary-effort", choices=EFFORTS, default=d("xhigh"),
@@ -622,7 +620,7 @@ def main() -> None:
                        description="Watch a 4ga project and run adversary on its cards: each card in Approved To "
                                    "Do gets its own run (up to --pool at once) in its own workspace, and moves "
                                    "through In Progress, Needs Feedback and Done as the run goes. Flags after "
-                                   "`--` are passed to every run (e.g. -- --worker-permission-mode auto).")
+                                   "`--` are passed to every run (e.g. -- --cpu-quota auto).")
     m.add_argument("--project", help="the 4ga project's name (created, with a board, if missing)")
     m.add_argument("--config", metavar="FILE", help="manage several projects from a TOML file, sharing one pool "
                    "(see `load_manage_config` in cli.py, or the README, for the format)")

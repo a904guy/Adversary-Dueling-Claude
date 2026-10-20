@@ -112,3 +112,23 @@ def prefix(cfg) -> list[str]:
         return []
     return ["systemd-run", *(["--user"] if _user() else []), "--scope", "--quiet", "--collect",
             f"--slice={slice_name(cfg)}", "--"]
+
+
+def oom_kills(cfg, root: Path = Path("/sys/fs/cgroup")) -> int | None:
+    """How many processes the kernel has killed in the run's slice for running out of its memory
+    (memory.events counts the whole slice), or None when it can't be read (no limits, no cgroup v2)."""
+    if not limited(cfg):
+        return None
+    name = slice_name(cfg)   # a system slice as root, else under the user's manager
+    for path in [root / "adversary.slice" / name / "memory.events",
+                 *root.glob(f"user.slice/*/user@*.service/adversary.slice/{name}/memory.events")]:
+        if not path.exists():
+            continue
+        try:
+            for line in path.read_text().splitlines():
+                key, _, value = line.partition(" ")
+                if key == "oom_kill":
+                    return int(value)
+        except (OSError, ValueError):
+            return None
+    return None

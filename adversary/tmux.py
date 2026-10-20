@@ -2,6 +2,10 @@
 
 import subprocess
 
+# Pane labels (a user option: Claude Code rewrites the pane title), shown in the pane borders.
+PANE_LABELS = {"worker": "WORKER · does the task", "adversary": "ADVERSARY · reviews & approves (read-only)",
+               "bridge": "BRIDGE · p pause/resume · s status · q quit"}
+
 
 def tmux(*args: str, input: str | None = None) -> str:
     return subprocess.run(["tmux", *args], input=input, capture_output=True, text=True, check=True).stdout.strip()

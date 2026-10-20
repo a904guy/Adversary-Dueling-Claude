@@ -161,6 +161,11 @@ def _write_private(path: Path, text: str) -> None:
 # keyboard swallows whatever the bridge types next. /auto-mode-setup's "Teach auto mode about your
 # environment?" opened in a card's worker and held up the run for ten hours.
 QUIET_UI = {"skillOverrides": {"auto-mode-setup": "off"}}
+# The worker's defaults when a run doesn't name them: auto mode (Claude Code's classifier approves
+# what's safe; the rest still goes to the supervisor) and the latest Opus (`opus` is Claude Code's
+# alias for it), whatever the account's own default model is.
+DEFAULT_WORKER_MODE = "auto"
+DEFAULT_WORKER_MODEL = "opus"
 
 
 def draft_path(cfg: RunConfig, role: str) -> Path:
@@ -225,9 +230,8 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
     if cfg.skip_permissions:
         worker.append("--dangerously-skip-permissions")
     else:
-        worker += ["--permission-mode", cfg.worker_permission_mode or "manual"]
-    if cfg.worker_model:
-        worker += ["--model", cfg.worker_model]
+        worker += ["--permission-mode", cfg.worker_permission_mode or DEFAULT_WORKER_MODE]
+    worker += ["--model", cfg.worker_model or DEFAULT_WORKER_MODEL]
     if cfg.worker_effort:
         worker += ["--effort", cfg.worker_effort]
     if cfg.card_mode:

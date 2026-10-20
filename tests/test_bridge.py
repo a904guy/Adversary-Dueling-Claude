@@ -1685,3 +1685,111 @@ def test_both_agents_have_claude_codes_own_dialogs_switched_off(repo, tmp_path):
     for role in (WORKER, ADVERSARY):
         s = json.loads((tmp_path / "run" / f"{role}-settings.json").read_text())
         assert s["skillOverrides"]["auto-mode-setup"] == "off"
+
+
+def restartable(b):
+    """Give the bridge fake pane checks: `b.test_dead` holds roles whose Claude Code exited, and a
+    restart puts the agent in a new pane (%9, %10, …)."""
+    dead, respawned = set(), []
+
+    def respawn(pane):
+        dead.discard(pane.role)
+        respawned.append(pane.role)
+        return f"%{8 + len(respawned)}"
+    b.pane_state = lambda pane: "its pane closed" if pane.role in dead else None
+    b.respawn = respawn
+    b.test_dead, b.test_respawned = dead, respawned
+
+
+async def test_a_worker_that_dies_is_started_again_and_the_supervisor_told(repo, tmp_path, monkeypatch):
+    """productbuilder.io, 13:45: the worker was killed for running past the run's memory limit during a
+    build, its pane closed, and the run sat with nobody working for over an hour."""
+    b, sent = make(repo, tmp_path, memory_max="1728M")
+    restartable(b)
+    kills = [0]
+    monkeypatch.setattr(bridge_mod.limits, "oom_kills", lambda cfg: kills[0])
+    await ready(b, sent)
+    b.check_agents(now=0)
+    assert not b.test_respawned                                  # alive: nothing to do
+    b.test_dead.add(WORKER)
+    kills[0] = 1
+    b.check_agents(now=10)
+    w = b.panes[WORKER]
+    assert w.restart_at == 10 + bridge_mod.RESTART_DELAY and not b.test_respawned
+    b.check_agents(now=10 + bridge_mod.RESTART_DELAY)
+    assert b.test_respawned == [WORKER] and w.target == "%9" and not w.started
+    await settle()
+    note = [t for r, t in sent if r == ADVERSARY][-1]
+    assert "running out of the run's memory (limit 1728M)" in note and "one build or test run at a time" in note
+    await submit(b, ADVERSARY, sent)
+    await stop(b, ADVERSARY, "Pick up at the icon commit.")
+    assert not any(r == WORKER and t == "Pick up at the icon commit." for r, t in sent)   # not while it starts
+    await b.on_hook(WORKER, "SessionStart", {"source": "resume"})
+    await settle()
+    assert sent[-1] == (WORKER, "Pick up at the icon commit.")
+
+
+async def test_an_agent_that_keeps_dying_is_left_down_and_a_managed_run_closes(repo, tmp_path):
+    b, sent = make(repo, tmp_path, managed=True)
+    restartable(b)
+    stops = []
+    b.request_stop = lambda: stops.append(1)
+    await ready(b, sent)
+    t, delays = 0.0, []
+    for _ in range(bridge_mod.MAX_RESTARTS):
+        b.test_dead.add(ADVERSARY)
+        b.check_agents(now=t)
+        a = b.panes[ADVERSARY]
+        delays.append(a.restart_at - t)
+        t = a.restart_at
+        b.check_agents(now=t)
+        await b.on_hook(ADVERSARY, "SessionStart", {"source": "resume"})
+    assert delays == [bridge_mod.RESTART_DELAY * 2 ** i for i in range(bridge_mod.MAX_RESTARTS)]
+    assert not stops
+    b.test_dead.add(ADVERSARY)
+    b.check_agents(now=t + 1)
+    assert stops == [1] and b.panes[ADVERSARY].restart_at == float("inf")
+
+
+async def test_a_stall_wakes_the_supervisor_a_few_times(repo, tmp_path):
+    b, sent = make(repo, tmp_path, stall_after=60)
+    await ready(b, sent)
+    w, a = b.panes[WORKER], b.panes[ADVERSARY]
+    t = 0
+    for i in range(bridge_mod.STALL_NUDGES + 1):
+        w.busy = a.busy = False
+        b.check_stall(now=t)
+        assert b.check_stall(now=t + 61)
+        await settle()
+        woke = [x for r, x in sent if r == ADVERSARY and "the run has stopped moving" in x]
+        assert len(woke) == min(i + 1, bridge_mod.STALL_NUDGES)
+        if woke and sent[-1][1] == woke[-1]:
+            await submit(b, ADVERSARY, sent)
+            a.busy = True
+            b.check_stall(now=t + 62)                   # it works: the episode ends
+        t += 1000
+    await stop(b, WORKER, "Back on it.")                # the worker moving again resets the count
+    assert b.stall_nudges == 0
+
+
+async def test_a_stalled_card_waiting_on_people_does_not_wake_the_supervisor(repo, tmp_path):
+    b, sent = make(repo, tmp_path, stall_after=60)
+    await ready(b, sent)
+    b.card = type("Card", (), {"open": True})()
+    b.card_followup = False
+    b.panes[WORKER].busy = b.panes[ADVERSARY].busy = False
+    b.check_stall(now=0)
+    assert b.check_stall(now=61)
+    await settle()
+    assert not any("the run has stopped moving" in x for _, x in sent)
+
+
+def test_the_worker_defaults_to_auto_mode_and_opus(repo, tmp_path):
+    from adversary.config import write_launch_files
+    b, _ = make(repo, tmp_path)
+    text = write_launch_files(b.cfg)["worker"].read_text()
+    assert "--permission-mode auto" in text and "--model opus" in text
+    b.cfg.worker_permission_mode, b.cfg.worker_model = "acceptEdits", "claude-sonnet-5-5"
+    text = write_launch_files(b.cfg)["worker"].read_text()
+    assert "--permission-mode acceptEdits" in text and "--model claude-sonnet-5-5" in text
+    assert "--model" not in write_launch_files(b.cfg)["adversary"].read_text()

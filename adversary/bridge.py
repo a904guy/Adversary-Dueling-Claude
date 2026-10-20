@@ -26,8 +26,8 @@ from datetime import datetime
 from pathlib import Path
 
 from adversary import board as fourga
-from adversary import cardmode, sessions, snapshot, tmux, workspace
-from adversary.config import RunConfig, draft_path, git_safe_env
+from adversary import cardmode, limits, sessions, snapshot, tmux, workspace
+from adversary.config import RunConfig, draft_path, git_safe_env, write_launch_files
 from adversary.transcript import (Transcript, background_running, latest_progress, find_subagent_log, last_assistant_text, recent_activity,
                                    subagent_finished, subagent_logs, token_usage, turn_had_tool_use, write_report)
 
@@ -41,6 +41,10 @@ RESUME_SETTLE = 1.5  # seconds after a permission decision before pasting a queu
 DRAFT_RECHECK = 1.0  # seconds between checks while a person has a draft in the pane
 DELIVERY_RETRY = 5.0  # seconds before retrying a delivery tmux refused
 UNDELIVERED_AFTER = 30.0  # seconds a paste may go unsubmitted, with nothing running, before it's sent again
+RESTART_DELAY = 5.0       # seconds before an agent that exited is started again; doubles with each restart
+STALL_NUDGES = 3          # times in a row the supervisor is woken for a stall before the bridge only logs it
+MAX_RESTARTS = 5          # restarts of one agent within RESTART_WINDOW before the bridge gives up on it
+RESTART_WINDOW = 3600.0
 DIALOG_DISMISS = 60.0     # seconds a dialog may cover the prompt of an unwatched pane before Esc closes it
 # Footer hints of a Claude Code dialog or menu that owns the keyboard (the prompt box's own footer
 # says "esc to interrupt", lower case). Typed text goes into the dialog, not the prompt.
@@ -88,6 +92,10 @@ class Pane:
     lost: tuple | None = None      # a delivery whose paste was dropped (header only): sent again after the turn
     idle_at: float | None = None   # wall-clock time its last turn ended (for the card's live comment)
     wait_retry: bool = False       # a recheck is scheduled
+    launched: bool = False         # its session has come up at least once (only then is an exit a death)
+    restarts: list = field(default_factory=list)   # monotonic times it was started again
+    restart_at: float | None = None  # when it's due to be started again, after it exited
+    died: str = ""                 # why it last exited, for the note to the supervisor
 
 
 @dataclass
@@ -133,7 +141,7 @@ def split_message(text: str, limit: int) -> list[str]:
 class Bridge:
     def __init__(self, cfg: RunConfig, panes: dict[str, str], deliver=None, log=print, screen_idle=None,
                  resume: str | None = None, focus=None, focused=None, popup=None, has_draft=None,
-                 pane_mode=None, capture=None, dismiss=None):
+                 pane_mode=None, capture=None, dismiss=None, pane_state=None, respawn=None):
         self.cfg = cfg
         self.panes = {role: Pane(role, target) for role, target in panes.items()}
         self.deliver = deliver or self._tmux_deliver
@@ -145,6 +153,9 @@ class Bridge:
         self.pane_mode = pane_mode or self._tmux_pane_mode
         self.capture = capture or (lambda pane: tmux.capture(pane.target))
         self.dismiss = dismiss or self._tmux_dismiss
+        self.pane_state = pane_state or self._tmux_pane_state
+        self.respawn = respawn or self._tmux_respawn
+        self._oom_seen = limits.oom_kills(cfg) or 0   # the slice's OOM kills so far (a resume starts from them)
         self._popup_task: asyncio.Task | None = None
         self._popups_unsupported = False   # this tmux rejected display-popup; stop retrying
         # Per-project record (which help popups were shown), kept with the runs, keyed by folder.
@@ -184,6 +195,7 @@ class Bridge:
         self.summary = ""
         self.idle_since: float | None = None   # when both agents last went idle together
         self.stalls = 0
+        self.stall_nudges = 0   # stall wake-ups since the worker last ended a turn
         self.plan_sent = False                  # the worker has been given its first instructions
         self._resumed_at = 0.0                   # monotonic time of the last permission decision
         self._flush_tasks: set[asyncio.Task] = set()
@@ -560,12 +572,14 @@ class Bridge:
                 self._record_session(role, payload)
             if pane.started:
                 return {}  # compaction or /clear, possibly mid-turn: not a new idle UI
-            pane.started = True
+            pane.started = pane.launched = True
             self.log(f"{role} session {payload.get('source') or 'started'}")
             if role == ADVERSARY:
                 self.focus(pane)  # the human talks to the supervisor, so it gets the keyboard
             pane.busy = False
             self.schedule_flush(role)
+            if role == WORKER:
+                self._send_direct()   # messages that waited while it was starting (again)
             return {}
         if event == "UserPromptSubmit":
             prompt = payload.get("prompt", "")
@@ -664,6 +678,7 @@ class Bridge:
         else:
             self.adversary_turns += 1
         if role == WORKER:
+            self.stall_nudges = 0
             self.transcript.add("Worker", text or "(no text)")
             self.log(f"worker ended turn: {self._short(text or '(no text)')}")
             # Any permission still pending is moot now: the worker's turn is over.
@@ -819,6 +834,8 @@ class Bridge:
         pane = self.panes[WORKER]
         if not pane.direct or self.paused or self.finished or self.perms or pane.expecting_submit:
             return
+        if not pane.started:
+            return   # starting (or restarting): sent from its SessionStart
         if pane.busy and self._waiting_on_person(pane):
             return  # (an idle worker's message goes through the queue, which checks too)
         if pane.busy:
@@ -964,6 +981,120 @@ class Bridge:
                 self._send_direct()
             else:   # first; mid-turn messages held behind it follow once it's submitted
                 self.schedule_flush(pane.role, delay=0)
+
+    # ── agents that exit ────────────────────────────────────────────────
+    def check_agents(self, now: float | None = None) -> None:
+        """Called every second. An agent whose Claude Code exited on its own (killed for running out
+        of the run's memory, a crash) is started again with its conversation (`--resume`), after
+        RESTART_DELAY seconds doubling with each restart, and the supervisor is told what happened.
+        After MAX_RESTARTS within RESTART_WINDOW it's left down: a managed run closes then, so the
+        manager can start it fresh."""
+        now = time.monotonic() if now is None else now
+        for pane in self.panes.values():
+            if pane.restart_at is not None:
+                if now >= pane.restart_at:
+                    self._restart(pane, now)
+                continue
+            if not pane.launched:
+                continue   # still coming up: the startup watch looks after that
+            state = self.pane_state(pane)
+            if state is not None:
+                self._agent_exited(pane, state, now)
+
+    def _agent_exited(self, pane: Pane, state: str, now: float) -> None:
+        kills = limits.oom_kills(self.cfg)
+        oom = kills is not None and kills > self._oom_seen
+        self._oom_seen = kills if kills is not None else self._oom_seen
+        pane.died = (f"the kernel killed it for running out of the run's memory (limit {self.cfg.memory_max})"
+                     if oom else f"its Claude Code exited ({state})")
+        pane.started, pane.busy, pane.reason, pane.waiting_on = False, True, None, None
+        if pane.expecting_submit:
+            self._requeue_pending(pane, quiet=True)   # whatever was being typed in goes again
+        if pane.role == WORKER:
+            for req in list(self.perms.values()):
+                self._resolve(req, {}, f"request #{req.id} expired (the worker exited)")
+        recent = [t for t in pane.restarts if now - t < RESTART_WINDOW]
+        self.transcript.add(f"{pane.role.capitalize()} exited", pane.died)
+        if len(recent) >= MAX_RESTARTS:
+            pane.restart_at = float("inf")
+            self.log(f"{pane.role}: exited again: {pane.died}. It was started again {len(recent)} times in the "
+                     f"last {RESTART_WINDOW / 60:.0f} minutes, so it's left down"
+                     + ("; closing the run so the manager can start it fresh" if self.cfg.managed else ""))
+            if self.cfg.managed and self.request_stop:
+                self.request_stop()
+            return
+        delay = min(RESTART_DELAY * 2 ** len(recent), 300.0)
+        pane.restart_at = now + delay
+        self.log(f"{pane.role}: {pane.died}; starting it again in {delay:.0f}s with its conversation")
+
+    def _restart(self, pane: Pane, now: float) -> None:
+        pane.restart_at = None
+        pane.restarts.append(now)
+        try:
+            new = self.respawn(pane)
+        except Exception as e:
+            detail = getattr(e, "stderr", None) or e
+            self.log(f"{pane.role}: couldn't start it again ({str(detail).strip()})")
+            self._agent_exited(pane, "it couldn't be started again", now)
+            return
+        if new:
+            pane.target = new
+        self.log(f"{pane.role}: started again (attempt {len(pane.restarts)})")
+        memory = (" It was killed for memory: tell it to keep memory use down from here (one build or test "
+                  "run at a time, nothing heavy in parallel or left running in the background)."
+                  if "memory" in pane.died else "")
+        if pane.role == WORKER:
+            note = (f"The worker stopped: {pane.died}. The bridge started it again with its conversation history, "
+                    "but whatever it was doing was cut off (a command it was running is gone) and it hasn't been "
+                    "told anything since. Check where it got to (read_worker, the repo's state), then give it its "
+                    f"next step; your reply is forwarded to it.{memory}")
+        else:
+            note = (f"Your session stopped: {pane.died}. The bridge started it again with your conversation "
+                    "history. Anything you were in the middle of was cut off, and messages may have been lost "
+                    "either way, so don't assume your last reply reached the worker. Check the worker "
+                    f"(read_worker) and decide the next step; your reply is forwarded to it.{memory}")
+        self.enqueue(ADVERSARY, note, "resume")
+
+    def _tmux_pane_state(self, pane: Pane) -> str | None:
+        """None while the agent's pane runs; otherwise how it ended. Each pane execs into claude, so
+        the pane closes when it exits (or stays, dead, under remain-on-exit)."""
+        try:
+            out = tmux.tmux("display-message", "-p", "-t", pane.target,
+                            "#{pane_id} #{pane_dead} #{pane_dead_status} #{pane_dead_signal}")
+        except subprocess.CalledProcessError:
+            return "its pane closed"
+        parts = out.split()
+        if not parts or parts[0] != pane.target:
+            return "its pane closed"   # tmux resolved the target to some other pane
+        if len(parts) > 1 and parts[1] == "1":
+            return f"signal {parts[3]}" if len(parts) > 3 and parts[3] not in ("", "0") else f"exit status {parts[2] if len(parts) > 2 else '?'}"
+        return None
+
+    def _tmux_respawn(self, pane: Pane) -> str | None:
+        """Start the agent again with its session (`--resume`), in its pane if tmux kept it, else in
+        a new pane beside the other agent (or above the bridge). Returns a new pane's id."""
+        script = str(write_launch_files(self.cfg)[pane.role])
+        try:
+            dead = tmux.tmux("display-message", "-p", "-t", pane.target, "#{pane_id} #{pane_dead}") == f"{pane.target} 1"
+        except subprocess.CalledProcessError:
+            dead = False
+        if dead:
+            tmux.tmux("respawn-pane", "-k", "-t", pane.target, script)
+            new = None
+        else:
+            other = self.panes[ADVERSARY if pane.role == WORKER else WORKER]
+            if self.pane_state(other) is None:
+                # The worker sits left of the supervisor.
+                where = ["-h", "-b"] if pane.role == WORKER else ["-h"]
+                anchor = other.target
+            else:
+                where, anchor = ["-v", "-b"], os.environ.get("TMUX_PANE", "")
+            new = tmux.tmux("split-window", *where, "-P", "-F", "#{pane_id}", "-t", anchor, "-c", self.cfg.repo, script)
+            tmux.tmux("set-option", "-p", "-t", new, "@adversary_label", tmux.PANE_LABELS[pane.role])
+        task = asyncio.get_running_loop().create_task(_startup_watch(self))   # trust dialogs and the like
+        self._flush_tasks.add(task)
+        task.add_done_callback(self._flush_tasks.discard)
+        return new
 
     def _press_enter(self, pane: Pane) -> None:
         try:
@@ -1954,7 +2085,22 @@ class Bridge:
                  f"(worker last turn: {record['worker_last_reason']}, adversary last turn: "
                  f"{record['adversary_last_reason']})")
         for role in screen:
-            self.log(f"STALL: {role} looks idle on screen but its turn never reported Stop (interrupted?)")
+            self.log(f"STALL: {role} looks idle on screen but its turn never reported Stop (interrupted?); "
+                     "treating it as idle")
+            self.panes[role].busy = False   # so what's queued for it can go in
+        a = self.panes[ADVERSARY]
+        waiting_on_people = bool(self.card and (self.card.open or self.card_followup))   # parks instead
+        if self.stall_nudges < STALL_NUDGES and a.started and not a.queue and not waiting_on_people:
+            # Nobody else will move the run on: wake the supervisor (its reply goes to the worker).
+            self.stall_nudges += 1
+            self.enqueue(ADVERSARY, f"The bridge sees you and the worker both idle for {round(idle)}s with the run "
+                         "unfinished, and nothing on its way to either of you, so the run has stopped moving. A "
+                         "message may have been lost. Check the worker (read_worker), then give it its next step "
+                         "(your reply is forwarded to it), call hold if it's rightly waiting on something, or "
+                         "finish if the work is done.", "resume")
+        else:
+            for role in screen:
+                self.schedule_flush(role, delay=0)
         self.transcript.add(f"STALL: both agents idle for {round(idle)}s",
                             f"```json\n{json.dumps(record, indent=2)}\n```")
         line = json.dumps(record) + "\n"
@@ -2254,6 +2400,7 @@ async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file
                     last_status = status
                 bridge.check_stall()
                 bridge.check_undelivered()
+                bridge.check_agents()
                 bridge.check_hold()
                 bridge.check_popups()
                 if bridge.card and not bridge._card_busy:
@@ -2277,7 +2424,7 @@ async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file
         # The window-resized hook pins this pane to a few rows; drop it so the stats aren't clipped.
         subprocess.run(["tmux", "set-hook", "-u", "-w", "-t", window, "window-resized"], capture_output=True)
     bridge.save_state(final=True)
-    await close_agents(bridge, [worker_pane, adversary_pane])
+    await close_agents(bridge, [p.target for p in bridge.panes.values()])   # an agent started again has a new pane
     lines = bridge.save_stats_file(None if bridge.finished else "closed (interrupted)")
     try:
         for line in lines:
