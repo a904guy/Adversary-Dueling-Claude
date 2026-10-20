@@ -35,13 +35,21 @@ def test_enabled_servers_merges_scopes_and_respects_approval(tmp_path):
     assert got["shadowed"]["command"] == "local"                     # local beats user
 
 
-def test_plan_gives_nothing_unless_servers_are_named(tmp_path):
+def test_plan_gives_the_browsers_read_only_unless_told_otherwise(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     _home(repo, user={"chrome-devtools": DEVTOOLS, "firefox": FIREFOX, "adversary": {"command": "evil"}}, chrome=True)
-    for specs in ([], None, ["none"]):
+    for specs in ([], None):                                            # nothing named: the worker's browsers
         p = mcps.plan(specs, repo)
-        assert p.servers == {} and p.allow == [] and not p.chrome
+        assert set(p.servers) == {"chrome-devtools"} and p.chrome       # firefox has no read-only preset
+        assert "mcp__chrome-devtools__take_screenshot" in p.allow and "mcp__claude-in-chrome__find" in p.allow
+        assert not any(t.endswith(("__click", "__fill", "__evaluate_script")) for t in p.allow)
+        assert p.labels == ["chrome-devtools (read-only)", "claude-in-chrome (read-only)"]
+    p = mcps.plan(["none"], repo)
+    assert p.servers == {} and p.allow == [] and not p.chrome
+    _home(repo, user={"firefox": FIREFOX})
+    assert mcps.plan([], repo).allow == []                              # no browser: nothing
+    _home(repo, user={"chrome-devtools": DEVTOOLS, "firefox": FIREFOX, "adversary": {"command": "evil"}}, chrome=True)
     p = mcps.plan(["chrome-devtools", "firefox", "claude-in-chrome"], repo)
     assert set(p.servers) == {"chrome-devtools", "firefox"}
     assert "mcp__chrome-devtools" in p.allow and "mcp__firefox" in p.allow
@@ -74,9 +82,11 @@ def test_launch_files_hand_the_servers_to_the_supervisor_privately(tmp_path):
     run = tmp_path / "run"
     run.mkdir()
     cfg = RunConfig(task="t", repo=str(repo), run_dir=str(run), sock="/s", base_sha="abc")
-    scripts = write_launch_files(cfg)                                   # nothing named: just the bridge's own
-    assert set(json.loads((run / "adversary-mcp.json").read_text())["mcpServers"]) == {"adversary"}
-    assert "--chrome" not in scripts["adversary"].read_text()
+    scripts = write_launch_files(cfg)                                   # nothing named: the browsers, read-only
+    assert set(json.loads((run / "adversary-mcp.json").read_text())["mcpServers"]) == {"adversary", "chrome-devtools"}
+    adv = scripts["adversary"].read_text()
+    assert "mcp__chrome-devtools__take_screenshot" in adv and "--chrome" in adv
+    assert "mcp__chrome-devtools__click" not in adv
     cfg.adversary_mcps = ["chrome-devtools", "claude-in-chrome"]
     scripts = write_launch_files(cfg)
     conf = json.loads((run / "adversary-mcp.json").read_text())["mcpServers"]

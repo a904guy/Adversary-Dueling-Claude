@@ -56,7 +56,7 @@ class RunConfig:
     sessions: dict = field(default_factory=dict)   # role -> Claude Code session ID, for resuming
     git_subdirs: list[str] = field(default_factory=list)   # git repos inside the working folder
     git_subdir_bases: dict = field(default_factory=dict)   # subdir -> its HEAD when the run started
-    adversary_mcps: list[str] = field(default_factory=list)   # --adversary-mcp specs; empty = none
+    adversary_mcps: list[str] = field(default_factory=list)   # --adversary-mcp specs; empty = the browsers, read-only
     cpu_quota: str | None = None    # --cpu-quota, e.g. "100%" (one core): the run's systemd slice (see limits)
     memory_max: str | None = None   # --memory-max, e.g. "3G"
     card: dict | None = None        # the 4ga card this run works ({"id", "url"}); see cardmode
@@ -183,8 +183,9 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
     # doesn't stop at the "New MCP servers found" dialog every launch.
     (run / "adversary-settings.json").write_text(json.dumps(
         {**_hooks(cfg, "adversary", base_events), **mcps.approvals(cfg.repo)}, indent=2))
-    # The supervisor's MCP servers: the bridge's own, plus any named with --adversary-mcp. Its
-    # launch doesn't load the user's servers, so named ones are handed over here.
+    # The supervisor's MCP servers: the bridge's own, plus the worker's browsers read-only (or the
+    # ones named with --adversary-mcp). Its launch doesn't load the user's servers, so they're
+    # handed over here.
     mcp = mcps.plan(cfg.adversary_mcps, cfg.repo)
     _write_private(run / "adversary-mcp.json", json.dumps({
         "mcpServers": {

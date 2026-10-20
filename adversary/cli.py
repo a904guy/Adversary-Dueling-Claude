@@ -282,8 +282,7 @@ def run(a: argparse.Namespace) -> None:
         memory_max=limits.memory_share(1) if a.memory_max == "auto" else a.memory_max,
         workspace=json.loads(Path(a.workspace_info).read_text()) if a.workspace_info else None,
     )
-    if cfg.adversary_mcps:
-        print(f"adversary: MCP servers for the supervisor: {mcp_summary(cfg)}")
+    print(f"adversary: MCP servers for the supervisor: {mcp_summary(cfg)}")
     # Where each inner repo starts, so the closing diff counts its changes with git (respecting
     # its .gitignore) rather than from the folder snapshot.
     os.environ.update(git_safe_env(cfg.safe_dirs()[1:]))
@@ -441,8 +440,7 @@ def resume(a: argparse.Namespace) -> None:
     changed = apply_settings(cfg, a)
     if changed:
         print(f"adversary: changed for this and later sessions: {', '.join(changed)}")
-    if cfg.adversary_mcps:
-        print(f"adversary: MCP servers for the supervisor: {mcp_summary(cfg)}")
+    print(f"adversary: MCP servers for the supervisor: {mcp_summary(cfg)}")
     if os.path.exists(cfg.sock):
         os.remove(cfg.sock)  # left behind by a bridge that didn't exit cleanly
     cfg.save()

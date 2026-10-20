@@ -125,11 +125,23 @@ class McpPlan:
     labels: list[str] = field(default_factory=list)           # "chrome-devtools (read-only)", for logs/prompt
 
 
+def default_specs(repo, home: Path | None = None) -> list[str]:
+    """The browser servers the worker has (Chrome DevTools servers, and Claude in Chrome when it's
+    on by default), each read-only: what the supervisor gets when no --adversary-mcp is given, so
+    it can check the worker's claims in the same browser."""
+    out = [f"{n}:readonly" for n, d in enabled_servers(repo, home).items() if _readonly_tools(n, d)]
+    if chrome_enabled(home):
+        out.append(f"{CHROME}:readonly")
+    return out
+
+
 def plan(specs: list[str] | None, repo, home: Path | None = None, strict: bool = False) -> McpPlan:
-    """What the supervisor gets for `specs` (None/[]/["none"] = nothing). Unknown names raise
-    ValueError when `strict` (at the command line), and are skipped otherwise (a server removed
-    since the run began)."""
+    """What the supervisor gets for `specs`: None/[] = the default_specs browser servers,
+    ["none"] = nothing. Unknown names raise ValueError when `strict` (at the command line), and
+    are skipped otherwise (a server removed since the run began)."""
     specs = [s.strip() for s in (specs or []) if s and s.strip()]
+    if not specs:
+        specs = default_specs(repo, home)
     out = McpPlan()
     if not specs or any(s.lower() == "none" for s in specs):
         if strict and len(specs) > 1:
