@@ -189,3 +189,24 @@ def test_resume_note_for_a_worker_that_never_started():
     note = resume_note(False, "", None, fresh_worker=True)
     assert "fresh session that knows nothing about the task" in note and "complete plan" in note
     assert "both restored" in resume_note(False, "", None)
+
+
+def test_supervisor_runs_in_auto_mode_by_default_and_strict_keeps_the_allowlist(tmp_path):
+    """auto lets it inspect the machine (lsusb, journalctl…) to check claims; strict is the old
+    allowlist-only dontAsk. It can't Edit or Write either way, and its prompt matches its mode."""
+    from adversary.config import write_launch_files
+    cfg = RunConfig(task="t", repo=str(tmp_path), run_dir=str(tmp_path), sock="/s", base_sha="abc")
+    script = write_launch_files(cfg)["adversary"].read_text()
+    role = (tmp_path / "adversary-role.md").read_text()
+    assert "--permission-mode auto" in script and "Edit,Write,NotebookEdit" in script
+    assert "Look, don't change" in role and "allowlist" not in role
+    cfg.adversary_permission_mode = "strict"
+    script = write_launch_files(cfg)["adversary"].read_text()
+    role = (tmp_path / "adversary-role.md").read_text()
+    assert "--permission-mode dontAsk" in script and "Edit,Write,NotebookEdit" in script
+    assert "allowlist" in role and "Look, don't change" not in role
+    a = _parse("run", "do it", "--adversary-permission-mode", "strict")
+    assert a.adversary_permission_mode == "strict"
+    from adversary.cli import apply_settings
+    cfg.adversary_permission_mode = None
+    assert apply_settings(cfg, _parse("resume", "--adversary-permission-mode", "auto")) == ["adversary-permission-mode=auto"]

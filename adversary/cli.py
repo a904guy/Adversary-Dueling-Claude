@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from adversary import limits, mcps, sessions, snapshot, tmux
-from adversary.config import RunConfig, git_safe_env, write_launch_files
+from adversary.config import ADVERSARY_MODES, RunConfig, git_safe_env, write_launch_files
 
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "adversary" / "runs"
 
@@ -272,6 +272,7 @@ def run(a: argparse.Namespace) -> None:
     cfg = RunConfig(
         task=task, repo=str(repo), run_dir=str(run_dir), sock=str(sock_dir / f"adversary-{ts}.sock"),
         base_sha=base_sha, snapshot_dir=snapshot_dir, skip_permissions=a.skip_permissions, worker_permission_mode=a.worker_permission_mode,
+        adversary_permission_mode=a.adversary_permission_mode,
         max_exchanges=a.max_exchanges, worker_model=a.worker_model, adversary_model=a.adversary_model,
         worker_effort=a.worker_effort, adversary_effort=a.adversary_effort,
         verify_cmds=a.verify_cmd or [], session=f"adversary-{ts}", strict_approvals=a.strict_approvals,
@@ -524,6 +525,10 @@ def add_settings(p: argparse.ArgumentParser, resume: bool) -> None:
     perms.add_argument("--worker-permission-mode", choices=PERMISSION_MODES,
                        help="worker permission mode; prompts that remain go to the adversary"
                             + (keep or " (default: auto)"))
+    p.add_argument("--adversary-permission-mode", choices=ADVERSARY_MODES,
+                   help="auto: the supervisor may run ordinary commands (lsusb, ps, journalctl, curl…) to check "
+                        "the worker's claims, with Claude Code stopping risky ones; strict: only its allowlist of "
+                        "read and verify commands. It can't edit files either way" + (keep or " (default: auto)"))
     p.add_argument("--strict-approvals", action=argparse.BooleanOptionalAction, default=d(False),
                    help="ignore user-level settings for the worker so no user allow rule bypasses the adversary" + keep)
     p.add_argument("--max-exchanges", type=int, default=d(30),
@@ -570,7 +575,7 @@ def apply_settings(cfg: RunConfig, a: argparse.Namespace) -> list[str]:
     """Overlay the settings given to `resume` on the run's saved config; return what changed."""
     changed = []
     for name in ("strict_approvals", "max_exchanges", "stall_after", "worker_model", "adversary_model",
-                 "worker_effort", "adversary_effort", "cpu_quota", "memory_max"):
+                 "worker_effort", "adversary_effort", "cpu_quota", "memory_max", "adversary_permission_mode"):
         value = getattr(a, name, None)
         if value is not None and value != getattr(cfg, name):
             setattr(cfg, name, value)

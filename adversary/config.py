@@ -42,6 +42,7 @@ class RunConfig:
     base_sha: str | None
     skip_permissions: bool = False
     worker_permission_mode: str | None = None
+    adversary_permission_mode: str | None = None   # "auto" or "strict" (None: DEFAULT_ADVERSARY_MODE)
     max_exchanges: int = 30   # round trips without the human before the worker is held
     worker_model: str | None = None
     adversary_model: str | None = None
@@ -166,6 +167,30 @@ QUIET_UI = {"skillOverrides": {"auto-mode-setup": "off"}}
 # alias for it), whatever the account's own default model is.
 DEFAULT_WORKER_MODE = "auto"
 DEFAULT_WORKER_MODEL = "opus"
+# The supervisor's Bash: "auto" lets Claude Code's classifier pass ordinary commands (lsusb, ps,
+# journalctl, curl localhost…) so it can check claims about the machine, not just the code, and stop
+# risky ones; "strict" keeps it to the read/verify allowlist. Either way it can't Edit or Write.
+ADVERSARY_MODES = ["auto", "strict"]
+DEFAULT_ADVERSARY_MODE = "auto"
+
+BASH_NOTE = {
+    "auto": (
+        "Your Bash is open to ordinary commands: inspect the machine as well as the code (`lsusb`, `ps`, "
+        "`systemctl status`, `journalctl`, `curl` against the app, running the tests and the program) so "
+        "you can check the worker's claims for yourself. Claude Code stops risky commands; if one is "
+        "denied, find a read-only way to see the same thing. **Look, don't change.** Never edit files, "
+        "install anything, restart services, commit or fix the worker's work yourself, even when it would "
+        "be quicker: if something needs changing, tell the worker. Your job is to direct and verify.\n"),
+    "strict": (
+        "Your Bash access is an allowlist of read and verify commands. Run each one as a single simple "
+        "command, with no `&&`, pipes or redirects. If a command is denied, try a simpler form or use "
+        "Read/Grep/Glob, and don't conclude that Bash is unavailable. You cannot edit files, and you should "
+        "not try. Your job is to direct and verify.\n"),
+}
+
+
+def adversary_mode(cfg: "RunConfig") -> str:
+    return cfg.adversary_permission_mode or DEFAULT_ADVERSARY_MODE
 
 
 def draft_path(cfg: RunConfig, role: str) -> Path:
@@ -210,7 +235,7 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
         }
     }, indent=2))
     # The role prompt, plus a note of the external tools this run's supervisor has.
-    role = (PROMPTS / "adversary_role.md").read_text()
+    role = (PROMPTS / "adversary_role.md").read_text() + "\n" + BASH_NOTE[adversary_mode(cfg)]
     if mcp.labels:
         role += (
             "\n\n## External tools this run\n"
@@ -259,7 +284,8 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
         "--setting-sources", "project",
         "--settings", str(run / "adversary-settings.json"),
         "--mcp-config", str(run / "adversary-mcp.json"),
-        "--permission-mode", "dontAsk",
+        # auto: the classifier passes what's safe (allowed tools skip it); strict: only the allowlist.
+        "--permission-mode", "auto" if adversary_mode(cfg) == "auto" else "dontAsk",
         "--allowedTools", ",".join(allowed),
         "--disallowedTools", "Edit,Write,NotebookEdit,AskUserQuestion",
         "--append-system-prompt-file", str(run / "adversary-role.md"),
