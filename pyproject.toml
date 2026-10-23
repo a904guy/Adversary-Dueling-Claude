@@ -11,6 +11,7 @@ dev = ["pytest", "pytest-asyncio"]
 
 [project.scripts]
 adversary = "adversary.cli:main"
+claude-adversary = "adversary.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]

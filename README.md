@@ -33,7 +33,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 ```
 
-The package has no runtime dependencies beyond the standard library.
+The package has no runtime dependencies beyond the standard library. It installs two names for the same command, `adversary` and `claude-adversary`; use whichever you like.
 
 ## Usage
 
