@@ -167,6 +167,8 @@ QUIET_UI = {"skillOverrides": {"auto-mode-setup": "off"}}
 # alias for it), whatever the account's own default model is.
 DEFAULT_WORKER_MODE = "auto"
 DEFAULT_WORKER_MODEL = "opus"
+# The supervisor's too, rather than the account's default (Fable on some accounts): the latest Opus.
+DEFAULT_ADVERSARY_MODEL = "opus"
 # The supervisor's Bash: "auto" lets Claude Code's classifier pass ordinary commands (lsusb, ps,
 # journalctl, curl localhost…) so it can check claims about the machine, not just the code, and stop
 # risky ones; "strict" keeps it to the read/verify allowlist. Either way it can't Edit or Write.
@@ -296,8 +298,7 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
         adversary += ["--add-dir", str(run / "attachments")]
     if cfg.snapshot_dir:
         adversary += ["--add-dir", cfg.snapshot_dir]
-    if cfg.adversary_model:
-        adversary += ["--model", cfg.adversary_model]
+    adversary += ["--model", cfg.adversary_model or DEFAULT_ADVERSARY_MODEL]
     if cfg.adversary_effort:
         adversary += ["--effort", cfg.adversary_effort]
 

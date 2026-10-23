@@ -538,7 +538,7 @@ def add_settings(p: argparse.ArgumentParser, resume: bool) -> None:
                    help="log a stall when both agents sit idle this long with the run unfinished"
                         + (keep or " (default 120)") + "; 0 = off")
     p.add_argument("--worker-model", help="model for the worker" + (keep or " (default: opus, the latest Opus)"))
-    p.add_argument("--adversary-model", help="model for the adversary" + (keep or " (default: the account's own default)"))
+    p.add_argument("--adversary-model", help="model for the adversary" + (keep or " (default: opus, the latest Opus)"))
     p.add_argument("--worker-effort", choices=EFFORTS, default=d("high"),
                    help="effort level for the worker (claude --effort)" + (keep or "; default: high"))
     p.add_argument("--adversary-effort", choices=EFFORTS, default=d("xhigh"),

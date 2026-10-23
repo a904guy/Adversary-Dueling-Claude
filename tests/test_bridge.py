@@ -1784,7 +1784,7 @@ async def test_a_stalled_card_waiting_on_people_does_not_wake_the_supervisor(rep
     assert not any("the run has stopped moving" in x for _, x in sent)
 
 
-def test_the_worker_defaults_to_auto_mode_and_opus(repo, tmp_path):
+def test_the_worker_defaults_to_auto_mode_and_both_sides_to_opus(repo, tmp_path):
     from adversary.config import write_launch_files
     b, _ = make(repo, tmp_path)
     text = write_launch_files(b.cfg)["worker"].read_text()
@@ -1792,4 +1792,6 @@ def test_the_worker_defaults_to_auto_mode_and_opus(repo, tmp_path):
     b.cfg.worker_permission_mode, b.cfg.worker_model = "acceptEdits", "claude-sonnet-5-5"
     text = write_launch_files(b.cfg)["worker"].read_text()
     assert "--permission-mode acceptEdits" in text and "--model claude-sonnet-5-5" in text
-    assert "--model" not in write_launch_files(b.cfg)["adversary"].read_text()
+    assert "--model opus" in write_launch_files(b.cfg)["adversary"].read_text()   # not the account's default
+    b.cfg.adversary_model = "claude-opus-5-5"
+    assert "--model claude-opus-5-5" in write_launch_files(b.cfg)["adversary"].read_text()
