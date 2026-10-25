@@ -910,6 +910,20 @@ async def test_typed_prompt_beating_a_mid_turn_message_requeues_it(repo, tmp_pat
     assert sent[-1] == (WORKER, "Use the fixtures dir.")
 
 
+async def test_a_compacted_supervisor_is_reminded_of_its_role_and_the_task(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await b.on_hook(WORKER, "SessionStart", {})
+    await b.on_hook(ADVERSARY, "SessionStart", {"source": "startup"})
+    out = await b.on_hook(ADVERSARY, "SessionStart", {"source": "compact"})
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert out["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert "SUPERVISOR" in ctx and f"<task>\n{b.cfg.task}\n</task>" in ctx and "Look, don't change" in ctx
+    assert await b.on_hook(WORKER, "SessionStart", {"source": "compact"}) == {}      # the worker: nothing
+    assert await b.on_hook(ADVERSARY, "SessionStart", {"source": "clear"}) == {}     # a person's /clear
+    b.cfg.adversary_permission_mode = "strict"
+    assert "limited to these command prefixes" in b._adversary_reminder()
+
+
 async def test_adversary_pane_focused_once_loaded(repo, tmp_path):
     b, sent = make(repo, tmp_path)
     await b.on_hook(WORKER, "SessionStart", {})

@@ -27,7 +27,7 @@ from pathlib import Path
 
 from adversary import board as fourga
 from adversary import cardmode, limits, sessions, snapshot, tmux, workspace
-from adversary.config import RunConfig, draft_path, git_safe_env, write_launch_files
+from adversary.config import RunConfig, adversary_mode, draft_path, git_safe_env, write_launch_files
 from adversary.transcript import (Transcript, background_running, latest_progress, find_subagent_log, last_assistant_text, recent_activity,
                                    subagent_finished, subagent_logs, token_usage, turn_had_tool_use, write_report)
 
@@ -279,12 +279,7 @@ class Bridge:
             f"<task>\n{self.cfg.task}\n</task>\n\n"
             f"Repository: {self.cfg.repo}\n{self._baseline_text()}\n"
             f"Worker permissions: {'all tool calls pre-approved (skip-permissions)' if self.cfg.skip_permissions else 'routed to you for approval'}\n\n"
-            "Your Bash access is limited to these command prefixes, each run as ONE simple command "
-            "(no `&&`, `;`, pipes, redirects, loops or `cd`; you are already in the repo): "
-            f"{', '.join(self.cfg.adversary_bash())}. Anything else is denied, which does not mean Bash is "
-            "unavailable. Use Read/Grep/Glob to inspect files, and WebFetch/WebSearch to research "
-            "anything the task points you at that isn't in the repo — a referenced GitHub repo's source "
-            "and docs, an API, a spec. You MUST run the project's tests yourself before calling finish.\n\n"
+            f"{self._bash_text()}\n\n"
             "Study the repository now — and whatever else the task points you at — then END YOUR TURN with "
             "the worker's instructions: the goal in your own words and a concrete plan for how to accomplish "
             "it. That reply is forwarded to the worker verbatim as its first instructions and starts it "
@@ -306,6 +301,41 @@ class Bridge:
             "If the task is too ambiguous to plan without my input, call hold and end your turn with your "
             "question to me instead: nothing reaches the worker until you message_worker, so no half-formed "
             "plan leaks."
+        )
+
+    def _bash_text(self) -> str:
+        if adversary_mode(self.cfg) == "strict":
+            bash = ("Your Bash access is limited to these command prefixes, each run as ONE simple command "
+                    "(no `&&`, `;`, pipes, redirects, loops or `cd`; you are already in the repo): "
+                    f"{', '.join(self.cfg.adversary_bash())}. Anything else is denied, which does not mean Bash "
+                    "is unavailable.")
+        else:
+            bash = ("Your Bash runs ordinary commands, so check the machine as well as the code (`lsusb`, `ps`, "
+                    "`systemctl status`, `journalctl`, `curl` against the app); Claude Code stops risky ones. "
+                    "Look, don't change: never edit, install, restart, commit or fix the worker's work yourself.")
+        return (bash + " Use Read/Grep/Glob to inspect files, and WebFetch/WebSearch to research anything the "
+                "task points you at that isn't in the repo — a referenced GitHub repo's source and docs, an "
+                "API, a spec. You MUST run the project's tests yourself before calling finish.")
+
+    def _adversary_reminder(self) -> str:
+        """Put back what a compaction may have summarised away: the role and the task, verbatim. The
+        role file is the system prompt and survives, but the brief was the first message."""
+        return (
+            "Your conversation was just compacted. A reminder of your role and the task, so nothing in "
+            "the summary has softened or lost them:\n\n"
+            "You are the SUPERVISOR of this run, not the worker. The worker does the work; you plan it, "
+            "direct it, approve or deny its tool calls, and verify every claim yourself (read the code, run "
+            "the tests, check the machine or the page) before believing it. Whatever you end a turn with is "
+            "forwarded to the worker (or posted for people), so end each turn with what the worker should "
+            "do next. Call finish with \"complete\" only after you have verified every requirement "
+            "yourself. Your role instructions in the system prompt still apply in full.\n\n"
+            f"<task>\n{self.cfg.task}\n</task>\n\n"
+            f"Repository: {self.cfg.repo}\n{self._baseline_text()}\n"
+            f"Worker permissions: {'all tool calls pre-approved (skip-permissions)' if self.cfg.skip_permissions else 'routed to you for approval'}\n\n"
+            f"{self._bash_text()}\n\n"
+            "If the summary leaves you unsure where things stand, check before acting: list_agents for "
+            "what's running, read_worker for the worker's latest, changed_files and the diff for the work "
+            "so far."
         )
 
     def _baseline_text(self) -> str:
@@ -571,7 +601,14 @@ class Bridge:
             if not self.cfg.sessions.get(role):
                 self._record_session(role, payload)
             if pane.started:
-                return {}  # compaction or /clear, possibly mid-turn: not a new idle UI
+                # Compaction or /clear, possibly mid-turn: not a new idle UI. After a compaction the
+                # supervisor gets its role and task back at once, as context on the hook's reply.
+                if role == ADVERSARY and payload.get("source") == "compact":
+                    self.log("supervisor compacted: reminded it of its role and the task")
+                    self.transcript.add("Supervisor compacted", "Reminded it of its role and the task.")
+                    return {"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                                   "additionalContext": self._adversary_reminder()}}
+                return {}
             pane.started = pane.launched = True
             self.log(f"{role} session {payload.get('source') or 'started'}")
             if role == ADVERSARY:
