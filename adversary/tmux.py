@@ -3,7 +3,7 @@
 import subprocess
 
 # Pane labels (a user option: Claude Code rewrites the pane title), shown in the pane borders.
-PANE_LABELS = {"worker": "WORKER · does the task", "adversary": "ADVERSARY · reviews & approves (read-only)",
+PANE_LABELS = {"worker": "WORKER · does the task", "adversary": "ADVERSARY · plans, verifies & approves",
                "bridge": "BRIDGE · p pause/resume · s status · q quit"}
 
 
