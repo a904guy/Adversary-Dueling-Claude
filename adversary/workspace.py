@@ -11,8 +11,10 @@ A workspace mirrors the project folder:
 
 The symlinks are named in the repo's info/exclude so a worker's `git add -A` can't commit them
 (a pattern like `node_modules/` doesn't match a symlink). When the card is done, each repo's
-branch is merged into the branch its main checkout is on: main's newer commits are merged into
-the card branch first (a conflict goes back to the run to resolve), then main fast-forwards.
+branch is merged into the branch its main checkout is on: main's newer commits, and the remote's,
+are merged into the card branch first (a conflict goes back to the run to resolve), then main
+fast-forwards. Then
+each repo whose main checkout has a remote has its branch pushed, if it's ahead (see push).
 """
 
 import os
@@ -186,14 +188,22 @@ def merge(info: dict) -> list[str]:
             raise MergeError(_so_far(f"{name}: its main checkout is on {on!r}, not {repo['target']!r}, so "
                                      f"nothing was merged there; check out {repo['target']} in {source}.", done),
                              needs_person=True)
+        # The remote's newer commits come in too (pushed from elsewhere), so the branch pushed
+        # afterwards is a fast-forward there; a conflict with them goes to the worker like any other.
+        incoming = [repo["target"]]
+        if remote := _remote(source, repo["target"]):
+            _network(source, "fetch", "--quiet", remote, repo["target"])
+            if git(source, "rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{repo['target']}", check=False):
+                incoming.append(f"{remote}/{repo['target']}")
         for attempt in range(2):   # main can move on (another card merged) between the two steps
             # Bring the target's newer commits into the card branch, then fast-forward the target.
-            r = subprocess.run(["git", "merge", "--no-edit", repo["target"]], cwd=tree, capture_output=True, text=True)
-            if r.returncode != 0:
-                subprocess.run(["git", "merge", "--abort"], cwd=tree, capture_output=True)
-                raise MergeError(_so_far(f"{name}: {repo['branch']} conflicts with {repo['target']} — merge "
-                                         f"{repo['target']} into it, resolve the conflicts and commit:\n"
-                                         f"{(r.stdout + r.stderr)[:800]}", done))
+            for ref in incoming:
+                r = subprocess.run(["git", "merge", "--no-edit", ref], cwd=tree, capture_output=True, text=True)
+                if r.returncode != 0:
+                    subprocess.run(["git", "merge", "--abort"], cwd=tree, capture_output=True)
+                    raise MergeError(_so_far(f"{name}: {repo['branch']} conflicts with {ref} — merge {ref} into "
+                                             f"it, resolve the conflicts and commit:\n"
+                                             f"{(r.stdout + r.stderr)[:800]}", done))
             r = subprocess.run(["git", "merge", "--ff-only", repo["branch"]], cwd=source, capture_output=True, text=True)
             if r.returncode == 0:
                 break
@@ -203,6 +213,59 @@ def merge(info: dict) -> list[str]:
                                      f"{(r.stdout + r.stderr)[:800]}", done), needs_person=True)
         done.append(f"{name}: {repo['branch']} merged into {repo['target']} ({ahead} commit{'s' if ahead != '1' else ''})")
     return done or ["nothing to merge: no commits on the card branches"]
+
+
+PUSH_TIMEOUT = 120   # seconds; a push that would prompt for credentials fails instead (no terminal)
+
+
+def _remote(source: Path, branch: str) -> str | None:
+    """Where `branch` pushes: its upstream's remote, else origin, else the repo's only remote."""
+    upstream = git(source, "config", f"branch.{branch}.remote", check=False)
+    remotes = git(source, "remote", check=False).split()
+    if upstream in remotes:
+        return upstream
+    if "origin" in remotes:
+        return "origin"
+    return remotes[0] if len(remotes) == 1 else None
+
+
+def _network(cwd: Path, *args: str) -> tuple[bool, str]:
+    """A git command that talks to a remote: never prompts (no terminal to answer), and gives up
+    after PUSH_TIMEOUT. Returns (ok, output)."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "true", "SSH_ASKPASS": "true"}
+    try:
+        r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, env=env,
+                           stdin=subprocess.DEVNULL, timeout=PUSH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {PUSH_TIMEOUT}s"
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def push(info: dict) -> tuple[list[str], list[str]]:
+    """Push each repo's target branch to its remote when it has commits the remote doesn't (the
+    card's merged work, and anything else committed there meanwhile). Returns (pushed, failed),
+    one line per repo; a repo with no remote, or nothing new, is skipped. A failure leaves the
+    merge in place: the work is on the local branch, just not on the remote yet."""
+    pushed: list[str] = []
+    failed: list[str] = []
+    for repo in info["repos"]:
+        name = repo["path"] or Path(info["folder"]).name
+        source, branch = Path(repo["source"]), repo["target"]
+        remote = _remote(source, branch)
+        if not remote:
+            continue
+        _network(source, "fetch", "--quiet", remote, branch)   # what the remote has now
+        has = git(source, "rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{branch}", check=False)
+        ahead = git(source, "rev-list", "--count", f"{remote}/{branch}..{branch}" if has else branch, check=False)
+        if ahead in ("", "0"):
+            continue
+        ok, out = _network(source, "push", remote, f"{branch}:{branch}")
+        n = f"{ahead} commit{'s' if ahead != '1' else ''}"
+        if ok:
+            pushed.append(f"{name}: pushed {branch} to {remote} ({n})")
+        else:
+            failed.append(f"{name}: couldn't push {branch} to {remote} ({n} only on this machine): {out[-600:]}")
+    return pushed, failed
 
 
 def commits(info: dict) -> list[str]:

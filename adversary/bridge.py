@@ -1484,8 +1484,8 @@ class Bridge:
                     self.transcript.add("Merge refused at report_done; sent to the worker", str(e))
                     self.release_hold("the merge needs the worker")
                     fix = ("The supervisor reported this card done, but your work couldn't be merged into main yet:\n\n"
-                           f"{e}\n\nFix this in your workspace (commit everything; for a conflict, merge the target "
-                           "branch into your card branch, resolve the conflicts keeping both sides' intent, run the "
+                           f"{e}\n\nFix this in your workspace (commit everything; for a conflict, merge the branch it names "
+                           "(the target, or the remote's copy of it) into your card branch, resolve the conflicts keeping both sides' intent, run the "
                            "tests, and commit the merge). Then end your turn with what you changed.")
                     self.panes[WORKER].direct.append(fix)
                     self._card_say("Message from the bridge to Worker", fix)
@@ -1493,15 +1493,23 @@ class Bridge:
                     return {"text": f"Not merged, so the card stays open:\n\n{e}\n\nThis was sent to the worker to "
                                     "fix. When it reports back, check the resolution (read the merged files, run "
                                     "the tests), then call report_done again.", "error": True}
+            pushed: list[str] = []
+            push_failed: list[str] = []
+            if self.cfg.workspace:
+                # Merged work goes to each repo's remote too, so it doesn't sit committed on this machine.
+                pushed, push_failed = workspace.push(self.cfg.workspace)
+                for line in pushed + push_failed:
+                    self.log(f"report_done: {self._short(line)}")
             summary = (args.get("summary") or "").strip()
             if open_items and leave:
                 summary += ("\n\n**Left unticked:** " + ", ".join(open_items) + f" — {leave}")
             self.card.followup = False
-            self.card.post(self._done_comment(summary, merged, commits, diff))
+            self.card.post(self._done_comment(summary, merged, commits, diff, pushed, push_failed))
             self._card_said = True   # the turn's closing words would only repeat the Done comment
             self.card.move(fourga.DONE)
             try:
-                self.card.label(fourga.ATTENTION_LABEL, fourga.ATTENTION_COLOR, on=False)
+                # A push that failed needs someone (credentials, or the remote moved on): flag it.
+                self.card.label(fourga.ATTENTION_LABEL, fourga.ATTENTION_COLOR, on=bool(push_failed))
             except fourga.BoardError:
                 pass
             path = self.finish("COMPLETE", summary)
@@ -1515,7 +1523,8 @@ class Bridge:
             return {"text": f"The board refused that ({e}). Try again shortly; if it keeps failing, say so in "
                             "your reply.", "error": True}
 
-    def _done_comment(self, summary: str, merged: list[str], commits: list[str], diff: str | None) -> str:
+    def _done_comment(self, summary: str, merged: list[str], commits: list[str], diff: str | None,
+                      pushed: list[str] = (), push_failed: list[str] = ()) -> str:
         tok = self._session_tokens()["total"] + self._prior_tokens
         facts = [f"ran {self._dur(self._runtime_total())}"]
         if tok:
@@ -1527,6 +1536,11 @@ class Bridge:
         body = f"**Done.**\n\n{summary}"
         if merged:
             body += "\n\n**Merged:**\n" + "\n".join(f"- {m}" for m in merged)
+        if pushed:
+            body += "\n\n**Pushed:**\n" + "\n".join(f"- {p}" for p in pushed)
+        if push_failed:
+            body += ("\n\n**Not pushed (needs someone):**\n" + "\n".join(f"- {p}" for p in push_failed)
+                     + "\n\nThe work is merged locally; push it by hand once that's sorted.")
         if commits:
             shown = commits[-15:]
             body += ("\n\n**Commits:**\n" + ("- …\n" if len(commits) > len(shown) else "")

@@ -99,3 +99,62 @@ def test_nothing_to_merge_and_remove_keeps_real_files(tmp_path):
     assert workspace.merge(info) == ["nothing to merge: no commits on the card branches"]
     workspace.remove(info)
     assert (proj / "notes.txt").read_text() == "keep me" and not (tmp_path / "ws").exists()
+
+
+def test_push_sends_the_merged_branch_to_its_remote_only_when_ahead(tmp_path):
+    remote = tmp_path / "remote.git"
+    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(remote))
+    src = make_repo(tmp_path / "app", {"a.py": "1\n"})
+    git(src, "remote", "add", "origin", str(remote))
+    git(src, "push", "-q", "-u", "origin", "main")
+    info = workspace.create(str(src), str(tmp_path / "ws"), "11")
+    assert workspace.push(info) == ([], [])                            # nothing new: nothing pushed
+    (Path(info["path"]) / "a.py").write_text("card\n")
+    commit_all(Path(info["path"]), "card work")
+    workspace.merge(info)
+    pushed, failed = workspace.push(info)
+    assert failed == [] and pushed == ["app: pushed main to origin (1 commit)"]
+    assert git(remote, "rev-parse", "main") == git(src, "rev-parse", "main")
+    assert workspace.push(info) == ([], [])
+
+
+def test_a_failed_push_is_reported_and_a_repo_without_a_remote_is_skipped(tmp_path):
+    src = make_repo(tmp_path / "app", {"a.py": "1\n"})
+    info = workspace.create(str(src), str(tmp_path / "ws"), "12")
+    (Path(info["path"]) / "a.py").write_text("card\n")
+    commit_all(Path(info["path"]), "card work")
+    workspace.merge(info)
+    assert workspace.push(info) == ([], [])                            # no remote: local only
+    git(src, "remote", "add", "origin", str(tmp_path / "missing.git"))
+    pushed, failed = workspace.push(info)
+    assert pushed == [] and failed and failed[0].startswith("app: couldn't push main to origin")
+
+
+def test_merge_brings_in_commits_pushed_to_the_remote_and_conflicts_go_to_the_run(tmp_path):
+    remote = tmp_path / "remote.git"
+    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(remote))
+    src = make_repo(tmp_path / "app", {"a.py": "1\n", "b.py": "1\n"})
+    git(src, "remote", "add", "origin", str(remote))
+    git(src, "push", "-q", "-u", "origin", "main")
+    other = tmp_path / "other"
+    git(tmp_path, "clone", "-q", str(remote), str(other))
+    (other / "b.py").write_text("pushed elsewhere\n")
+    commit_all(other, "from another machine")
+    git(other, "push", "-q", "origin", "main")
+    info = workspace.create(str(src), str(tmp_path / "ws"), "13")
+    ws = Path(info["path"])
+    (ws / "a.py").write_text("card\n")
+    commit_all(ws, "card work")
+    workspace.merge(info)
+    assert (src / "b.py").read_text() == "pushed elsewhere\n" and (src / "a.py").read_text() == "card\n"
+    pushed, failed = workspace.push(info)
+    assert failed == [] and git(remote, "rev-parse", "main") == git(src, "rev-parse", "main")
+    git(other, "pull", "-q", "--no-rebase", "origin", "main")
+    (other / "a.py").write_text("clash\n")                            # the remote moves again, in the same file
+    commit_all(other, "clash")
+    git(other, "push", "-q", "origin", "main")
+    (ws / "a.py").write_text("card again\n")
+    commit_all(ws, "more card work")
+    with pytest.raises(workspace.MergeError, match="conflicts with origin/main") as e:
+        workspace.merge(info)
+    assert not e.value.needs_person                                   # the worker resolves it
