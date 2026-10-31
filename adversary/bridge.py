@@ -1464,10 +1464,14 @@ class Bridge:
             diff = self._diff_text()   # before merging: the merge brings in other cards' work too
             merged: list[str] = []
             commits: list[str] = []
+            pushed: list[str] = []
+            push_failed: list[str] = []
             if self.cfg.workspace:
                 commits = workspace.commits(self.cfg.workspace)
                 try:
-                    merged = workspace.merge(self.cfg.workspace)
+                    # Merged, then pushed to each repo's remote, so the work (and any conflict
+                    # resolution) doesn't sit committed on this machine only.
+                    merged, pushed, push_failed = workspace.land(self.cfg.workspace)
                 except workspace.MergeError as e:
                     if e.needs_person:
                         # Nothing the worker can fix from its workspace: someone has to act on the real repo.
@@ -1484,22 +1488,19 @@ class Bridge:
                     self.transcript.add("Merge refused at report_done; sent to the worker", str(e))
                     self.release_hold("the merge needs the worker")
                     fix = ("The supervisor reported this card done, but your work couldn't be merged into main yet:\n\n"
-                           f"{e}\n\nFix this in your workspace (commit everything; for a conflict, merge the branch it names "
-                           "(the target, or the remote's copy of it) into your card branch, resolve the conflicts keeping both sides' intent, run the "
-                           "tests, and commit the merge). Then end your turn with what you changed.")
+                           f"{e}\n\nFix this in your workspace: commit everything, and for a conflict, merge the branch "
+                           "it names (the target, or the remote's copy of it) into your card branch, resolve the "
+                           "conflicts keeping both sides' intent, run the tests, and COMMIT the merge. Don't push: "
+                           "once the supervisor reports done again, main is merged and pushed to the remote, your "
+                           "resolution with it. Then end your turn with what you changed.")
                     self.panes[WORKER].direct.append(fix)
                     self._card_say("Message from the bridge to Worker", fix)
                     self._send_direct()
                     return {"text": f"Not merged, so the card stays open:\n\n{e}\n\nThis was sent to the worker to "
                                     "fix. When it reports back, check the resolution (read the merged files, run "
                                     "the tests), then call report_done again.", "error": True}
-            pushed: list[str] = []
-            push_failed: list[str] = []
-            if self.cfg.workspace:
-                # Merged work goes to each repo's remote too, so it doesn't sit committed on this machine.
-                pushed, push_failed = workspace.push(self.cfg.workspace)
-                for line in pushed + push_failed:
-                    self.log(f"report_done: {self._short(line)}")
+            for line in pushed + push_failed:
+                self.log(f"report_done: {self._short(line)}")
             summary = (args.get("summary") or "").strip()
             if open_items and leave:
                 summary += ("\n\n**Left unticked:** " + ", ".join(open_items) + f" — {leave}")

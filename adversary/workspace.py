@@ -148,8 +148,12 @@ def _existing(source: Path, tree: Path, card_id: str) -> dict:
             "start": git(tree, "merge-base", "HEAD", target, check=False) or git(tree, "rev-parse", "HEAD")}
 
 
-def _link_rest(src: Path, ws: Path, repos: set[str], rel: str = "") -> None:
-    """Symlink every entry of src/rel into ws/rel, except repos and the folders leading to them."""
+def _link_rest(src: Path, ws: Path, repos: set[str], rel: str = "", every: set[str] | None = None) -> None:
+    """Symlink every entry of src/rel into ws/rel, except repos and the folders leading to them. A
+    symlink that leads into one of the repos (an `app -> repo/app` shortcut) points into the card's
+    own worktree instead: linked as it is, it would reach the live checkout, and a worker running
+    `cd app && uv sync` there would change the code and virtualenv the live site runs from."""
+    every = repos if every is None else every
     here = src / rel
     depth = len(Path(rel).parts)
     leading = {Path(r).parts[depth] for r in repos}   # (repos holds only those under rel)
@@ -160,14 +164,34 @@ def _link_rest(src: Path, ws: Path, repos: set[str], rel: str = "") -> None:
             continue
         if entry.name in leading and entry.is_dir() and not entry.is_symlink():
             dst.mkdir(exist_ok=True)
-            _link_rest(src, ws, {x for x in repos if x.startswith(r + "/")}, r)
+            _link_rest(src, ws, {x for x in repos if x.startswith(r + "/")}, r, every)
             continue
+        target = _into_worktree(entry, src, ws, every) if entry.is_symlink() else None
+        if target and dst.is_symlink() and os.readlink(dst) != str(target):
+            dst.unlink()   # a workspace made before links were redirected: fix it on reuse
         if not dst.exists() and not dst.is_symlink():
-            dst.symlink_to(entry)
+            dst.symlink_to(target or entry)
 
 
-def merge(info: dict) -> list[str]:
-    """Merge each repo's card branch into its target. Returns what happened, per repo. Raises
+def _into_worktree(link: Path, src: Path, ws: Path, repos: set[str]) -> Path | None:
+    """Where `link` should point in the workspace when it leads into one of the repos, else None."""
+    try:
+        to = link.resolve()
+    except OSError:
+        return None
+    for r in sorted(repos, key=len, reverse=True):
+        try:
+            inside = to.relative_to((src / r).resolve())
+        except ValueError:
+            continue
+        return ws / r / inside
+    return None
+
+
+def merge(info: dict, refresh: frozenset[str] = frozenset()) -> list[str]:
+    """Merge each repo's card branch into its target. Returns what happened, per repo; a repo named
+    in `refresh` goes through it even with nothing new on the card branch, to bring in the
+    remote's newer commits after a push was rejected. Raises
     MergeError when the work isn't committed or doesn't merge cleanly (the message says what to
     fix); repos merged before the failing one stay merged, and the message says which."""
     ws = Path(info["path"])
@@ -180,7 +204,7 @@ def merge(info: dict) -> list[str]:
     done: list[str] = []
     for name, repo, tree in trees:
         ahead = git(tree, "rev-list", "--count", f"{repo['target']}..HEAD", check=False)
-        if ahead in ("", "0"):
+        if ahead in ("", "0") and name not in refresh:
             continue
         source = Path(repo["source"])
         on = git(source, "rev-parse", "--abbrev-ref", "HEAD", check=False)
@@ -266,6 +290,23 @@ def push(info: dict) -> tuple[list[str], list[str]]:
         else:
             failed.append(f"{name}: couldn't push {branch} to {remote} ({n} only on this machine): {out[-600:]}")
     return pushed, failed
+
+
+REJECTED = ("non-fast-forward", "fetch first", "[rejected]")
+
+
+def land(info: dict) -> tuple[list[str], list[str], list[str]]:
+    """merge, then push: (merged, pushed, failed). A push the remote rejects because it moved on in
+    between is merged again (its new commits come into the card branch; a conflict raises
+    MergeError for the worker, like any merge) and pushed once more."""
+    merged = merge(info)
+    pushed, failed = push(info)
+    rejected = frozenset(f.split(":", 1)[0] for f in failed if any(k in f for k in REJECTED))
+    if rejected:
+        merge(info, refresh=rejected)
+        again, failed = push(info)
+        pushed += again
+    return merged, pushed, failed
 
 
 def commits(info: dict) -> list[str]:

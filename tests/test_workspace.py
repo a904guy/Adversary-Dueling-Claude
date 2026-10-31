@@ -158,3 +158,48 @@ def test_merge_brings_in_commits_pushed_to_the_remote_and_conflicts_go_to_the_ru
     with pytest.raises(workspace.MergeError, match="conflicts with origin/main") as e:
         workspace.merge(info)
     assert not e.value.needs_person                                   # the worker resolves it
+
+
+def test_land_merges_again_when_the_remote_moves_before_the_push(tmp_path, monkeypatch):
+    remote = tmp_path / "remote.git"
+    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(remote))
+    src = make_repo(tmp_path / "app", {"a.py": "1\n", "b.py": "1\n"})
+    git(src, "remote", "add", "origin", str(remote))
+    git(src, "push", "-q", "-u", "origin", "main")
+    other = tmp_path / "other"
+    git(tmp_path, "clone", "-q", str(remote), str(other))
+    info = workspace.create(str(src), str(tmp_path / "ws"), "14")
+    (Path(info["path"]) / "a.py").write_text("card\n")
+    commit_all(Path(info["path"]), "card work")
+    real_merge, calls = workspace.merge, []
+
+    def merge_then_remote_moves(i, **kw):
+        out = real_merge(i, **kw)
+        if not calls:                                                  # someone pushes right after our merge
+            (other / "b.py").write_text("raced\n")
+            commit_all(other, "race")
+            git(other, "push", "-q", "origin", "main")
+        calls.append(1)
+        return out
+    monkeypatch.setattr(workspace, "merge", merge_then_remote_moves)
+    merged, pushed, failed = workspace.land(info)
+    assert failed == [] and pushed and len(calls) == 2
+    assert git(remote, "rev-parse", "main") == git(src, "rev-parse", "main")
+    assert (src / "b.py").read_text() == "raced\n" and (src / "a.py").read_text() == "card\n"
+
+
+def test_a_shortcut_into_a_repo_points_at_the_cards_worktree_not_the_live_checkout(tmp_path):
+    """/web/productbuilder/app -> extension/app: a worker's `cd app && uv sync --dev` from the
+    workspace root went through the link to the live checkout and broke the deploy's venv."""
+    proj = tmp_path / "productbuilder"
+    make_repo(proj / "extension", {"app/main.py": "v1\n"})
+    (proj / "app").symlink_to(proj / "extension" / "app")
+    (proj / "wordpress").symlink_to(tmp_path)                          # outside the repos: as it is
+    info = workspace.create(str(proj), str(tmp_path / "ws"), "15")
+    ws = Path(info["path"])
+    assert (ws / "app").resolve() == (ws / "extension" / "app").resolve()
+    assert (ws / "wordpress").resolve() == tmp_path.resolve()
+    (ws / "app").unlink()
+    (ws / "app").symlink_to(proj / "extension" / "app")               # a workspace from before the fix
+    workspace.create(str(proj), str(tmp_path / "ws"), "15")
+    assert (ws / "app").resolve() == (ws / "extension" / "app").resolve()
