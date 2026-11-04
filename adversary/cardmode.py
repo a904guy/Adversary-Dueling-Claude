@@ -22,11 +22,31 @@ def checklist_text(items: list[dict]) -> str:
     return "\n".join(f"{i}. [{'x' if t.get('isCompleted') else ' '}] {t['name']}" for i, t in enumerate(items, 1))
 
 
+LOGS_LINE = re.compile(r"^[ \t]*Click here for logs:.*$", re.M)
+
+
+def without_logs_link(description: str) -> str:
+    """The description people wrote: the live view's link line taken out (it isn't part of the task)."""
+    return LOGS_LINE.sub("", description or "").strip()
+
+
+def with_logs_link(description: str, url: str) -> str | None:
+    """The description with the live view's link: the line updated if it's there, else added at the
+    end. None when it already reads right."""
+    line = f"Click here for logs: {url}"
+    desc = description or ""
+    if LOGS_LINE.search(desc):
+        new = LOGS_LINE.sub(lambda m: line, desc, count=1)
+    else:
+        new = (desc.rstrip() + "\n\n" if desc.strip() else "") + line
+    return None if new == desc else new
+
+
 def task_text(card: dict, comments: list[dict], bot_id: str, url: str, checklist: list[dict] | None = None) -> str:
     """The run's task, from the card: its title, description, checklist and people's comments so far."""
     parts = [f"# {card['name']}", f"(4ga card {card['id']}: {url})"]
-    if (card.get("description") or "").strip():
-        parts.append(card["description"].strip())
+    if without_logs_link(card.get("description") or ""):
+        parts.append(without_logs_link(card["description"]))
     if checklist:
         parts.append("## Checklist on the card (part of the requirements; [x] = ticked)\n\n" + checklist_text(checklist))
     said = [c for c in comments if c.get("userId") != bot_id and fourga.comment_text(c)]
@@ -73,6 +93,15 @@ class CardLink:
                                          "live": self.live, "asked": self.asked,
                                          "checklist": self.checklist, "followup": self.followup,
                                          "status_id": self.status_id}, indent=1))
+
+    def ensure_logs_link(self, url: str) -> str:
+        """Put the live view's link in the card's description (the one edit made to people's
+        descriptions), read just before writing so a person's edit isn't lost. Returns the card's title."""
+        card = self.client.card(self.card_id)
+        new = with_logs_link(card.get("description") or "", url)
+        if new is not None:
+            self.client.update_card(self.card_id, description=new)
+        return card.get("name") or ""
 
     def set_live(self, live: bool) -> None:
         self.live = live

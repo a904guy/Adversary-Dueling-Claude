@@ -211,6 +211,9 @@ class Board:
     def card(self, card_id: str) -> dict:
         return self.call("GET", f"/api/cards/{card_id}")["item"]
 
+    def update_card(self, card_id: str, **fields) -> dict:
+        return self.call("PATCH", f"/api/cards/{card_id}", fields)["item"]
+
     def create_card(self, list_id: str, name: str, description: str | None = None) -> dict:
         body: dict = {"name": name}
         if description:

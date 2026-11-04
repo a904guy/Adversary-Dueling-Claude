@@ -220,10 +220,16 @@ FOURGA_CLIENT_SECRET=...
 - **Active** (green label): on each card with a run attached, kept in step on every pass, so it corrects itself within one pass after a crash. It's for display only: resuming goes by `card.json` (below), which doesn't depend on the board being reachable when a run closes.
 - **The card timer:** runs while the card's run is live and pauses when it's parked, done or cut off, so it adds up the time agents spent on the card. Only cards the manager runs are touched; people's own timers are left alone.
 - **Needs attention** (red label): on a card that needs a person to act before it can move on. That's either one the manager gave up on (3 failed starts or resumes in 30 minutes), or finished work that can't be merged without someone, because the main checkout is on another branch or has local changes in the way. The label comes off when the card's run starts again or the card is done.
-- **Suggested by Agent** (purple label): on cards the supervisor files with `suggest_task`. Those are the only cards an agent writes a description and checklist on; people's descriptions and checklists are never touched. A board's label from before, "Suggested by agent", is renamed to match.
+- **Suggested by Agent** (purple label): on cards the supervisor files with `suggest_task`. Those are the only cards an agent writes a description and checklist on; people's descriptions and checklists are never touched, except for the live view's one link line (below). A board's label from before, "Suggested by agent", is renamed to match.
 - **Suggested by Human** (blue label): on any card in Approved To Do without the Agent label. It was a person's idea, so the manager labels it as soon as it sees it there, including cards still waiting for room in the pool.
 - **Done comment:** the summary, what was merged, the card's commits, and how long it ran, the tokens written, how many feedback requests it made, and the diff.
 - **Cover image:** for visible work (a page, a UI), a supervisor with a browser tool (it has the worker's, read-only) screenshots the result and attaches it as the card's cover with `attach_image`.
+
+**The live view.** Each card run can serve a read-only web page showing the worker, the supervisor and the bridge as they work: every message, thought, tool call and its result, streamed as it happens. On a desktop it's laid out like the tmux window: worker left, supervisor right, the bridge's log along the bottom. On a phone it shows one pane at a time, with a switch at the top. Nothing can be sent from it: changes go through the card, so the card stays the record.
+- **The link** is a line at the end of the card's description, `Click here for logs: https://kabana.hti.dev/live/<host>/<port>/`. It's added when the run starts and updated if the port changes; the line is left out of the task the agents see. When the run isn't running, the link shows "This run isn't live".
+- **How it's reached:** the run's bridge listens with HTTPS on a port of its own (47000-47999, kept across resumes) using the machine's certificate. kabana's Caddy proxies `/live/<host>/<port>/` to it, so the page is on kabana's own address and the browser sends kabana's login cookie with it. Caddy only proxies to the hosts named in its `/live` rule and to that port range; a new server needs adding there.
+- **Who can see it:** the page itself is public (it holds nothing), but its data is only served to someone kabana lets read the card: their token has to work for `GET /api/cards/<id>`, which 4ga allows to the card's board members and the project's managers. Someone signed out is asked to sign in to kabana. Everything the agents see is shown, including command output such as `.env` contents, so treat it like the board itself.
+- **Turning it on:** add `--viewer-host <this machine's name>` to `run_args`. The certificate defaults to Let's Encrypt's for that name (`/etc/letsencrypt/live/<host>/`); give `--viewer-cert` and `--viewer-key` otherwise. The ports only need to accept connections from kabana's server. Without `--viewer-host` nothing changes.
 
 **Surviving restarts.** Each card run records in its `card.json` that it's live, and clears that only when it closes on purpose: parked waiting on people, reported done, or a follow-up answered. On startup, and on every pass after, a card whose run isn't running is picked back up:
 - **In Progress:** resumed, or started fresh if its sessions were never recorded.
@@ -283,6 +289,8 @@ adversary/
   cardmode.py     a card run's side of the board: comments, columns, card prompts
   workspace.py    per-card workspaces (worktrees + links) and the merge into main
   bridge.py       socket server, relay logic, permission routing, caps, status
+  viewer.py       a card run's live view: HTTPS + Server-Sent Events, checked against kabana
+  static/viewer.html   the live view's page
   hook.py         hook command used by both sessions
   mcp_server.py   approve_tool / deny_tool / message_worker / hold / read_worker / list_agents / changed_files / finish (+ request_feedback / report_done / suggest_task on card runs)
   help/           text of the one-time popups (intro, worker-pane tip)

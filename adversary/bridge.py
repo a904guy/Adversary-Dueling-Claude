@@ -14,6 +14,7 @@ import os
 import re
 import shlex
 import signal
+import ssl
 import subprocess
 import sys
 import termios
@@ -26,7 +27,7 @@ from datetime import datetime
 from pathlib import Path
 
 from adversary import board as fourga
-from adversary import cardmode, limits, sessions, snapshot, tmux, workspace
+from adversary import cardmode, limits, sessions, snapshot, tmux, viewer, workspace
 from adversary.config import RunConfig, adversary_mode, draft_path, git_safe_env, write_launch_files
 from adversary.transcript import (Transcript, background_running, latest_progress, find_subagent_log, last_assistant_text, recent_activity,
                                    subagent_finished, subagent_logs, token_usage, turn_had_tool_use, write_report)
@@ -2412,6 +2413,41 @@ async def close_agents(bridge: Bridge, panes: list[str]) -> None:
     await stop_processes(pids, log=bridge.log)
 
 
+async def start_viewer(bridge: Bridge) -> "viewer.Viewer | None":
+    """A card run's live view (see viewer), when this machine has one set up (--viewer-host). It
+    never stops the run: anything that goes wrong is logged and the run carries on without it."""
+    cfg = bridge.cfg
+    if not (bridge.card and cfg.viewer_host):
+        return None
+    cert = cfg.viewer_cert or f"/etc/letsencrypt/live/{cfg.viewer_host}/fullchain.pem"
+    key = cfg.viewer_key or f"/etc/letsencrypt/live/{cfg.viewer_host}/privkey.pem"
+    board_url, card_id = bridge.card.client.url, bridge.card.card_id
+    live = viewer.Viewer(bridge, {WORKER: "Worker", ADVERSARY: "Supervisor"},
+                         check=lambda token: viewer.kabana_check(board_url, card_id, token),
+                         card_url=(cfg.card or {}).get("url") or "")
+    try:
+        port = await live.start(cfg.viewer_port, cert, key)
+    except (OSError, ssl.SSLError) as e:
+        bridge.log(f"live view: couldn't start ({e}); the run carries on without it")
+        return None
+    if port != cfg.viewer_port:
+        cfg.viewer_port = port
+        cfg.save()
+    url = viewer.link(cfg.viewer_base or viewer.DEFAULT_BASE, cfg.viewer_host, port)
+    try:
+        live.title = await asyncio.to_thread(bridge.card.ensure_logs_link, url)
+    except fourga.BoardError as e:
+        bridge.log(f"live view: couldn't put its link on the card: {e}")
+    plain = bridge.log_fn
+
+    def tee(line: str) -> None:   # what the bridge pane shows, the page's bridge strip shows too
+        plain(line)
+        live.bridge_line(line)
+    bridge.log_fn = tee
+    bridge.log(f"live view: {url} (port {port})")
+    return live
+
+
 async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file: str | None = None) -> None:
     cfg = RunConfig.load(run_dir)
     os.environ.update(git_safe_env(cfg.safe_dirs()))   # the bridge's own git calls (diff stats)
@@ -2425,6 +2461,7 @@ async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file
         # a comment gets that comment into its first message, and a Done card's follow-up is known.
         await bridge.card_tick()
     server = await asyncio.start_unix_server(bridge.handle_conn, path=cfg.sock)
+    live = await start_viewer(bridge)
     bridge.log(f"bridge up · run dir {run_dir}")
     bridge.log("keys: p pause/resume relay · s status + stats · q end the run (shows the stats, then closes everything)")
     stop = asyncio.Event()
@@ -2465,6 +2502,8 @@ async def serve(run_dir: str, worker_pane: str, adversary_pane: str, resume_file
             kb.cancel()
     finally:
         watch.cancel()
+        if live:
+            await live.close()
         if os.path.exists(cfg.sock):
             os.remove(cfg.sock)
     # The loop ends on q or a close signal: record the run's final numbers, close the two Claude

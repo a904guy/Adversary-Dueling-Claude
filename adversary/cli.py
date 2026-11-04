@@ -282,6 +282,7 @@ def run(a: argparse.Namespace) -> None:
         cpu_quota=limits.cpu_share(1) if a.cpu_quota == "auto" else a.cpu_quota,
         memory_max=limits.memory_share(1) if a.memory_max == "auto" else a.memory_max,
         workspace=json.loads(Path(a.workspace_info).read_text()) if a.workspace_info else None,
+        viewer_host=a.viewer_host, viewer_cert=a.viewer_cert, viewer_key=a.viewer_key, viewer_base=a.viewer_base,
     )
     print(f"adversary: MCP servers for the supervisor: {mcp_summary(cfg)}")
     # Where each inner repo starts, so the closing diff counts its changes with git (respecting
@@ -558,6 +559,14 @@ def add_settings(p: argparse.ArgumentParser, resume: bool) -> None:
     p.add_argument("--memory-max", metavar="SIZE",
                    help="cap the run's memory the same way, e.g. 3G, or auto for (RAM - 1 GB) shared over the "
                         "pool (manage fills this in for CPU-limited runs)" + (keep or "; default: no cap"))
+    p.add_argument("--viewer-host", metavar="HOST",
+                   help="turn on a card run's live view: this machine's name, as kabana's Caddy reaches it and "
+                        "its TLS certificate names it" + keep)
+    p.add_argument("--viewer-cert", metavar="PEM", help="the live view's certificate (default: "
+                   "/etc/letsencrypt/live/HOST/fullchain.pem)" + keep)
+    p.add_argument("--viewer-key", metavar="PEM", help="its private key (default: .../HOST/privkey.pem)" + keep)
+    p.add_argument("--viewer-base", metavar="URL", help="where the card's link points (default: "
+                   "https://kabana.hti.dev/live)" + keep)
     p.add_argument("--no-attach", action="store_true", help="don't attach to the tmux session")
 
 
@@ -575,7 +584,8 @@ def apply_settings(cfg: RunConfig, a: argparse.Namespace) -> list[str]:
     """Overlay the settings given to `resume` on the run's saved config; return what changed."""
     changed = []
     for name in ("strict_approvals", "max_exchanges", "stall_after", "worker_model", "adversary_model",
-                 "worker_effort", "adversary_effort", "cpu_quota", "memory_max", "adversary_permission_mode"):
+                 "worker_effort", "adversary_effort", "cpu_quota", "memory_max", "adversary_permission_mode",
+                 "viewer_host", "viewer_cert", "viewer_key", "viewer_base"):
         value = getattr(a, name, None)
         if value is not None and value != getattr(cfg, name):
             setattr(cfg, name, value)

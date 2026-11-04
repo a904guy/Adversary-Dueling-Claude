@@ -64,6 +64,14 @@ class RunConfig:
     board_env: str | None = None    # 4ga credentials file for a card run (default ~/.config/adversary/4ga.env)
     workspace: dict | None = None   # a card workspace's repos/branches (see workspace.create)
     managed: bool = False           # launched by `adversary manage`: close by itself when the card is done
+    # The live view of a card run (see viewer): this machine's name as kabana's Caddy reaches it and
+    # its certificate is for, the certificate (default: Let's Encrypt's for viewer_host), where the
+    # links go, and the port it got (kept across resumes so the card's link stays the same).
+    viewer_host: str | None = None
+    viewer_cert: str | None = None
+    viewer_key: str | None = None
+    viewer_base: str | None = None
+    viewer_port: int | None = None
 
     @property
     def card_mode(self) -> bool:
