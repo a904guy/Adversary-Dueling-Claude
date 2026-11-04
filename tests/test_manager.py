@@ -455,3 +455,9 @@ def test_the_manage_config_file(tmp_path):
     f.write_text('[[project]]\nfolder = "/srv/a"\n')
     with pytest.raises(SystemExit):
         load_manage_config(str(f))                                       # a project needs a name or an id
+
+
+def test_a_resume_takes_the_live_view_settings_from_run_args(fake, folder, tmp_path):
+    m, _ = make(fake, folder, tmp_path)
+    m.run_args = ["--cpu-quota", "auto", "--viewer-host", "productbuilder.io", "--viewer-base=https://k/live"]
+    assert m._viewer_args() == ["--viewer-host", "productbuilder.io", "--viewer-base=https://k/live"]

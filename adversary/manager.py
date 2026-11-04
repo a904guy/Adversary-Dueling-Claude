@@ -37,6 +37,9 @@ MAX_FAILS = 3          # launch/resume failures on one card before it's handed t
 FAIL_WINDOW = 1800     # seconds those failures are counted over
 
 
+VIEWER_FLAGS = ("--viewer-host", "--viewer-cert", "--viewer-key", "--viewer-base")
+
+
 @dataclass
 class CardView:
     card: dict
@@ -300,9 +303,20 @@ class Manager:
         self.log(f"card {cid} {view.card['name']!r}: started run {run_dir}")
         return run_dir
 
+    def _viewer_args(self) -> list[str]:
+        """The live view's settings from run_args, which a resumed run takes too: they describe this
+        machine, not the run, so a run started before they were set gets its live view on resume."""
+        out, args = [], self.run_args
+        for i, a in enumerate(args):
+            if a in VIEWER_FLAGS and i + 1 < len(args):
+                out += [a, args[i + 1]]
+            elif a.split("=", 1)[0] in VIEWER_FLAGS:
+                out.append(a)
+        return out
+
     def resume(self, view: CardView, cfg: RunConfig, why: str) -> bool:
         try:
-            self.launcher(["resume", "--run", cfg.run_dir, "--kill", "--no-attach"])
+            self.launcher(["resume", "--run", cfg.run_dir, "--kill", "--no-attach", *self._viewer_args()])
         except Exception as e:
             self._failed(view, "resume the run for", e, cfg)
             return False
