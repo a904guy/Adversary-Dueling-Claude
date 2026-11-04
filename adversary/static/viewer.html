@@ -215,23 +215,33 @@ function select(role) {
   p.jump.classList.toggle("show", !p.stick);
 }
 
+let bulk = false;
+const HISTORY_SHOWN = 2500;   // the latest of the history the page draws on load
 function append(role, el) {
   const p = panes[role]; if (!p) return;
   const empty = $(".empty", p.feed); if (empty) empty.remove();
   p.feed.append(el);
+  if (bulk) return;   // the history: trimmed and scrolled once at the end, not per item (that froze the tab)
   while (p.feed.childElementCount > 3000) p.feed.firstElementChild.remove();
   if (p.stick) p.feed.scrollTop = p.feed.scrollHeight;
 }
+// Folds are measured together once a frame: all the reads, then all the writes, so thousands of
+// them on load cost one layout rather than one each.
+let folds = [];
 function foldable(box, body) {
   box.append(body);
-  requestAnimationFrame(() => {
-    if (body.scrollHeight > 300) {
-      box.classList.add("collapsed");
-      const more = h("button", "more", "Show more");
-      more.onclick = () => { const c = box.classList.toggle("collapsed"); more.textContent = c ? "Show more" : "Show less"; };
-      box.append(more);
-    }
-  });
+  if (!folds.length) requestAnimationFrame(measureFolds);
+  folds.push([box, body]);
+}
+function measureFolds() {
+  const tall = folds.filter(([, body]) => body.isConnected && body.scrollHeight > 300);
+  folds = [];
+  for (const [box] of tall) {
+    box.classList.add("collapsed");
+    const more = h("button", "more", "Show more");
+    more.onclick = () => { const c = box.classList.toggle("collapsed"); more.textContent = c ? "Show more" : "Show less"; };
+    box.append(more);
+  }
 }
 function who(label, ts) { const w = h("div", "who"); w.append(h("span", null, label)); const t = h("time", null, clock(ts)); w.append(t); return w; }
 
@@ -351,7 +361,11 @@ async function load() {
     const a = h("a", null, data.card.title); if (data.card.url) { a.href = data.card.url; a.target = "_blank"; a.rel = "noopener"; } t.append(a);
   }
   build();
-  for (const ev of data.events) render(ev);
+  for (const ev of data.events) if (ev.seq) lastSeq = Math.max(lastSeq, ev.seq);
+  bulk = true;
+  try { for (const ev of data.events.slice(-HISTORY_SHOWN)) { try { render(ev); } catch (e) {} } }
+  finally { bulk = false; }
+  for (const r of roles) { const f = panes[r].feed; while (f.childElementCount > 3000) f.firstElementChild.remove(); }
   showState(data.state || {});
   requestAnimationFrame(() => requestAnimationFrame(() => {   // after the folds have measured
     for (const r of roles) { const p = panes[r]; p.stick = true; p.feed.scrollTop = p.feed.scrollHeight; p.jump.classList.remove("show"); }
