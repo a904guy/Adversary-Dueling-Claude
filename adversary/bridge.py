@@ -488,7 +488,7 @@ class Bridge:
             # Enter again only while the box still starts with our message: never submit
             # something a person typed, or a shell command.
             report = self._draft_report(pane)
-            if report is not None and not str(report.get("head", "")).startswith(header[:40]):
+            if report is not None and not self._head_is_ours(report.get("head", ""), header):
                 self.log(f"{role}: the pasted message never reached the prompt box (it holds something else, "
                          f"or is empty) and wasn't submitted; it was NOT delivered: {self._short(body)}")
                 return
@@ -511,6 +511,15 @@ class Bridge:
             return True
         first = next((l.strip() for l in body.splitlines() if l.strip()), "")[:24]
         return not first or first in " ".join(screen.split())
+
+    @staticmethod
+    def _head_is_ours(head, header: str) -> bool:
+        """Whether the prompt box's opening (the draft mod's `head`) is the bridge's own message:
+        the typed header, or Claude Code's "[Pasted text #1 +18 lines]" placeholder. A session
+        still busy resuming can take the typed header in with the paste, so the box then shows
+        the placeholder alone. Only asked while the bridge waits on its own paste's submit."""
+        h = str(head or "").lstrip()
+        return h.startswith(header[:40]) or h.startswith("[Pasted text")
 
     @staticmethod
     def _body_missing(pending: tuple, prompt: str) -> bool:
@@ -1001,7 +1010,7 @@ class Bridge:
                 continue
             header, body, reason = pane.pending
             report = self._draft_report(pane)
-            if report and report.get("draft") and str(report.get("head", "")).startswith(header[:40]):
+            if report and report.get("draft") and self._head_is_ours(report.get("head", ""), header):
                 # Still in the prompt box, unsubmitted: Enter, not a second copy.
                 pane.pending_at = now
                 self.log(f"{pane.role}: the bridge's message is still unsent in the prompt box; pressing Enter")

@@ -1673,6 +1673,30 @@ async def test_a_lost_delivery_that_is_in_the_session_log_is_not_sent_twice(repo
     assert len(sent) == n and not w.expecting_submit
 
 
+async def test_a_paste_left_as_a_placeholder_in_the_box_is_submitted_not_sent_again(repo, tmp_path, monkeypatch):
+    """productbuilder.io, 15:55: the supervisor's session was still busy resuming and took the typed
+    header in with the paste, so its box showed "[Pasted text #1 +18 lines]" alone. Neither check
+    knew that for the bridge's own message: it was queued to go again, the placeholder was taken
+    for a person's draft, and the run waited on it for an hour."""
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    await stop(b, WORKER, "Phase 1 done.")
+    await submit(b, ADVERSARY, sent)
+    await stop(b, ADVERSARY, "Go ahead with phase 2.")
+    w = b.panes[WORKER]
+    assert w.expecting_submit
+    (tmp_path / "run" / "draft-worker.json").write_text('{"draft": true, "head": "[Pasted text #1 +18 lines]"}')
+    pressed = []
+    monkeypatch.setattr(b, "_press_enter", lambda pane: pressed.append(pane.role))
+    b.test_screen_idle.add("%1")
+    n = len(sent)
+    b.check_undelivered(now=w.pending_at + bridge_mod.UNDELIVERED_AFTER)
+    await settle()
+    assert pressed == [WORKER] and len(sent) == n and w.expecting_submit   # Enter, not a second copy
+    assert bridge_mod.Bridge._head_is_ours("[Pasted text #2 +3 lines]", "Message from your supervisor")
+    assert not bridge_mod.Bridge._head_is_ours("half a thought", "Message from your supervisor")
+
+
 async def test_a_dialog_nobody_closes_is_dismissed(repo, tmp_path, monkeypatch):
     b, sent = make(repo, tmp_path)
     await ready(b, sent)
