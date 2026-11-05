@@ -210,6 +210,7 @@ class Bridge:
         self._card_checked = False   # looked up the card's column at start
         self._card_said = False      # this turn already posted its closing summary (report_done / can't complete)
         self._status_key, self._status_at = "", -1e9   # what the status comment last showed, and when
+        self.live_url: str | None = None   # the run's live view, once it's up: no status comment then
         self.card_followup = False   # resumed for a comment on a Done card; ends when work goes to the worker
         if cfg.card_mode:
             try:
@@ -1696,6 +1697,8 @@ class Bridge:
         return "\n\n---\n\n".join(body for _, body, _ in sides), "|".join(k for _, _, k in sides)
 
     def _update_status(self, now: float) -> None:
+        if self.live_url:
+            return   # the live view shows all of it, and the card links to it
         progress = self._progress()
         if progress is None:
             return
@@ -2453,6 +2456,7 @@ async def start_viewer(bridge: Bridge) -> "viewer.Viewer | None":
         plain(line)
         live.bridge_line(line)
     bridge.log_fn = tee
+    bridge.live_url = url
     bridge.log(f"live view: {url} (port {port})")
     return live
 

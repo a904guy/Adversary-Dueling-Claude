@@ -606,7 +606,7 @@ async def test_a_plan_written_as_the_reply_to_a_comment_doesnt_strand_the_worker
     assert [body for role, _, body in sent if role == ADVERSARY][-1] == nudge   # not nagged again
 
 
-async def test_the_live_comment_shows_both_agents_working_first_edited_while_newest(fake, tmp_path):
+async def test_the_live_comment_shows_both_agents_working_first_and_is_only_ever_edited(fake, tmp_path):
     _, card = board_with_card(fake)
     b, sent = make(fake, tmp_path, card)
     await b.card_tick(now=0)
@@ -643,5 +643,24 @@ async def test_the_live_comment_shows_both_agents_working_first_edited_while_new
     assert "> isqrt done; 18 tests pass." in body and body.count("Now:") == 1   # only the one working
     fake.add_comment(card["id"], "Looks good so far.", user=HUMAN, name="Pat")
     says(slog, "All good; reporting done.", "git log -1")
-    b._update_status(50)                                       # something new since: a new one below
-    assert len(live()) == 2 and "Checking the edge cases" in live()[0] and bot_comments(fake, card)[-1] == live()[-1]
+    b._update_status(50)                                       # comments since: still the same one, edited
+    assert len(live()) == 1 and "All good; reporting done." in live()[0] and fake.edits == 2
+    fake.comments.pop(b.card.status_id)                        # someone deleted it: a new one
+    says(slog, "Reported.", "true")
+    b._update_status(60)
+    assert len(live()) == 1 and "Reported." in live()[0]
+
+
+async def test_no_live_comment_while_the_run_has_a_live_view(fake, tmp_path):
+    _, card = board_with_card(fake)
+    b, sent = make(fake, tmp_path, card)
+    await b.card_tick(now=0)
+    await start(b)
+    log = tmp_path / "worker.jsonl"
+    log.write_text(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "On it."}]}}) + "\n")
+    b._worker_log = lambda: log
+    b._role_log = lambda role: log
+    b.panes[WORKER].busy = True
+    b.live_url = "https://kabana.hti.dev/live/h/47000/"
+    b._update_status(10)
+    assert not [t for t in bot_comments(fake, card) if t.startswith("**Live**")]

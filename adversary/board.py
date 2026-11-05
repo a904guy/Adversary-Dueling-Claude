@@ -325,11 +325,6 @@ class Board:
             if e.status != 404:   # already gone
                 raise
 
-    def newest_comment_id(self, card_id: str) -> str | None:
-        items = self.call("GET", f"/api/cards/{card_id}/comments").get("items") or []
-        return str(max(items, key=lambda c: int(c["id"]))["id"]) if items else None
-
-
 def comment_text(c: dict) -> str:
     return ((c.get("data") or {}).get("text") or "").strip()
 

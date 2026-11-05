@@ -157,10 +157,10 @@ class CardLink:
         return human
 
     def set_status(self, text: str) -> None:
-        """Show `text` as the run's status: edit the status comment while it's the newest comment on
-        the card; once anything newer is posted, leave it be (a record of how things stood then) and
-        post a fresh one at the bottom, so the live status follows the conversation."""
-        if self.status_id and self.client.newest_comment_id(self.card_id) == self.status_id:
+        """Show `text` as the run's status: the one status comment, edited in place for as long as it
+        exists, however many comments come after it. A new one is posted only when there's none yet,
+        or someone deleted it."""
+        if self.status_id:
             try:
                 self.client.edit_comment(self.status_id, text)
                 return
