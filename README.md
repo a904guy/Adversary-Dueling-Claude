@@ -226,7 +226,7 @@ FOURGA_CLIENT_SECRET=...
 - **Cover image:** for visible work (a page, a UI), a supervisor with a browser tool (it has the worker's, read-only) screenshots the result and attaches it as the card's cover with `attach_image`.
 
 **The live view.** Each card run can serve a read-only web page showing the worker, the supervisor and the bridge as they work: every message, thought, tool call and its result, streamed as it happens. On a desktop it's laid out like the tmux window: worker left, supervisor right, the bridge's log along the bottom. On a phone it shows one pane at a time, with a switch at the top. Nothing can be sent from it: changes go through the card, so the card stays the record.
-- **The link** is a line at the end of the card's description, `Click here for logs: https://kabana.hti.dev/live/<host>/<port>/`. It's added when the run starts and updated if the port changes; the line is left out of the task the agents see. When the run isn't running, the link shows "This run isn't live".
+- **The link** is a line at the end of the card's description, `Click here for logs: https://kabana.hti.dev/live/<host>/<port>/`. It's added when the run starts and updated if the port changes; the line is left out of the task the agents see. When the run isn't running (parked, done, restarting), the link shows a page saying so, which checks every 20 seconds and loads the live view once the run is back. kabana's Caddy serves it (`handle_errors` on `/live/*`) from `/etc/caddy/live-down.html`, a copy of `adversary/static/live-down.html`.
 - **No status comment with it:** while a run has a live view, the bridge posts no "Live" status comment on the card; the view and its link stand in for it. A run without one keeps a single status comment, edited in place for the whole run however many comments follow it (a new one only if someone deletes it).
 - **How it's reached:** the run's bridge listens with HTTPS on a port of its own (47000-47999, kept across resumes) using the machine's certificate. kabana's Caddy proxies `/live/<host>/<port>/` to it, so the page is on kabana's own address and the browser sends kabana's login cookie with it. Caddy only proxies to the hosts named in its `/live` rule and to that port range; a new server needs adding there.
 - **Who can see it:** the page itself is public (it holds nothing), but its data is only served to someone kabana lets read the card: their token has to work for `GET /api/cards/<id>`, which 4ga allows to the card's board members and the project's managers. Someone signed out is asked to sign in to kabana. Everything the agents see is shown, including command output such as `.env` contents, so treat it like the board itself.
@@ -292,6 +292,7 @@ adversary/
   bridge.py       socket server, relay logic, permission routing, caps, status
   viewer.py       a card run's live view: HTTPS + Server-Sent Events, checked against kabana
   static/viewer.html   the live view's page
+  static/live-down.html   what kabana's Caddy shows for a /live link whose run isn't running
   hook.py         hook command used by both sessions
   mcp_server.py   approve_tool / deny_tool / message_worker / hold / read_worker / list_agents / changed_files / finish (+ request_feedback / report_done / suggest_task on card runs)
   help/           text of the one-time popups (intro, worker-pane tip)

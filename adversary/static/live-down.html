@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Run not live</title>
+<!-- Served by kabana's Caddy (handle_errors) when /live/<host>/<port>/ can't reach its run: the run is
+     parked, done, or between restarts. It checks again on its own and loads the live view once it's back. -->
+<style>
+:root { --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #5b6475; --line: #dfe3ea; --accent: #2f6fd6; }
+@media (prefers-color-scheme: dark) { :root { --bg: #0f1218; --card: #171b24; --text: #e6e9ef; --muted: #98a1b3; --line: #262c38; --accent: #6ea2ff; } }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px; background: var(--bg); color: var(--text);
+       font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { width: 100%; max-width: 440px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 28px 24px; }
+h1 { margin: 0 0 8px; font-size: 19px; display: flex; align-items: center; gap: 10px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none; }
+p { margin: 0 0 12px; color: var(--muted); }
+.row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; align-items: center; }
+button, a.btn { font: inherit; padding: 7px 14px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: var(--text); cursor: pointer; text-decoration: none; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+#when { font-size: 13px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1><span class="dot"></span>This run isn't live right now</h1>
+  <p>The card's agents aren't running at the moment. They may be waiting on an answer, finished, or restarting.</p>
+  <p>A comment on the card starts them again. This page checks every 20 seconds and shows the live view as soon as the run is back.</p>
+  <div class="row">
+    <button class="primary" id="again">Check now</button>
+    <a class="btn" href="https://kabana.hti.dev/">Open the board</a>
+    <span id="when"></span>
+  </div>
+</main>
+<script>
+const when = document.getElementById("when");
+let left = 20;
+async function check() {
+  when.textContent = "Checking…";
+  try {
+    const r = await fetch(location.href, { method: "HEAD", cache: "no-store", credentials: "same-origin" });
+    if (r.ok) { location.reload(); return; }
+  } catch (e) {}
+  left = 20;
+}
+document.getElementById("again").onclick = check;
+setInterval(() => {
+  if (--left <= 0) { check(); return; }
+  when.textContent = `Next check in ${left}s`;
+}, 1000);
+</script>
+</body>
+</html>
