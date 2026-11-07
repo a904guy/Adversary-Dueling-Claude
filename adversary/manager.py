@@ -324,6 +324,13 @@ class Manager:
         return True
 
     @staticmethod
+    def _resumable(cfg: RunConfig | None) -> bool:
+        """Both agents' sessions were recorded. One that never came up (live: the supervisor quit at
+        its folder-trust dialog while the worker started) has nothing to resume, so its run is started
+        fresh instead; resuming it only fails."""
+        return bool(cfg and cfg.sessions.get("worker") and cfg.sessions.get("adversary"))
+
+    @staticmethod
     def _cut_off(cfg: RunConfig) -> bool:
         """The run stopped while it was still live (see CardLink.live): a crash, reboot or kill."""
         try:
@@ -351,7 +358,7 @@ class Manager:
         the same path, where Claude Code keeps the sessions, from the repos' current main; without
         sessions to resume, the card gets a fresh run instead, its comments in the task."""
         cid = str(view.card["id"])
-        if not cfg.sessions:
+        if not self._resumable(cfg):
             return self._move(view, fourga.IN_PROGRESS) and self.start(view) is not None
         try:
             info = workspace.create(self.folder, cfg.workspace["path"], cid)
@@ -494,12 +501,12 @@ class Manager:
             if cid in live:
                 continue
             if view.column == fourga.norm(fourga.IN_PROGRESS):
-                # A run whose agents never started (it closed at a startup dialog) has nothing to
+                # A run whose agents didn't both start (one closed at a startup dialog) has nothing to
                 # resume: start a fresh one in the same workspace.
-                todo.append(("resume" if cfg and cfg.sessions else "start", view, cfg))
+                todo.append(("resume" if self._resumable(cfg) else "start", view, cfg))
         for cid, view in views.items():
             cfg = runs.get(cid)
-            if cid not in live and cfg and cfg.sessions and view.column == fourga.norm(fourga.NEEDS_FEEDBACK):
+            if cid not in live and self._resumable(cfg) and view.column == fourga.norm(fourga.NEEDS_FEEDBACK):
                 # Parked waiting on people: resumed by a reply. Cut off while live (it may have been
                 # working on what didn't depend on the answer): resumed now.
                 try:

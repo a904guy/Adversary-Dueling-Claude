@@ -203,6 +203,22 @@ def test_a_run_that_never_started_is_started_again_not_resumed(fake, folder, tmp
     assert [c[0] for c in launcher.calls] == ["run"] and fake.column_of(card["id"]) == "In Progress"
 
 
+def test_a_run_whose_supervisor_never_started_is_started_again_not_resumed(fake, folder, tmp_path):
+    """Live: the supervisor quit at its folder-trust dialog while the worker started; resuming
+    "could not find the adversary's Claude Code session" three times, and the card was given up on."""
+    m, launcher = make(fake, folder, tmp_path, pool=1)
+    m.tick()
+    b = next(iter(fake.boards.values()))
+    card = fake.add_card(fake.list_named(b["id"], "Approved To Do")["id"], "t")
+    m.tick()
+    cfg = m.runs()[card["id"]]
+    cfg.sessions = {"worker": "w"}
+    cfg.save()
+    launcher.calls.clear()
+    m.tick()
+    assert [c[0] for c in launcher.calls] == ["run"] and fake.column_of(card["id"]) == "In Progress"
+
+
 def test_people_are_added_to_an_existing_project_and_its_boards(fake, folder, tmp_path):
     p = fake.add_project("AnySite", creator=BOT)
     b = fake.add_board(p["id"], "Later board", lists=fourga.COLUMNS)
@@ -405,7 +421,7 @@ def test_giving_up_on_a_cut_off_run_hands_it_to_people_once(fake, folder, tmp_pa
     card = fake.add_card(fake.list_named(b["id"], "Approved To Do")["id"], "t")
     m.tick()
     cfg = m.runs()[card["id"]]
-    cfg.sessions = {"adversary": "a"}
+    cfg.sessions = {"worker": "w", "adversary": "a"}
     cfg.save()
     _set_state(cfg, live=True, cursor=0)
     fake.cards[card["id"]]["listId"] = fake.list_named(b["id"], "Needs Feedback")["id"]

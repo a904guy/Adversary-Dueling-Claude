@@ -1517,28 +1517,44 @@ async def test_supervisor_reply_reaches_a_busy_worker_mid_turn(repo, tmp_path):
     assert not b.panes[WORKER].queue
 
 
-NEW_TRUST = " Quick safety check\n ❯ No, exit\n   Yes, I trust this folder\n"
-OLD_TRUST = " Quick safety check\n ❯ 1. Yes, I trust this folder\n   2. No, exit\n"
+NEW_TRUST = ["No, exit", "Yes, I trust this folder"]
+OLD_TRUST = ["1. Yes, I trust this folder", "2. No, exit"]
 
 
-@pytest.mark.parametrize("screen,keys", [(NEW_TRUST, ["Down", "Enter"]), (OLD_TRUST, ["Enter"])])
-async def test_trust_dialog_is_accepted_whichever_option_comes_first(repo, tmp_path, monkeypatch, screen, keys):
+@pytest.mark.parametrize("options,lost,keys", [
+    (NEW_TRUST, 0, ["Down", "Enter"]),
+    (OLD_TRUST, 0, ["Enter"]),
+    (NEW_TRUST, 1, ["Down", "Down", "Enter"]),   # the first Down lost as the dialog drew
+])
+async def test_trust_dialog_is_accepted_whichever_option_comes_first(repo, tmp_path, monkeypatch, options, lost, keys):
     """Claude Code 2.1.15x lists "Yes, I trust" first with the cursor on it; newer versions put
-    "No, exit" first. Down+Enter on the older layout picks "No, exit" and the session quits."""
+    "No, exit" first. Enter with the cursor on "No, exit" ends the session: live on 2.1.319 a Down
+    went missing, and the supervisor quit before it started. Enter only goes with the cursor on yes."""
     b, _ = make(repo, tmp_path)
     pressed = {}
+    cursor = {"%1": 0, "%2": 0}
+    drop = {"%1": lost, "%2": lost}
     real_sleep = asyncio.sleep
-    monkeypatch.setattr(bridge_mod.tmux, "capture", lambda target: screen)
-    monkeypatch.setattr(bridge_mod.tmux, "press", lambda target, key: pressed.setdefault(target, []).append(key))
+
+    def screen(target):
+        return " Quick safety check\n" + "".join(
+            f" {'❯' if i == cursor[target] else ' '} {o}\n" for i, o in enumerate(options))
+
+    def press(target, key):
+        pressed.setdefault(target, []).append(key)
+        if key == "Down":
+            if drop[target]:
+                drop[target] -= 1
+            else:
+                cursor[target] = (cursor[target] + 1) % len(options)
+        elif key == "Enter":
+            assert "Yes" in options[cursor[target]], "picked No, exit"
+            b.panes[{"%1": WORKER, "%2": ADVERSARY}[target]].started = True
+
+    monkeypatch.setattr(bridge_mod.tmux, "capture", screen)
+    monkeypatch.setattr(bridge_mod.tmux, "press", press)
     monkeypatch.setattr(bridge_mod.asyncio, "sleep", lambda s: real_sleep(0))
-
-    async def come_up():
-        while not pressed.get("%1") or not pressed.get("%2"):
-            await real_sleep(0)
-        for p in b.panes.values():
-            p.started = True
-
-    await asyncio.gather(bridge_mod._startup_watch(b), come_up())
+    await bridge_mod._startup_watch(b)
     assert pressed == {"%1": keys, "%2": keys}
 
 

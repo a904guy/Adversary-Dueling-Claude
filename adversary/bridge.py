@@ -2333,8 +2333,13 @@ def _cursor_on(screen: str, option: str) -> bool:
 
 
 async def _startup_watch(bridge: Bridge) -> None:
-    """Get each pane past Claude Code's startup dialogs (folder trust, skip-permissions confirm)."""
-    accepted: set[tuple[str, str]] = set()
+    """Get each pane past Claude Code's startup dialogs (folder trust, skip-permissions confirm).
+
+    Enter is pressed only when the screen shows the cursor (❯) on the yes option. Otherwise Down is
+    pressed and the screen read again on the next pass: a key pressed just as the dialog draws can be
+    lost (live, Claude Code 2.1.319: the Down went missing, Enter picked "No, exit" and the supervisor
+    quit before it ever started)."""
+    seen: set[tuple[str, str]] = set()
     for _ in range(120):
         await asyncio.sleep(1)
         waiting = False
@@ -2344,16 +2349,15 @@ async def _startup_watch(bridge: Bridge) -> None:
             waiting = True
             screen = tmux.capture(pane.target)
             for marker, label in (("Yes, I trust this folder", "trust"), ("Yes, I accept", "skip-permissions")):
-                if marker in screen and (role, label) not in accepted:
-                    accepted.add((role, label))
+                if marker not in screen:
+                    continue
+                if (role, label) not in seen:
+                    seen.add((role, label))
                     bridge.log(f"{role}: accepting startup dialog ({label})")
-                    # Claude Code versions order these options differently ("No, exit" first in some,
-                    # "Yes" first with the cursor on it in others): move down only when the cursor (❯)
-                    # isn't already on the yes line, or Enter would pick "No, exit" and end the session.
-                    if not _cursor_on(screen, marker):
-                        tmux.press(pane.target, "Down")
-                        await asyncio.sleep(0.2)
-                    tmux.press(pane.target, "Enter")
+                # Claude Code versions order these options differently ("No, exit" first in some, "Yes"
+                # first with the cursor on it in others).
+                tmux.press(pane.target, "Enter" if _cursor_on(screen, marker) else "Down")
+                break
         if not waiting:
             return
     # Still not up after two minutes: something on screen the bridge doesn't know how to answer. A
