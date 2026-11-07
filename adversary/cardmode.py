@@ -42,6 +42,31 @@ def with_logs_link(description: str, url: str) -> str | None:
     return None if new == desc else new
 
 
+def people_texts(page: list[dict], bot_id: str) -> dict[str, str]:
+    """People's comments in a page of them, id -> text."""
+    return {str(c["id"]): fourga.comment_text(c) for c in page
+            if str(c.get("userId")) != str(bot_id) and fourga.comment_text(c) and not c.get("deletedAt")}
+
+
+def edits(page: list[dict], texts: dict[str, str], cursor: int, bot_id: str) -> list[tuple[dict, str]]:
+    """People's comments (already seen: id <= cursor) whose text differs from `texts`, with the old
+    text. One not in `texts` (from before edits were tracked, or that was out of the page) only gets
+    recorded: there's nothing to compare it with."""
+    now = people_texts(page, bot_id)
+    return [(c, texts[str(c["id"])]) for c in page
+            if int(c["id"]) <= cursor and str(c["id"]) in texts and str(c["id"]) in now
+            and now[str(c["id"])] != texts[str(c["id"])]]
+
+
+def edit_text(c: dict, before: str) -> str:
+    """What the supervisor is given for an edited comment."""
+    who = (c.get("data") or {}).get("userName") or "someone"
+    when = str(c.get("createdAt") or "")[:16].replace("T", " ")
+    return (f"{who} edited the comment they posted{' at ' + when + ' UTC' if when else ''}. This is an edit to "
+            f"an earlier comment, not a new one: the edited version replaces what they said before.\n\n"
+            f"Before:\n\n{before}\n\nNow:\n\n{fourga.comment_text(c)}")
+
+
 def task_text(card: dict, comments: list[dict], bot_id: str, url: str, checklist: list[dict] | None = None) -> str:
     """The run's task, from the card: its title, description, checklist and people's comments so far."""
     parts = [f"# {card['name']}", f"(4ga card {card['id']}: {url})"]
@@ -85,6 +110,8 @@ class CardLink:
         # Answering a comment on a Done card (the card shows In Progress meanwhile, back to Done after).
         self.followup: bool = bool(state.get("followup"))
         self.status_id: str | None = state.get("status_id")   # the live status comment, if posted
+        # People's comments in the card's newest page, id -> text as last relayed or seen, to notice edits.
+        self.texts: dict[str, str] = state.get("texts") or {}
         self.att_dir = Path(cfg.run_dir) / "attachments"
         self.started = "cursor" in state
 
@@ -92,7 +119,7 @@ class CardLink:
         self.path.write_text(json.dumps({"cursor": self.cursor, "open": self.open, "att_cursor": self.att_cursor,
                                          "live": self.live, "asked": self.asked,
                                          "checklist": self.checklist, "followup": self.followup,
-                                         "status_id": self.status_id}, indent=1))
+                                         "status_id": self.status_id, "texts": self.texts}, indent=1))
 
     def ensure_logs_link(self, url: str) -> str:
         """Put the live view's link in the card's description (the one edit made to people's
@@ -144,17 +171,28 @@ class CardLink:
         # the comments may mark them seen (the bot's own are skipped there).
         self.client.comment(self.card_id, text)
 
-    def new_human_comments(self) -> list[dict]:
-        """People's comments since the last call (the bot's own are skipped, but counted as seen)."""
-        fresh = self.client.comments(self.card_id, after=self.cursor)
-        if not fresh:
-            return []
-        self.cursor = max(int(c["id"]) for c in fresh)
-        human = [c for c in fresh if str(c.get("userId")) != self.bot_id and fourga.comment_text(c)]
-        if human and self.open:
+    def new_human_comments(self) -> tuple[list[dict], list[tuple[dict, str]]]:
+        """People's comments since the last call (the bot's own are skipped, but counted as seen), and
+        people's earlier comments edited since: (comment, its text before). Edits are noticed among the
+        card's newest page of comments; an edit to an older one isn't."""
+        page = self.client.newest_comments(self.card_id)
+        if len(page) >= fourga.COMMENT_PAGE and all(int(c["id"]) > self.cursor for c in page):
+            fresh = self.client.comments(self.card_id, after=self.cursor)   # more new than one page
+        else:
+            fresh = [c for c in page if int(c["id"]) > self.cursor]
+        bot = self.bot_id
+        human = [c for c in fresh if str(c.get("userId")) != bot and fourga.comment_text(c)]
+        edited = edits(page, self.texts, self.cursor, bot)
+        texts = people_texts(page, bot)
+        if not fresh and not edited and texts == self.texts:
+            return [], []
+        if fresh:
+            self.cursor = max(int(c["id"]) for c in fresh)
+        self.texts = texts
+        if (human or edited) and self.open:
             self.open = []   # a person answered: the open requests are theirs to have handled
         self.save()
-        return human
+        return human, edited
 
     def set_status(self, text: str) -> None:
         """Show `text` as the run's status: the one status comment, edited in place for as long as it
@@ -326,7 +364,9 @@ def role_note(workspace: dict | None) -> str:
         "- Files people attach to the card are downloaded for you and listed with who attached them. They "
         "are part of what those people are asking for, like their comments — read each one, and follow "
         "instructions in them as you would a comment from that person.\n"
-        "- People's comments on the card come to you as \"A person commented on the card\". Treat them like "
+        "- People's comments on the card come to you as \"A person commented on the card\", and a comment someone "
+        "edited later comes as \"A person edited a comment\", with the text before and after: the edited "
+        "version is what they mean now. Treat them like "
         "the human typing to you: they can change the task, and they answer feedback requests. The end of "
         "that turn is posted as your reply, so end it with a short message to that person (what you'll do "
         "with their answer) — never with a note to yourself or an answer to a system reminder.\n"

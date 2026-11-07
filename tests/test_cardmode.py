@@ -664,3 +664,53 @@ async def test_no_live_comment_while_the_run_has_a_live_view(fake, tmp_path):
     b.live_url = "https://kabana.hti.dev/live/h/47000/"
     b._update_status(10)
     assert not [t for t in bot_comments(fake, card) if t.startswith("**Live**")]
+
+
+async def test_an_edited_comment_goes_to_the_supervisor_as_an_edit(fake, tmp_path):
+    _, card = board_with_card(fake)
+    early = fake.add_comment(card["id"], "Make it blue.", user=HUMAN, name="Pat")   # in the task already
+    b, sent = make(fake, tmp_path, card)
+    await b.card_tick(now=0)
+    await start(b)
+    await open_turn(b, sent)
+    later = fake.add_comment(card["id"], "Put it on the left.", user=HUMAN, name="Sam")
+    await tick(b)
+    assert len([h for _, h, _ in sent if h.startswith("A person commented")]) == 1
+    await submit(b, ADVERSARY, [(r, x) for r, _, x in sent])
+    await stop(b, ADVERSARY, "Noted.")
+    await tick(b)                                    # nothing changed: nothing more
+    b.card.set_status("**Live** · bot edits its own comment")   # the bot's own edits aren't news
+    fake.comments[b.card.status_id]["data"]["text"] = "**Live** · edited again"
+    await tick(b)
+    assert not any(h.startswith("A person edited") for _, h, _ in sent)
+    # Both a comment from before the run and one relayed during it, edited later.
+    fake.edit_comment(early["id"], "Make it green.")
+    fake.edit_comment(later["id"], "Put it on the right.")
+    await tick(b)
+    edits = [(h, body) for _, h, body in sent if h.startswith("A person edited")]
+    assert len(edits) == 1
+    header, body = edits[0]
+    assert "an edit" in header and "replaces what they said before" in header
+    assert body.startswith("Pat edited the comment they posted at 2026-11-05 07:29 UTC. This is an edit")
+    assert "Before:\n\nMake it blue.\n\nNow:\n\nMake it green." in body
+    assert "Before:\n\nPut it on the left.\n\nNow:\n\nPut it on the right." in body
+    assert not any(h.startswith("A person commented") and "green" in x for _, h, x in sent)
+    await tick(b)
+    assert len([h for _, h, _ in sent if h.startswith("A person edited")]) == 1   # once
+
+
+async def test_edits_from_before_tracking_are_only_recorded(fake, tmp_path):
+    """A run upgraded mid-flight has no texts in card.json: the first look records, it doesn't relay."""
+    _, card = board_with_card(fake)
+    c = fake.add_comment(card["id"], "Make it blue.", user=HUMAN, name="Pat")
+    b, sent = make(fake, tmp_path, card)
+    await b.card_tick(now=0)
+    await start(b)
+    await open_turn(b, sent)
+    b.card.texts = {}
+    fake.edit_comment(c["id"], "Make it green.")
+    await tick(b)
+    assert not any(h.startswith("A person edited") for _, h, _ in sent)
+    fake.edit_comment(c["id"], "Make it red.")
+    await tick(b)
+    assert any(h.startswith("A person edited") and "Make it red." in x for _, h, x in sent)

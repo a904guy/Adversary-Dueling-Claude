@@ -147,6 +147,16 @@ def test_resumes_crashed_and_answered_runs_and_stops_pulled_back_ones(fake, fold
     m.alive = lambda s: s == runs[crashed["id"]].session
     m.tick()
     assert [c[:3] for c in launcher.calls] == [["resume", "--run", runs[waiting["id"]].run_dir]]
+    # Parked again, having seen that answer: editing it wakes the run too.
+    answer = max(fake.comments.values(), key=lambda c: int(c["id"]))
+    (Path(runs[waiting["id"]].run_dir) / cardmode.STATE).write_text(json.dumps(
+        {"cursor": int(answer["id"]), "texts": {answer["id"]: "go with option B"}}))
+    launcher.calls.clear()
+    m.tick()
+    assert launcher.calls == []
+    fake.edit_comment(answer["id"], "go with option C")
+    m.tick()
+    assert [c[:3] for c in launcher.calls] == [["resume", "--run", runs[waiting["id"]].run_dir]]
     # A card pulled back to Upcoming has its live run stopped.
     stopped = []
     m.stop = lambda cfg, why: stopped.append((cfg.card["id"], why))

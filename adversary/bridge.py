@@ -468,6 +468,9 @@ class Bridge:
             "perm": "Permission request from the worker (pasted below). Decide it with your tools:",
             "direct": "Message from your supervisor, sent while you were working (pasted below). Follow it as if I wrote it:",
             "human_comment": "A person commented on the card (pasted below). It comes from the people you work for; act on it:",
+            "human_edit": "A person edited a comment they posted earlier on the card (pasted below). It's an edit, "
+                          "not a new comment: the edited version replaces what they said before. It comes from the "
+                          "people you work for; act on it:",
         }.get(kind, "Message from the adversary bridge (pasted below):")
 
     async def _tmux_deliver(self, role: str, header: str, body: str) -> None:
@@ -777,9 +780,9 @@ class Bridge:
             # Not forwarded to the worker. On a card run, what the supervisor said for people (to a
             # person, or while the worker is parked or the run is over) goes on the card.
             said, self._card_said = self._card_said, False
-            if reason in ("user", "human_comment", "worker_msg", "resume", "init") and not self._blank(text) and not said:
+            if reason in ("user", "human_comment", "human_edit", "worker_msg", "resume", "init") and not self._blank(text) and not said:
                 self._card_say("Message from Supervisor", text)
-            if reason == "human_comment" and not self.finished and self._worker_idle():
+            if reason in ("human_comment", "human_edit") and not self.finished and self._worker_idle():
                 # A reply to a person never reaches the worker. If the supervisor wrote the worker's next
                 # step there (common right after a feedback answer), the run would sit still: say so once.
                 self.enqueue(ADVERSARY, "Your reply went on the card for the people; it did NOT reach the worker, "
@@ -1586,10 +1589,10 @@ class Bridge:
                     await asyncio.to_thread(self.card.move, fourga.IN_PROGRESS)
                     self.log("follow-up on a Done card: card in In Progress while answering; the worker waits")
             was_open = bool(self.card.open)
-            fresh, files = [], []
+            fresh, edited, files = [], [], []
             # Each on its own: a failure in one must not lose what the other already marked as seen.
             try:
-                fresh = await asyncio.to_thread(self.card.new_human_comments)
+                fresh, edited = await asyncio.to_thread(self.card.new_human_comments)
             except fourga.BoardError as e:
                 self.log(f"card: couldn't read comments: {e}")
             try:
@@ -1608,6 +1611,12 @@ class Bridge:
                 self.log(f"card comment from {who}: {self._short(text)}")
                 self.transcript.add(f"Card comment from {who}", text)
                 parts.append(f"{who}:\n\n{text}")
+            edit_parts = []
+            for c, before in edited:
+                who = (c.get("data") or {}).get("userName") or "someone"
+                self.log(f"card comment edited by {who}: {self._short(fourga.comment_text(c))}")
+                self.transcript.add(f"Card comment edited by {who}", cardmode.edit_text(c, before))
+                edit_parts.append(cardmode.edit_text(c, before))
             if files:
                 self.log(f"card: {len(files)} file(s) attached: {', '.join(a['name'] for a in files)}")
                 self.transcript.add("Files attached to the card", cardmode.attachments_text(files))
@@ -1617,43 +1626,56 @@ class Bridge:
                 self.transcript.add("Card checklist changed", "\n".join(changes))
                 parts.append("The card's checklist was changed (it's part of the requirements):\n"
                              + "\n".join(f"- {c}" for c in changes))
-            person = bool(fresh or changes)   # comments and checklist edits come from people
+            person = bool(fresh or changes or edited)   # comments, their edits and checklist edits: people
             if person:
                 self._human_spoke()
-                self.human_prompts_count += max(1, len(fresh))
-            if parts:
+                self.human_prompts_count += max(1, len(fresh) + len(edited))
+            edit_said = "\n\n---\n\n".join(edit_parts)
+            if parts or edit_parts:
                 self._parked_since = None
                 said = "\n\n---\n\n".join(parts)
+                spoke = bool(fresh or changes)   # people said something new (not only files, not only edits)
                 queue = self.panes[ADVERSARY].queue
                 queued = next((i for i, (_, r) in enumerate(queue) if r in ("resume", "init")), None)
+                followup = ("This card was already reported Done, and a person has {what} since; that is why the "
+                            "run was resumed. Your reply this turn is posted on the card as your answer — it does "
+                            "NOT go to the worker, which stays idle. If they asked a question, answer it (check the "
+                            "code or your history first). If they want changes or a revision, give the worker the "
+                            "work with message_worker (the card moves back to In Progress), verify it as usual, and "
+                            "call report_done again to merge it. ")
                 if queued is not None:
                     # Not delivered yet (the run is just starting): fold it into the first message, so the
                     # supervisor starts with it rather than reading "no new instructions" and acting on that.
                     body, r = queue[queued]
-                    if not person:
+                    if parts and not spoke:
                         body += "\n\n" + said   # only files: the card's, part of the task
-                    elif self.card_followup and "already reported Done" not in body:
-                        body += ("\n\nThis card was already reported Done, and a person has commented on it since; "
-                                 "that is why the run was resumed. Your reply this turn is posted on the card as "
-                                 "your answer — it does NOT go to the worker, which stays idle. If they asked a "
-                                 "question, answer it (check the code or your history first). If they want changes "
-                                 "or a revision, give the worker the work with message_worker (the card moves back "
-                                 "to In Progress), verify it as usual, and call report_done again to merge it. "
-                                 f"Their comment (it comes from the people you work for):\n\n{said}")
-                    else:
+                    elif parts and self.card_followup and "already reported Done" not in body:
+                        body += ("\n\n" + followup.format(what="commented on it")
+                                 + f"Their comment (it comes from the people you work for):\n\n{said}")
+                    elif parts:
                         body += ("\n\nA person has since commented on the card (this is why the run was resumed; "
                                  f"it comes from the people you work for, so act on it):\n\n{said}")
+                    if edit_said:
+                        if self.card_followup and "already reported Done" not in body:
+                            body += "\n\n" + followup.format(what="edited a comment on it")
+                        body += ("\n\nA person has since edited a comment they posted earlier on the card. It's an "
+                                 "edit, not a new comment: the edited version replaces what they said before (it "
+                                 f"comes from the people you work for, so act on it):\n\n{edit_said}")
                     queue[queued] = (body, r)
-                elif person:
-                    if self._worker_idle():
-                        said += ("\n\n(Your reply to this is posted on the card for them; it does not reach the "
-                                 "worker, which is " + ("on hold" if self.held else "idle") + ". To give the worker "
-                                 "work, use message_worker.)")
-                    self.enqueue(ADVERSARY, said, "human_comment")
                 else:
-                    self.enqueue(ADVERSARY, said + "\n\n(Files only, no comment. Your reply isn't sent to the "
-                                 "worker; use message_worker if it needs them.)", "human_comment")
-            if fresh and was_open:
+                    note = ""
+                    if self._worker_idle():
+                        note = ("\n\n(Your reply to this is posted on the card for them; it does not reach the "
+                                "worker, which is " + ("on hold" if self.held else "idle") + ". To give the worker "
+                                "work, use message_worker.)")
+                    if parts and spoke:
+                        self.enqueue(ADVERSARY, said + note, "human_comment")
+                    elif parts:
+                        self.enqueue(ADVERSARY, said + "\n\n(Files only, no comment. Your reply isn't sent to the "
+                                     "worker; use message_worker if it needs them.)", "human_comment")
+                    if edit_said:
+                        self.enqueue(ADVERSARY, edit_said + note, "human_edit")
+            if (fresh or edited) and was_open:
                 await asyncio.to_thread(self.card.move, fourga.IN_PROGRESS)
         except fourga.BoardError as e:
             self.log(f"card: {e}")

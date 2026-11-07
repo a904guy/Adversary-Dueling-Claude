@@ -51,6 +51,7 @@ SOURCES = [
     ("The worker agent ended its turn", "worker", "Worker"),
     ("Permission request from the worker", "permission", "Permission request"),
     ("A person commented on the card", "person", "Card comment"),
+    ("A person edited a comment", "person", "Card comment edited"),
     ("Message from the adversary bridge", "bridge", "Bridge"),
 ]
 PASTED = re.compile(r'<pasted_content id="[^"]*">\n?|\n?</pasted_content>')

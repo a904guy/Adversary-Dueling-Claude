@@ -190,6 +190,7 @@ FOURGA_CLIENT_SECRET=...
    A message over 8,000 characters is split into numbered parts, at paragraph or line breaks; a code block cut by a split is closed and reopened. 4ga itself takes comments of a million characters, so the split is for reading. Permission requests aren't posted.
 
    People's comments are relayed to the supervisor every 15 seconds, like typing to it.
+   - **Edits.** When a person edits one of their comments, the edited version goes to the supervisor as its own message, headed as an edit to an earlier comment that replaces what they said before, with the text before and after. It counts like a comment: it answers open feedback requests, and it resumes a parked run or a Done card's follow-up. Edits are noticed among the card's newest 50 comments (one request per check); an edit to an older one isn't.
    - **Attachments.** Files people attach are downloaded into the run's `attachments/` folder, which both agents may read (images too). Files already on the card go to the supervisor with its first message, or with the resume message on a resumed run.
    - A file attached later arrives in the same message as the comments found with it, or on its own.
    - The bot's own attachments aren't relayed, and anything over 50 MB is skipped with a note.
@@ -234,8 +235,8 @@ FOURGA_CLIENT_SECRET=...
 
 **Surviving restarts.** Each card run records in its `card.json` that it's live, and clears that only when it closes on purpose: parked waiting on people, reported done, or a follow-up answered. On startup, and on every pass after, a card whose run isn't running is picked back up:
 - **In Progress:** resumed, or started fresh if its sessions were never recorded.
-- **Needs Feedback:** resumed if it was cut off while live (it may have been working on what didn't depend on the answer). If it was parked, it waits for a reply.
-- **Done (within the follow-up window):** resumed if it was cut off mid-follow-up, or when someone comments.
+- **Needs Feedback:** resumed if it was cut off while live (it may have been working on what didn't depend on the answer). If it was parked, it waits for a reply, or for someone to edit a comment the run has seen.
+- **Done (within the follow-up window):** resumed if it was cut off mid-follow-up, or when someone comments or edits a comment.
 
 Resumes come before new work in the pool. To start the manager at boot and restart it if it dies, use `examples/adversary-manage@.service`, one instance per project. Its `KillMode=process` makes restarting the manager leave the runs' tmux sessions alone.
 

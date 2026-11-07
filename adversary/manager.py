@@ -368,14 +368,21 @@ class Manager:
         self.log(f"card {cfg.card['id']}: stopped run {Path(cfg.run_dir).name} ({why})")
 
     def _replied(self, cfg: RunConfig) -> bool:
-        """A person commented on the card after the run last looked (its card.json cursor)."""
+        """A person commented on the card after the run last looked (its card.json cursor), or edited
+        one of their comments it had seen (among the card's newest page of comments)."""
         try:
-            cursor = int(json.loads((Path(cfg.run_dir) / cardmode.STATE).read_text()).get("cursor") or 0)
+            state = json.loads((Path(cfg.run_dir) / cardmode.STATE).read_text())
         except (OSError, ValueError):
-            cursor = 0
+            state = {}
+        cursor = int(state.get("cursor") or 0)
         bot = str(self.client.me()["id"])
-        return any(str(c.get("userId")) != bot and fourga.comment_text(c)
-                   for c in self.client.comments(cfg.card["id"], after=cursor))
+        page = self.client.newest_comments(cfg.card["id"])
+        if cardmode.edits(page, state.get("texts") or {}, cursor, bot):
+            return True
+        if len(page) >= fourga.COMMENT_PAGE and all(int(c["id"]) > cursor for c in page):
+            page = self.client.comments(cfg.card["id"], after=cursor)
+        return any(int(c["id"]) > cursor and str(c.get("userId")) != bot and fourga.comment_text(c)
+                   for c in page)
 
     # ── the Active label ────────────────────────────────────────────────
     def _label(self, full: dict, name: str, color: str) -> str:

@@ -73,9 +73,17 @@ class Fake4ga:
         return c
 
     def add_comment(self, card_id, text, user=HUMAN, name="Pat"):
-        c = {"id": self.nid(), "cardId": card_id, "userId": user, "data": {"text": text, "userName": name}}
+        c = {"id": self.nid(), "cardId": card_id, "userId": user, "data": {"text": text, "userName": name},
+             "createdAt": "2026-11-05T07:29:59.000Z", "updatedAt": None, "deletedAt": None}
         self.comments[c["id"]] = c
         return c
+
+    def edit_comment(self, comment_id, text):
+        """A person editing their comment in the web UI."""
+        c = self.comments[comment_id]
+        c["data"]["text"] = text
+        c["updatedAt"] = "2026-11-05T08:00:00.000Z"
+        c["updatedById"] = c["userId"]
 
     def add_attachment(self, card_id, name, data: bytes, user=HUMAN):
         a = {"id": self.nid(), "cardId": card_id, "name": name, "createdById": user}
@@ -240,6 +248,7 @@ class Fake4ga:
             if c["userId"] != BOT:
                 return 403, {"code": "E_FORBIDDEN"}
             c["data"]["text"] = body["text"]
+            c["updatedAt"], c["updatedById"] = "2026-11-05T08:00:00.000Z", BOT
             self.edits = getattr(self, "edits", 0) + 1
             return 200, {"item": c}
         if method == "DELETE" and (r := m(r"/api/comments/(\d+)")):

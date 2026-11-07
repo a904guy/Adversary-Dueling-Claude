@@ -33,6 +33,7 @@ UPCOMING, SUGGESTED, APPROVED, IN_PROGRESS, NEEDS_FEEDBACK, DONE = (
 COLUMNS = [UPCOMING, SUGGESTED, APPROVED, IN_PROGRESS, NEEDS_FEEDBACK, DONE]
 ACTIVE = [SUGGESTED, APPROVED, IN_PROGRESS, NEEDS_FEEDBACK, DONE]
 GAP = 65535   # 4ga's position gap
+COMMENT_PAGE = 50   # comments per page from 4ga
 # The card label the manager keeps on every card with a run attached, so people can see which are.
 ACTIVE_LABEL, ACTIVE_COLOR = "Active", "#2e7d32"
 # On a card that needs a person to act before it can move on (the manager gave up on it, or its work
@@ -307,10 +308,15 @@ class Board:
             items = self.call("GET", f"/api/cards/{card_id}/comments{q}").get("items") or []
             fresh = [c for c in items if int(c["id"]) > after]
             out += fresh
-            if len(fresh) < len(items) or len(items) < 50:
+            if len(fresh) < len(items) or len(items) < COMMENT_PAGE:
                 break
             before = items[-1]["id"]
         return sorted(out, key=lambda c: int(c["id"]))
+
+    def newest_comments(self, card_id: str) -> list[dict]:
+        """The card's newest page of comments (up to COMMENT_PAGE), oldest first: one request."""
+        items = self.call("GET", f"/api/cards/{card_id}/comments").get("items") or []
+        return sorted(items, key=lambda c: int(c["id"]))
 
     def comment(self, card_id: str, text: str) -> dict:
         return self.call("POST", f"/api/cards/{card_id}/comments", {"text": text})["item"]
