@@ -870,6 +870,17 @@ async def test_teammate_message_is_a_notification_not_human(repo, tmp_path):
     assert not b.panes[WORKER].human_prompts and b.exchanges == 3
 
 
+async def test_a_subagent_report_is_labelled_as_one_not_as_the_human(repo, tmp_path):
+    b, sent = make(repo, tmp_path)
+    await ready(b, sent)
+    report = ('<agent-message from="a2edf428e2d0725f7">\n[Subagent hand-back] The text below is the final '
+              'report of a subagent this session delegated to.\n  I could not read the license page.\n</agent-message>')
+    await b.on_hook(ADVERSARY, "UserPromptSubmit", {"prompt": report})
+    text = (tmp_path / "run" / "transcript.md").read_text()
+    assert "Subagent report → adversary" in text and "Human → adversary" not in text
+    assert b.human_prompts_count == 1                     # only the label changes; it still counts as before
+
+
 async def test_invisible_replies_count_as_empty(repo, tmp_path):
     b, sent = make(repo, tmp_path)
     await ready(b, sent)

@@ -550,6 +550,14 @@ class Bridge:
                 or "<teammate-message" in p[:200])
 
     @staticmethod
+    def _is_subagent_report(prompt: str) -> bool:
+        """A subagent's final report handed back to the pane (an <agent-message> block). Only its
+        label differs: it's logged and transcribed as a subagent report, not as the human typing,
+        but it's otherwise handled like typed input (counters included)."""
+        p = prompt.lstrip()
+        return p.startswith("<agent-message") and "[Subagent hand-back]" in p[:300]
+
+    @staticmethod
     def _is_delivery(pending: tuple, prompt: str) -> bool:
         """Whether a submitted prompt is the bridge's paste rather than something a person typed.
 
@@ -670,8 +678,12 @@ class Bridge:
                 self._human_spoke()
                 self.human_prompts_count += 1
                 pane.human_prompts.append(prompt)
-                self.log(f"human typed into {role}: {self._short(prompt)}")
-                self.transcript.add(f"Human → {role}", prompt)
+                if self._is_subagent_report(prompt):
+                    self.log(f"subagent report into {role}: {self._short(prompt)}")
+                    self.transcript.add(f"Subagent report → {role}", prompt)
+                else:
+                    self.log(f"human typed into {role}: {self._short(prompt)}")
+                    self.transcript.add(f"Human → {role}", prompt)
             return {}
         if event == "Stop":
             if pane.expecting_submit and pane.pending and pane.pending[2] != "direct":
