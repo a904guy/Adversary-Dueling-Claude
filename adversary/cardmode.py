@@ -207,6 +207,16 @@ class CardLink:
         self.status_id = str(self.client.comment(self.card_id, text)["id"])
         self.save()
 
+    def clear_status(self) -> bool:
+        """Delete the run's status comment, if it posted one (a live view replaces it). Returns whether
+        there was one. One someone already deleted counts as gone."""
+        if not self.status_id:
+            return False
+        self.client.delete_comment(self.status_id)
+        self.status_id = None
+        self.save()
+        return True
+
     def new_attachments(self) -> list[dict]:
         """Files people attached to the card since the last call, downloaded into the run's
         attachments/ folder: [{"name", "who", "path"}], or "error" in place of "path" when the

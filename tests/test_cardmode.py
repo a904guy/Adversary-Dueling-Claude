@@ -688,6 +688,37 @@ async def test_no_live_comment_while_the_run_has_a_live_view(fake, tmp_path):
     assert not [t for t in bot_comments(fake, card) if t.startswith("**Live**")]
 
 
+async def test_a_run_set_up_with_a_live_view_posts_no_status_before_it_is_up(fake, tmp_path):
+    # A Done card's comment resumes the run: its first card check comes before the live view starts,
+    # with the last session's activity at hand. It posted a "Live" comment in that moment.
+    _, card = board_with_card(fake)
+    b, sent = make(fake, tmp_path, card, viewer_host="kabana.hti.dev")
+    await b.card_tick(now=0)
+    await start(b)
+    log = tmp_path / "worker.jsonl"
+    log.write_text(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "On it."}]}}) + "\n")
+    b._worker_log = lambda: log
+    b._role_log = lambda role: log
+    b.panes[WORKER].busy = True
+    assert b.live_url is None
+    b._update_status(10)
+    assert not [t for t in bot_comments(fake, card) if t.startswith("**Live**")]
+    b.live_expected = False   # the live view couldn't start: the status comment stands in for it
+    b._update_status(20)
+    assert [t for t in bot_comments(fake, card) if t.startswith("**Live**")]
+
+
+async def test_an_old_status_comment_is_removed(fake, tmp_path):
+    _, card = board_with_card(fake)
+    b, sent = make(fake, tmp_path, card)
+    await b.card_tick(now=0)
+    assert not b.card.clear_status()
+    b.card.set_status("**Live** · from an older run")
+    assert b.card.clear_status()
+    assert b.card.status_id is None
+    assert not [t for t in bot_comments(fake, card) if t.startswith("**Live**")]
+
+
 async def test_an_edited_comment_goes_to_the_supervisor_as_an_edit(fake, tmp_path):
     _, card = board_with_card(fake)
     early = fake.add_comment(card["id"], "Make it blue.", user=HUMAN, name="Pat")   # in the task already
