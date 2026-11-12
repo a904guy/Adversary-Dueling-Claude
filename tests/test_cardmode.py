@@ -197,7 +197,7 @@ def test_card_launch_files_give_each_side_its_tools(tmp_path):
     assert "adversary/card-9" in (tmp_path / "worker-role.md").read_text()
     assert "report_done" in (tmp_path / "adversary-role.md").read_text()
     allow = json.loads((tmp_path / "worker-settings.json").read_text())["permissions"]["allow"]
-    assert allow == ["mcp__adversary__request_feedback"]
+    assert allow == ["mcp__adversary__request_feedback", "mcp__adversary__add_checklist_item"]
 
 
 def test_mcp_server_offers_tools_by_role(monkeypatch):
@@ -209,7 +209,7 @@ def test_mcp_server_offers_tools_by_role(monkeypatch):
     monkeypatch.setenv("ADVERSARY_CARD", "1")
     assert {"report_done", "request_feedback", "suggest_task"} <= {t["name"] for t in mcp_server.tools()}
     monkeypatch.setenv("ADVERSARY_ROLE", "worker")
-    assert [t["name"] for t in mcp_server.tools()] == ["request_feedback"]
+    assert [t["name"] for t in mcp_server.tools()] == ["request_feedback", "add_checklist_item"]
 
 
 def test_a_run_not_launched_by_the_manager_has_no_card_anything(tmp_path):
@@ -507,6 +507,28 @@ async def test_the_supervisor_can_add_checklist_items_without_them_echoing_back(
     await tick(b)
     assert not any(h.startswith("A person commented") for _, h, _ in sent)   # its own additions aren't news
     assert b.on_mcp("tick_checklist", {"item": "Write the tests"})["text"] == "Ticked: Write the tests"
+
+
+async def test_the_worker_can_add_checklist_items_but_only_the_supervisor_ticks_them(fake, tmp_path):
+    _, card = board_with_card(fake)
+    b, sent = make(fake, tmp_path, card)
+    await b.card_tick(now=0)
+    await start(b)
+    await open_turn(b, sent)
+    assert not b.on_mcp("add_checklist_item", {"name": "Build the pages"}, role=WORKER).get("error")
+    assert [t["name"] for t in fake.tasks if t["cardId"] == card["id"]] == ["Build the pages"]
+    assert b.on_mcp("tick_checklist", {"item": "1"}, role=WORKER)["error"]
+    assert not fake.tasks[0].get("isCompleted")
+    assert b.on_mcp("tick_checklist", {"item": "1"})["text"] == "Ticked: Build the pages"
+    await tick(b)
+    assert not any(h.startswith("A person commented") for _, h, _ in sent)   # the worker's additions aren't news
+    assert "Worker added a checklist item" in (tmp_path / "run" / "transcript.md").read_text()
+
+
+def test_the_workers_tool_server_offers_asking_and_adding_checklist_items(monkeypatch):
+    from adversary import mcp_server
+    monkeypatch.setenv("ADVERSARY_ROLE", "worker")
+    assert [t["name"] for t in mcp_server.tools()] == ["request_feedback", "add_checklist_item"]
 
 
 async def test_several_comments_between_checks_arrive_together_once(fake, tmp_path):

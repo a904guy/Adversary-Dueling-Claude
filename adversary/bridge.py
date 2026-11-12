@@ -1402,7 +1402,7 @@ class Bridge:
         if not self.card:
             return {"text": "This run isn't tied to a reachable card" + (" (see the bridge log)" if self.cfg.card else "")
                             + ", so there's no board to report to.", "error": True}
-        if role != ADVERSARY and tool != "request_feedback":
+        if role != ADVERSARY and tool not in ("request_feedback", "add_checklist_item"):
             return {"text": f"{tool} is the supervisor's tool.", "error": True}
         try:
             if tool == "request_feedback":
@@ -1447,7 +1447,8 @@ class Bridge:
                 if not name:
                     return {"text": "name is empty.", "error": True}
                 self.card.add_item(name)
-                self.transcript.add("Checklist item added", name)
+                who = "Supervisor" if role == ADVERSARY else "Worker"
+                self.transcript.add(f"{who} added a checklist item", name)
                 return {"text": f"Added to the checklist: {name}"}
             if tool == "attach_image":
                 path = Path(str(args.get("path") or "")).expanduser()

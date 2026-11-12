@@ -137,7 +137,7 @@ TOOLS = [
 ]
 
 # On a card run (ADVERSARY_CARD=1) the supervisor also gets these; the worker's own copy of this
-# server (ADVERSARY_ROLE=worker) offers request_feedback alone.
+# server (ADVERSARY_ROLE=worker) offers WORKER_CARD_TOOLS.
 CARD_TOOLS = [
     {
         "name": "request_feedback",
@@ -207,8 +207,8 @@ CARD_TOOLS = [
     {
         "name": "add_checklist_item",
         "description": (
-            "Add an item to the end of the card's checklist. On a card without one, lay out your plan's main "
-            "steps as you hand off; on any card, add a step you discover. You can't rename or remove items."
+            "Add an item to the end of the card's checklist: a step of the plan, or one you discover as you go. "
+            "Only the supervisor ticks items, once it has checked them. You can't rename or remove items."
         ),
         "inputSchema": {
             "type": "object",
@@ -234,9 +234,14 @@ CARD_TOOLS = [
 ]
 
 
+# The worker's copy of the server: ask people, and add steps to the card's checklist (only the
+# supervisor ticks them, once it has checked the work).
+WORKER_CARD_TOOLS = ("request_feedback", "add_checklist_item")
+
+
 def tools() -> list[dict]:
     if os.environ.get("ADVERSARY_ROLE") == "worker":
-        return [t for t in CARD_TOOLS if t["name"] == "request_feedback"]
+        return [t for t in CARD_TOOLS if t["name"] in WORKER_CARD_TOOLS]
     return TOOLS + (CARD_TOOLS if os.environ.get("ADVERSARY_CARD") else [])
 
 

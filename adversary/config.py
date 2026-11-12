@@ -219,7 +219,8 @@ def write_launch_files(cfg: RunConfig) -> dict[str, Path]:
     if cfg.card_mode:
         # The worker's request_feedback reaches the bridge through its own copy of the bridge's MCP
         # server, which offers it nothing else; the call itself needs no approval.
-        worker_settings["permissions"] = {"allow": ["mcp__adversary__request_feedback"]}
+        worker_settings["permissions"] = {"allow": ["mcp__adversary__request_feedback",
+                                                    "mcp__adversary__add_checklist_item"]}
         (run / "worker-mcp.json").write_text(json.dumps({"mcpServers": {"adversary": {
             "command": sys.executable, "args": ["-m", "adversary.mcp_server"],
             "env": {"ADVERSARY_SOCK": cfg.sock, "ADVERSARY_ROLE": "worker", "PYTHONPATH": pkg_root}}}}, indent=2))
