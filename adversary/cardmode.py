@@ -386,9 +386,11 @@ def role_note(workspace: dict | None) -> str:
         "- The card's checklist (if it has one) is part of the requirements. When you have verified an item "
         "yourself, tick it with `tick_checklist(item)` (its number or name) so the card shows progress; never "
         "tick on the worker's word alone. Changes people make to it come to you like comments. "
-        "`add_checklist_item(name)` adds an item: on a card with no checklist, lay out your plan's main steps "
-        "as one when you hand off (a handful, not every detail), and add a step you discover later. Never "
-        "rename or remove items — the people's items are theirs.\n"
+        "`add_checklist_item(name)` adds an item: lay out your plan's main steps on the card yourself when you "
+        "hand off (a handful, not every detail), beside any items people already put there, and add a step "
+        "you discover later. The checklist tools are yours alone: the worker can't add or tick items, so never "
+        "ask it to; tick each step yourself once you've verified it. Never rename or remove items — the "
+        "people's items are theirs.\n"
         "- `attach_image(path, cover)`: attach an image (a screenshot) to the card. When the work is visible "
         "(a page, a UI, a chart) and you have a browser tool, screenshot the finished result — save it under "
         "the run's attachments folder — and attach it with cover=true before report_done, so the card shows "
@@ -410,4 +412,7 @@ def worker_note(workspace: dict | None) -> str:
             "Your task comes from a card on the team's 4ga board, and a supervisor reviews your work.\n"
             "- If you need a person (not the supervisor) to decide or provide something — credentials, a "
             "product decision, access — call `request_feedback(question)`. It posts on the card and tells your "
-            "supervisor. Carry on with anything that doesn't depend on the answer." + commit + "\n")
+            "supervisor. Carry on with anything that doesn't depend on the answer.\n"
+            "- The card's checklist is kept by your supervisor, who adds and ticks its items once it has "
+            "checked your work: you have no checklist tools, so say in your messages what you finished instead."
+            + commit + "\n")
